@@ -18,6 +18,8 @@ dependencies = [
     "lxml>=5.2",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
+    "pdfplumber>=0.11",
+    "pypdf>=4.2",
 ]
 
 [project.optional-dependencies]
@@ -28,7 +30,6 @@ stats = [
     "seaborn>=0.13",
 ]
 r = ["rpy2>=3.5"]
-pdf = ["pdfplumber>=0.11", "pypdf>=4.2"]
 ui = ["streamlit>=1.36"]
 orchestration = ["langgraph>=0.2"]
 dev = [

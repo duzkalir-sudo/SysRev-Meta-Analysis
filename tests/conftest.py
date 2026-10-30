@@ -18,21 +18,25 @@ from src.core.enums import (
     ActorType,
     ArmRole,
     EvidenceLocationType,
+    RoBTool,
     SourceDatabase,
     StudyDesign,
 )
 from src.core.schemas import (
     Author,
+    DomainJudgement,
     ExtractedStudyArm,
     ExtractedValue,
     MeSHTerm,
     OutcomeDefinition,
     PICOProtocol,
     RecruitmentPeriod,
+    RiskOfBiasAssessment,
     SearchStrategy,
     SourceEvidence,
     StudyRecord,
 )
+from src.core.schemas.extraction import ROB2_DOMAINS
 from src.state.db import init_db, make_engine, make_session_factory
 from src.state.machine import GuardContext
 
@@ -57,11 +61,16 @@ READY = GuardContext(
     ft_missing_decisions=0,
     ft_unresolved_conflicts=0,
     ft_included=10,
+    ft_awaiting_human_confirmation=0,
     included_reports_without_extraction=0,
+    included_reports_without_usable_pdf=0,
     arms_for_non_included_reports=0,
     extracted_values_without_evidence=0,
     extraction_arms=20,
     unapproved_extraction_arms=0,
+    extraction_items_pending=0,
+    included_studies_without_approved_rob=0,
+    unresolved_double_counting=0,
     stats_output_present=True,
     manuscript_present=True,
     audit_passed=True,
@@ -86,11 +95,16 @@ EMPTY = GuardContext(
     ft_missing_decisions=0,
     ft_unresolved_conflicts=0,
     ft_included=0,
+    ft_awaiting_human_confirmation=0,
     included_reports_without_extraction=0,
+    included_reports_without_usable_pdf=0,
     arms_for_non_included_reports=0,
     extracted_values_without_evidence=0,
     extraction_arms=0,
     unapproved_extraction_arms=0,
+    extraction_items_pending=0,
+    included_studies_without_approved_rob=0,
+    unresolved_double_counting=0,
     stats_output_present=False,
     manuscript_present=False,
     audit_passed=None,
@@ -196,6 +210,27 @@ def make_arm(record_id: str = "rec1", **overrides: Any) -> ExtractedStudyArm:
     return ExtractedStudyArm(**data)
 
 
+def approved_rob(
+    record_id: str, reviewer_id: str, name: str = "Dr Human Reviewer"
+) -> RiskOfBiasAssessment:
+    """A human-approved RoB 2 assessment (SYNTHETIC judgements)."""
+    return RiskOfBiasAssessment(
+        record_id=record_id,
+        tool=RoBTool.ROB2,
+        domains=[
+            DomainJudgement(domain=d, judgement="low", support="synthetic justification")
+            for d in ROB2_DOMAINS
+        ],
+        overall="low",
+        assessor=name,
+        assessed_by=ActorType.HUMAN,
+        approved_by_human=True,
+        approved_by=name,
+        approved_reviewer_id=reviewer_id,
+        approved_at=NOW,
+    )
+
+
 def make_protocol(**overrides: Any) -> PICOProtocol:
     data: dict[str, Any] = {
         "review_title": "Synthetic intervention X versus placebo for condition Y",
@@ -234,6 +269,7 @@ __all__ = [
     "READY",
     "FakeClock",
     "RecruitmentPeriod",
+    "approved_rob",
     "make_arm",
     "make_author",
     "make_evidence",

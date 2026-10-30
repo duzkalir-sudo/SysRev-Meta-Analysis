@@ -3,7 +3,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from src.core.enums import ActorType, CheckStatus, FullTextStatus, RoBTool, SourceDatabase
+from src.core.enums import (
+    ActorType,
+    CheckStatus,
+    FullTextStatus,
+    RoBTool,
+    SourceDatabase,
+    UploadMatchStatus,
+)
 from src.core.schemas import (
     AuditReport,
     CitationCheck,
@@ -137,8 +144,8 @@ def _rob2(judgements: list[str], overall: str | None) -> RiskOfBiasAssessment:
             for d, j in zip(ROB2_DOMAINS, judgements, strict=True)
         ],
         overall=overall,
-        assessor="rob-agent",
-        assessed_by=ActorType.AGENT,
+        assessor="Dr Reviewer",
+        assessed_by=ActorType.HUMAN,
     )
 
 
@@ -219,7 +226,12 @@ def test_fulltext_item_rules() -> None:
         pdf_filename="r1.pdf",
         pdf_sha256="b" * 64,
     )
-    assert not done.blocks_gate2
+    # no identity check recorded: unconfirmed, not usable (fail closed)
+    assert done.match_unconfirmed and done.blocks_gate2 and not done.has_usable_pdf
+    for status in (UploadMatchStatus.UNCERTAIN, UploadMatchStatus.MISMATCH):
+        assert done.model_copy(update={"match_status": status}).blocks_gate2
+    confirmed = done.model_copy(update={"match_status": UploadMatchStatus.CONFIRMED})
+    assert not confirmed.blocks_gate2 and confirmed.has_usable_pdf
 
 
 # --------------------------------------------------------------------------- Audit

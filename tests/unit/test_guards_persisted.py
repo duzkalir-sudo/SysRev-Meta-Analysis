@@ -17,13 +17,15 @@ from src.core.enums import (
     ScreeningStage,
     ScreeningVerdict,
     SourceDatabase,
+    UploadMatchStatus,
 )
+from src.core.exceptions import SysRevError
 from src.core.schemas import FullTextItem, PRISMACounts, ScreeningDecision
 from src.screening.deduplication import deduplicate
 from src.screening.prisma import PRISMATracker
 from src.state.machine import PipelineStateMachine
 from src.state.repository import NotFoundError, Repository
-from tests.conftest import make_arm, make_protocol, make_record
+from tests.conftest import approved_rob, make_arm, make_protocol, make_record
 
 INC, EXC, UNC = ScreeningVerdict.INCLUDE, ScreeningVerdict.EXCLUDE, ScreeningVerdict.UNCERTAIN
 TA, FT = ScreeningStage.TITLE_ABSTRACT, ScreeningStage.FULL_TEXT
@@ -36,7 +38,11 @@ def repo(session: Session) -> Repository:
     r = Repository(session)
     r.create_project(PID, "Synthetic review")
     r.save_protocol(PID, make_protocol())
+    HUMAN["id"], _ = r.enroll_reviewer("Dr Human")
     return r
+
+
+HUMAN: dict[str, str] = {}
 
 
 def decide(
@@ -53,6 +59,7 @@ def decide(
             reviewer=reviewer,
             reviewer_identity="Dr Human" if reviewer == ADJ else f"agent-{reviewer.value}",
             is_human=reviewer == ADJ,
+            reviewer_id=HUMAN["id"] if reviewer == ADJ else None,
             stage=stage,
             verdict=verdict,
             exclusion_reason="not eligible" if verdict == EXC else None,
@@ -220,10 +227,18 @@ def test_manifest_entry_unlocks_gate2_only_when_resolved(repo: Repository) -> No
     )
     assert violations(repo, *S3_TO_G2) == []
     assert any("still missing" in x for x in violations(repo, *G2_TO_S4))
+    upload = FullTextItem(record_id="a", title="T1", status=FullTextStatus.USER_UPLOADED,
+                          pdf_filename="a.pdf", pdf_sha256="a" * 64)  # fmt: skip
+    with pytest.raises(SysRevError, match="authenticated"):
+        repo.save_fulltext_item(PID, upload)  # an upload must name an enrolled reviewer
+    unverified = upload.model_copy(update={"recorded_by": "Dr Human",
+                                           "recorded_by_reviewer_id": HUMAN["id"]})  # fmt: skip
+    repo.save_fulltext_item(PID, unverified)
+    # a PDF whose identity was never checked does not release Gate 2
+    assert any("still missing" in x for x in violations(repo, *G2_TO_S4))
     repo.save_fulltext_item(
-        PID, FullTextItem(record_id="a", title="T1", status=FullTextStatus.USER_UPLOADED,
-                          pdf_filename="a.pdf", pdf_sha256="a" * 64),
-    )  # fmt: skip
+        PID, unverified.model_copy(update={"match_status": UploadMatchStatus.CONFIRMED})
+    )
     assert violations(repo, *G2_TO_S4) == []
 
 
@@ -234,7 +249,8 @@ def _through_retrieval(repo: Repository) -> None:
     _through_screening(repo)
     repo.save_fulltext_item(
         PID, FullTextItem(record_id="a", title="T1", status=FullTextStatus.OA_DOWNLOADED,
-                          pdf_filename="a.pdf", pdf_sha256="a" * 64),
+                          pdf_filename="a.pdf", pdf_sha256="a" * 64,
+                          match_status=UploadMatchStatus.CONFIRMED),
     )  # fmt: skip
 
 
@@ -268,11 +284,14 @@ def test_complete_stage4_and_prisma_reaches_stage5(repo: Repository) -> None:
     decide(repo, "a", R2, INC, FT)
     arm = make_arm("a")
     repo.save_extracted_arm(PID, arm)
+    assert any("await confirmation" in x for x in violations(repo, *S4_TO_G3))
+    decide(repo, "a", ADJ, INC, FT)  # a human confirms automated full-text eligibility
     assert violations(repo, *S4_TO_G3) == []
     v = violations(repo, *G3_TO_S5)
     assert any("not approved by a human" in x for x in v)
     assert any("reports_assessed is 0 but persisted records imply 1" in x for x in v)
-    repo.approve_extracted_arm(arm.arm_id, "Dr Human")
+    repo.approve_extracted_arm(arm.arm_id, reviewer_id=HUMAN["id"])
+    repo.save_rob(PID, approved_rob("a", HUMAN["id"], "Dr Human"))
     t = PRISMATracker()
     t.record_identified(SourceDatabase.PUBMED, 2)
     t.record_title_abstract_decision("a", include=True)
@@ -307,7 +326,7 @@ def test_unresolved_duplicate_candidate_blocks_and_resolution_merges(repo: Repos
 
     [cand] = repo.load_duplicate_candidates(PID)
     resolved = repo.resolve_duplicate_candidate(
-        PID, cand.candidate_id, resolution="duplicate_keep_a", resolved_by="Dr Human"
+        PID, cand.candidate_id, resolution="duplicate_keep_a", reviewer_id=HUMAN["id"]
     )
     assert resolved.is_resolved
     by_id = {r.record_id: r for r in repo.load_records(PID)}
@@ -330,11 +349,15 @@ def test_resolve_distinct_keeps_records_separate(repo: Repository) -> None:
     repo.save_records(PID, result.all_records)
     cand = result.possible_duplicates[0].to_candidate()
     repo.save_duplicate_candidate(PID, cand)
-    repo.resolve_duplicate_candidate(PID, cand.candidate_id, resolution="distinct", resolved_by="R")
+    repo.resolve_duplicate_candidate(
+        PID, cand.candidate_id, resolution="distinct", reviewer_id=HUMAN["id"]
+    )
     assert all(r.duplicate_of is None for r in repo.load_records(PID))
     assert repo.build_guard_context(PID).unresolved_duplicate_candidates == 0
     with pytest.raises(NotFoundError):
-        repo.resolve_duplicate_candidate(PID, "nope", resolution="distinct", resolved_by="R")
+        repo.resolve_duplicate_candidate(
+            PID, "nope", resolution="distinct", reviewer_id=HUMAN["id"]
+        )
 
 
 def test_resolution_repoints_existing_duplicates_of_dropped_cluster(repo: Repository) -> None:
@@ -352,7 +375,7 @@ def test_resolution_repoints_existing_duplicates_of_dropped_cluster(repo: Reposi
     c = cand.to_candidate()
     repo.save_duplicate_candidate(PID, c)
     repo.resolve_duplicate_candidate(
-        PID, c.candidate_id, resolution="duplicate_keep_a", resolved_by="R"
+        PID, c.candidate_id, resolution="duplicate_keep_a", reviewer_id=HUMAN["id"]
     )
     by_id = {r.record_id: r for r in repo.load_records(PID)}
     assert (by_id["b"].duplicate_of, by_id["c"].duplicate_of) == ("a", "a")

@@ -10,6 +10,10 @@ from src.screening.cohort_overlap import CohortOverlapConfig, CohortOverlapDetec
 from src.screening.deduplication import DeduplicationResult, Deduplicator, PossibleDuplicate
 from src.screening.prisma import PRISMATracker
 
+# LLM-assisted screening (Session 2) lives in ``src.screening.llm_screening`` and
+# ``src.screening.reporting``; they import the persistence layer, so they are not
+# re-exported here (keeps ``src.screening`` importable by ``src.state``).
+
 __all__ = [
     "CohortOverlapConfig",
     "CohortOverlapDetector",

@@ -220,9 +220,11 @@ def test_adjudicator_must_be_human() -> None:
     assert _decision(reviewer=ReviewerRole.ADJUDICATOR, is_human=True)
 
 
-def test_full_text_decision_cannot_be_uncertain() -> None:
+def test_human_full_text_decision_cannot_be_uncertain() -> None:
     with pytest.raises(ValidationError, match="full-text"):
-        _decision(stage=ScreeningStage.FULL_TEXT, verdict=ScreeningVerdict.UNCERTAIN)
+        _decision(stage=ScreeningStage.FULL_TEXT, verdict=ScreeningVerdict.UNCERTAIN, is_human=True)
+    # an automated pass may defer to a human rather than guess (conservative policy)
+    assert _decision(stage=ScreeningStage.FULL_TEXT, verdict=ScreeningVerdict.UNCERTAIN)
 
 
 def test_conflict_rules() -> None:

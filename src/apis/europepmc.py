@@ -94,6 +94,31 @@ class EuropePMCClient(BaseAPIClient):
                 records.append(record)
         return hit_count, records
 
+    async def find_pmcid(self, pmid: str) -> str | None:
+        """PMCID of a MEDLINE record (``EXT_ID:<pmid> AND SRC:MED``), or ``None``."""
+        norm = normalize_pmid(pmid)
+        data = await self._get_json(
+            "search",
+            {"query": f"EXT_ID:{norm} AND SRC:MED", "format": "json", "resultType": "lite"},
+        )
+        if not isinstance(data, dict):
+            raise APIClientError("unexpected Europe PMC response shape")
+        for raw in data.get("resultList", {}).get("result", []):
+            if str(raw.get("pmid")) == norm and raw.get("pmcid"):
+                return _safe(normalize_pmcid, raw["pmcid"])  # type: ignore[no-any-return]
+        return None
+
+    async def fetch_fulltext_xml(self, pmcid: str) -> bytes | None:
+        """JATS XML of an open-access article (``/{PMCID}/fullTextXML``); ``None`` if absent.
+
+        Europe PMC serves full text only for its open-access subset; other articles 404.
+        """
+        norm = normalize_pmcid(pmcid)
+        response = await self._request("GET", f"{norm}/fullTextXML", allow_404=True)
+        if response is None or not response.content.strip():
+            return None
+        return response.content
+
 
 def _safe(fn: Any, value: Any) -> Any:
     try:

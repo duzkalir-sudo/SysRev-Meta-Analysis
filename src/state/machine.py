@@ -85,11 +85,16 @@ class GuardContext:
     ft_missing_decisions: int
     ft_unresolved_conflicts: int
     ft_included: int
+    ft_awaiting_human_confirmation: int
     included_reports_without_extraction: int
+    included_reports_without_usable_pdf: int
     arms_for_non_included_reports: int
     extracted_values_without_evidence: int
     extraction_arms: int
     unapproved_extraction_arms: int
+    extraction_items_pending: int
+    included_studies_without_approved_rob: int
+    unresolved_double_counting: int
     # Stages 5-6
     stats_output_present: bool
     manuscript_present: bool
@@ -169,6 +174,11 @@ def _eligibility_documented(c: GuardContext) -> list[str]:
         v.append(f"{c.ft_unresolved_conflicts} unresolved full-text eligibility conflict(s)")
     if c.ft_included == 0 and not c.ft_missing_decisions and not c.ft_unresolved_conflicts:
         v.append("no reports were included after full-text assessment")
+    if c.ft_awaiting_human_confirmation:
+        v.append(
+            f"{c.ft_awaiting_human_confirmation} full-text eligibility outcome(s) rest only on "
+            "automated reviewers and await confirmation by an authenticated human"
+        )
     return v
 
 
@@ -180,6 +190,12 @@ def _extraction_grounded(c: GuardContext) -> list[str]:
     if c.included_reports_without_extraction:
         v.append(
             f"{c.included_reports_without_extraction} included report(s) have no extracted data"
+        )
+    if c.included_reports_without_usable_pdf:
+        v.append(
+            f"{c.included_reports_without_usable_pdf} included report(s) have no usable PDF "
+            "(structured XML only or unconfirmed identity): upload the PDF or record the "
+            "report as unavailable for quantitative synthesis"
         )
     if c.arms_for_non_included_reports:
         v.append(
@@ -195,6 +211,18 @@ def _extraction_approved(c: GuardContext) -> list[str]:
     v = _extraction_grounded(c)
     if c.unapproved_extraction_arms:
         v.append(f"{c.unapproved_extraction_arms} extraction arm(s) not approved by a human")
+    if c.extraction_items_pending:
+        v.append(f"{c.extraction_items_pending} master-table extraction item(s) await human review")
+    if c.unresolved_double_counting:
+        v.append(
+            f"{c.unresolved_double_counting} outcome(s) receive arm data from more than one "
+            "report of the same cohort: keep one report or document non-overlapping samples"
+        )
+    if c.included_studies_without_approved_rob:
+        v.append(
+            f"{c.included_studies_without_approved_rob} included study(ies) lack a "
+            "human-approved risk-of-bias assessment"
+        )
     v.extend(_prisma_recorded(c))
     pending = c.prisma_awaiting_screening + c.prisma_pending_reports
     if c.prisma_recorded and pending:
