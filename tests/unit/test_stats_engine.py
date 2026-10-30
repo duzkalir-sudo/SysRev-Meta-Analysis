@@ -18,7 +18,7 @@ from src.core.schemas.stats import AnalysisSpec, ArmSelection, ReportAccount, St
 from src.stats_engine import effect_sizes as es
 from src.stats_engine.engine import run_analysis, run_plan
 from src.stats_engine.glmm import glmm_logit
-from src.stats_engine.report import analysis_csv, forest_plot, report_markdown
+from src.stats_engine.report import analysis_csv, analysis_markdown, forest_plot, report_markdown
 from tests.conftest import NOW
 from tests.stats_helpers import (
     LAST_FU,
@@ -680,21 +680,25 @@ def test_every_eligible_report_is_accounted_for() -> None:
     arms = [stats_arm(r, "necrosis", follow_up=LAST_FU, events=x, n_analyzed=n)
             for r, x, n in with_data]  # fmt: skip
     no_data = [f"n{i:02d}" for i in range(8)]
+    codes = {"n00": "not_reported", "n01": "not_reported", "n02": "figure_only",
+             "n03": "insufficient_detail"}  # fmt: skip
     unavailable = [
         QuantitativeUnavailability(
             record_id=rid, outcome_id=None if rid == "n03" else "necrosis",
-            reason_code="not_reported", reason="necrosis not assessed (synthetic)",
+            reason_code=code, reason="synthetic reviewer note",  # type: ignore[arg-type]
             recorded_by="Dr Stats Reviewer", reviewer_id="rvw1",
         )
-        for rid in no_data[:4]
+        for rid, code in codes.items()
     ]  # fmt: skip
     res = run(NEC, arms, eligible=no_data, unavailability=unavailable)
     assert res.k == 12 and len(res.reports) == 20
     status = {r.record_id: (r.status, r.reason_code) for r in res.reports}
     assert all(status[r] == ("included", None) for r, _, _ in with_data)
-    assert [status[r][1] for r in no_data] == ["recorded_unavailable"] * 4 + [
-        "outcome_not_reported"
-    ] * 4
+    assert [status[r][1] for r in no_data] == [
+        *["confirmed_not_reported"] * 2,  # a reviewer confirmed the source does not report it
+        *["recorded_unavailable"] * 2,
+        *["outcome_data_not_extracted_or_unverified"] * 4,  # neutral: nothing extracted
+    ]
     assert sorted(e.record_ids[0] for e in res.excluded) == no_data  # one entry per study
     assert res.total_participants == sum(int(n) for _, _, n in with_data)
     assert res.total_events == sum(int(x) for _, x, _ in with_data)
@@ -712,12 +716,18 @@ def test_reports_of_one_cohort_are_not_counted_as_separate_studies() -> None:
     assert res.k == 2 and len(res.reports) == 5
     # s1b: another report of contributing cohort A -> ledger only, not an excluded study
     s1b = next(r for r in res.reports if r.record_id == "s1b")
-    assert s1b.reason_code == "outcome_not_reported" and s1b.reason is not None
+    assert s1b.reason_code == "outcome_data_not_extracted_or_unverified"
+    assert s1b.reason is not None
     assert "not counted as a separate study" in s1b.reason
     # cohort C contributes nothing -> exactly one excluded study listing both reports
     assert [(e.record_ids, e.reason_code) for e in res.excluded] == [
-        (["c1", "c2"], "outcome_not_reported")
+        (["c1", "c2"], "outcome_data_not_extracted_or_unverified")
     ]
+    # the secondary report and the missing outcome data stay visible in the human reports
+    md, table = analysis_markdown(res), analysis_csv(res)
+    for rid in ("s1b", "c1", "c2"):
+        assert f"| {rid} |" in md
+        assert any(row.startswith("report,") and f",{rid}," in row for row in table.splitlines())
 
 
 def test_unsupported_measure_still_accounts_for_every_report() -> None:
@@ -753,3 +763,47 @@ def test_report_ledger_invariants() -> None:
         ReportAccount.model_validate(entry | {"reason_code": "missing_data"})
     with pytest.raises(ValidationError, match="needs a reason"):
         ReportAccount.model_validate(entry | {"status": "excluded", "unit_id": None})
+
+
+NON_REPORTING_CLAIMS = ("not reported", "not_reported", "did not report", "does not report",
+                        "failed to report", "not report the")  # fmt: skip
+
+
+def test_missing_extraction_is_never_described_as_not_reported() -> None:
+    """An eligible report without approved outcome data may simply not have been extracted
+    or verified yet: no output may claim that the paper failed to report the outcome."""
+    res = run(NEC, necrosis_arms()[:2], eligible=["quiet"])
+    entry = next(r for r in res.reports if r.record_id == "quiet")
+    assert entry.status == "excluded"
+    assert entry.reason_code == "outcome_data_not_extracted_or_unverified"
+    excluded = next(e for e in res.excluded if e.record_ids == ["quiet"])
+    assert excluded.reason_code == entry.reason_code
+    texts = [entry.reason or "", excluded.reason]
+    texts += [line for line in analysis_markdown(res).splitlines() if "| quiet |" in line]
+    texts += [row for row in analysis_csv(res).splitlines() if ",quiet," in row]
+    assert len(texts) == 5  # ledger, excluded study, Markdown row, CSV excluded + report rows
+    for text in texts:
+        assert not any(claim in text.lower() for claim in NON_REPORTING_CLAIMS), text
+    assert res.k == 2 and res.total_participants == 65  # 25 + 40; nothing counted as zero
+
+
+def test_only_a_reviewer_confirms_non_reporting() -> None:
+    def unavailable(code: str) -> QuantitativeUnavailability:
+        return QuantitativeUnavailability(
+            record_id="quiet", outcome_id="necrosis", reason_code=code,  # type: ignore[arg-type]
+            reason="checked the full text (synthetic)", recorded_by="Dr Stats Reviewer",
+            reviewer_id="rvw1",
+        )  # fmt: skip
+
+    confirmed = run(NEC, necrosis_arms()[:2], eligible=["quiet"],
+                    unavailability=[unavailable("not_reported")])  # fmt: skip
+    entry = next(r for r in confirmed.reports if r.record_id == "quiet")
+    assert entry.reason_code == "confirmed_not_reported"
+    assert entry.reason is not None and "Dr Stats Reviewer" in entry.reason
+    other = run(NEC, necrosis_arms()[:2], eligible=["quiet"],
+                unavailability=[unavailable("figure_only")])  # fmt: skip
+    assert next(r for r in other.reports if r.record_id == "quiet").reason_code == (
+        "recorded_unavailable"
+    )
+    # identical numbers whatever the non-contributing report's status
+    assert confirmed.primary == other.primary == run(NEC, necrosis_arms()[:2]).primary

@@ -606,8 +606,13 @@ excluded as `overlapping_cohort`. Every exclusion is listed with a reason code.
 
 **Report accounting.** Every full-text-eligible report appears exactly once in each
 analysis's `reports` ledger: `included` (with its analysis unit) or `excluded` with a reason
-code — including `recorded_unavailable` and `outcome_not_reported` for eligible reports
-without approved data for the outcome (missing data are never treated as zero events).
+code. Three cases are kept distinct: `recorded_unavailable` (a reviewer recorded the
+report as unusable for the outcome), `confirmed_not_reported` (a reviewer recorded that the
+source does not report it — `QuantitativeUnavailability.reason_code = "not_reported"`; the
+only status that asserts non-reporting), and the neutral
+`outcome_data_not_extracted_or_unverified` (no approved, verified extraction exists; this
+makes no claim about the paper). Missing data are never treated as zero events. The ledger
+is in `stats_output.json` and in each analysis's Markdown and CSV table.
 `excluded` lists a study/cohort once, with all its reports, and only when none of its
 reports contributes; a non-contributing report of a contributing cohort is recorded in the
 ledger only, so duplicate reports are never counted as separate studies.

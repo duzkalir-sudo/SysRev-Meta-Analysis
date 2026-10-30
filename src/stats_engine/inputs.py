@@ -5,9 +5,10 @@ arm(s) whose **outcome**, **estimator** and **structured follow-up timepoint** m
 approved analysis plan, and refuses (with a recorded reason) anything ambiguous:
 
 * every **full-text-eligible report** is accounted for in every analysis — included,
-  recorded as unavailable, without data for the outcome (never read as zero events), or
-  excluded with a reason — and reports of one study/cohort are never counted as separate
-  studies;
+  recorded as unavailable by a reviewer, confirmed by a reviewer as not reporting the
+  outcome, without approved extracted data (a neutral status that does *not* claim the
+  paper failed to report the outcome; never read as zero events), or excluded with a
+  reason — and reports of one study/cohort are never counted as separate studies;
 * an arm that is not human-approved, or that belongs to a report outside the eligible
   set, aborts the whole run (fail closed);
 * a report recorded as unavailable for the outcome is excluded with the human's reason;
@@ -42,6 +43,13 @@ from src.core.schemas.stats import (
 )
 
 CRUDE = frozenset({None, EstimateType.CRUDE_PROPORTION})
+NOT_EXTRACTED: ExclusionCode = "outcome_data_not_extracted_or_unverified"
+NOT_EXTRACTED_REASON = (
+    "no approved, verified extracted data for this outcome exist for this eligible report; "
+    "this does not establish whether the source reports the outcome (only a reviewer can "
+    "confirm that). The report contributes nothing to the calculation and is never counted "
+    "as zero events"
+)
 
 
 @dataclass(frozen=True)
@@ -183,7 +191,7 @@ def account_reports(
         if inputs.cohort(rid) not in represented:
             pending[inputs.cohort(rid)].append(rid)
     for _, rids in sorted(pending.items()):
-        rids.sort(key=lambda r: (selection.record_reasons[r].code == "outcome_not_reported", r))
+        rids.sort(key=lambda r: (selection.record_reasons[r].code == NOT_EXTRACTED, r))
         first = selection.record_reasons[rids[0]]
         reason = first.reason if len(rids) == 1 else "; ".join(
             f"{inputs.label(r)}: {selection.record_reasons[r].reason}" for r in rids
@@ -263,18 +271,22 @@ def select_units(
         arm_ids = tuple(a.arm_id for a in arms)
         u = unavailable.get((rid, spec.outcome_id)) or unavailable.get((rid, None))
         if u is not None:
-            reasons[rid] = RecordReason(
-                "recorded_unavailable",
-                f"recorded by {u.recorded_by} as unavailable ({u.reason_code}): {u.reason}",
-                arm_ids,
-            )
+            if u.reason_code == "not_reported":  # the only reviewer-confirmed non-reporting
+                reasons[rid] = RecordReason(
+                    "confirmed_not_reported",
+                    f"reviewer {u.recorded_by} confirmed that the source does not report this "
+                    f"outcome: {u.reason}",
+                    arm_ids,
+                )
+            else:
+                reasons[rid] = RecordReason(
+                    "recorded_unavailable",
+                    f"recorded by {u.recorded_by} as unavailable ({u.reason_code}): {u.reason}",
+                    arm_ids,
+                )
             continue
         if not arms:
-            reasons[rid] = RecordReason(
-                "outcome_not_reported",
-                "eligible report without approved extracted data for this outcome; missing "
-                "outcome data are never treated as zero events",
-            )
+            reasons[rid] = RecordReason(NOT_EXTRACTED, NOT_EXTRACTED_REASON)
             continue
         usable = [a for a in arms if a.estimate_type in estimators]
         if not usable:

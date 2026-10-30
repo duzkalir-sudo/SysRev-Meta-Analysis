@@ -211,8 +211,13 @@ class StudyResult(FrozenModel):
 
 
 ExclusionCode = Literal[
-    "recorded_unavailable",
-    "outcome_not_reported",  # eligible report without approved data for this outcome
+    "recorded_unavailable",  # a reviewer recorded the report as unusable for this outcome
+    # A reviewer confirmed that the source itself does not report the outcome. This is the
+    # only code that asserts non-reporting by the paper.
+    "confirmed_not_reported",
+    # No approved, verified extracted data for this outcome. Neutral: it says nothing about
+    # whether the paper reports the outcome (it may not have been extracted or verified yet).
+    "outcome_data_not_extracted_or_unverified",
     "incompatible_estimator",
     "timepoint_mismatch",
     "timepoint_missing",

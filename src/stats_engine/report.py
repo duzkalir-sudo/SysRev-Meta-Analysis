@@ -116,7 +116,23 @@ def analysis_markdown(a: AnalysisResult) -> str:
             )
     if a.excluded:
         lines += ["", "Excluded studies:", "", "| Study | Reason code | Reason |", "|---|---|---|"]
-        lines += [f"| {e.label} | {e.reason_code} | {e.reason} |" for e in a.excluded]
+        lines += [f"| {e.label} | {e.reason_code} | {_cell(e.reason)} |" for e in a.excluded]
+    if a.reports:
+        lines += [
+            "",
+            f"Report ledger (every full-text-eligible report; {len(a.reports)} reports, "
+            f"{sum(r.status == 'included' for r in a.reports)} contributing). "
+            "`outcome_data_not_extracted_or_unverified` means no approved, verified extraction "
+            "exists; it does not mean the paper failed to report the outcome.",
+            "",
+            "| Report | Record | Study | Cohort | Status | Analysis unit | Reason code | Reason |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        lines += [
+            f"| {r.label} | {r.record_id} | {r.study_id} | {r.cohort_id} | {r.status} | "
+            f"{r.unit_id or ''} | {r.reason_code or ''} | {_cell(r.reason or '')} |"
+            for r in a.reports
+        ]
     for title, items in (
         ("Methods", a.methods),
         ("Warnings", a.warnings),
@@ -125,6 +141,10 @@ def analysis_markdown(a: AnalysisResult) -> str:
         if items:
             lines += ["", f"{title}:", ""] + [f"* {x}" for x in items]
     return "\n".join(lines) + "\n"
+
+
+def _cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
 
 
 def analysis_csv(a: AnalysisResult) -> str:
@@ -147,6 +167,9 @@ def analysis_csv(a: AnalysisResult) -> str:
             "p_value",
             "reason_code",
             "reason",
+            "cohort_id",
+            "report_status",
+            "unit_id",
         ]
     )
     for s in a.studies:
@@ -164,6 +187,9 @@ def analysis_csv(a: AnalysisResult) -> str:
                 repr(s.weight_common_pct),
                 repr(s.weight_random_pct),
                 s.ci_method,
+                "",
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -187,6 +213,9 @@ def analysis_csv(a: AnalysisResult) -> str:
                 repr(r.p_value),
                 "",
                 "",
+                "",
+                "",
+                "",
             ]
         )
     for e in a.excluded:
@@ -207,8 +236,17 @@ def analysis_csv(a: AnalysisResult) -> str:
                 "",
                 e.reason_code,
                 e.reason,
+                "",
+                "",
+                "",
             ]
         )
+    blank = [""] * 9
+    for rr in a.reports:  # the complete per-report ledger
+        w.writerow(
+            ["report", rr.label, rr.study_id, rr.record_id, *blank,
+             rr.reason_code or "", rr.reason or "", rr.cohort_id, rr.status, rr.unit_id or ""]
+        )  # fmt: skip
     return buf.getvalue()
 
 
