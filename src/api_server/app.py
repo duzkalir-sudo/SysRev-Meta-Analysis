@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, sessionmaker
 
 from src import __version__
-from src.core.enums import GateId, GateVerdict, Phase
+from src.core.enums import ActorType, GateId, GateVerdict, Phase
 from src.core.exceptions import GuardViolationError, StateTransitionError
 from src.core.schemas.base import new_id
 from src.core.schemas.pipeline import GateDecision, StateTransition
@@ -40,6 +40,20 @@ class GateDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     verdict: GateVerdict
     comments: str | None = None
+
+
+class AdvanceRequest(BaseModel):
+    """Move from a working stage to its next phase (e.g. Stage 2 -> Gate 1.5)."""
+
+    model_config = ConfigDict(extra="forbid")
+    target: Phase
+    reason: str | None = None
+
+
+class ProjectSummary(BaseModel):
+    project_id: str
+    title: str
+    phase: Phase
 
 
 class ProjectView(BaseModel):
@@ -118,6 +132,13 @@ def create_app(database_url: str = "sqlite:///:memory:", data_dir: Path | None =
     def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
+    @app.get("/projects")
+    def list_projects(session: SessionDep) -> list[ProjectSummary]:
+        return [
+            ProjectSummary(project_id=p.id, title=p.title, phase=Phase(p.phase))
+            for p in Repository(session).list_projects()
+        ]
+
     @app.post("/projects", status_code=status.HTTP_201_CREATED)
     def create_project(body: CreateProjectRequest, session: SessionDep) -> ProjectView:
         repo = Repository(session)
@@ -143,6 +164,37 @@ def create_app(database_url: str = "sqlite:///:memory:", data_dir: Path | None =
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         context = repo.build_guard_context(project_id)
         return {t.value: machine.check(t, context) for t in sorted(machine.allowed_targets())}
+
+    @app.post("/projects/{project_id}/advance")
+    def advance(
+        project_id: str, body: AdvanceRequest, session: SessionDep, reviewer: ReviewerDep
+    ) -> ProjectView:
+        """Request a non-gate transition as the authenticated human (guards apply).
+
+        Leaving a HITL gate is only possible through ``/gates/{gate}``.
+        """
+        repo = Repository(session)
+        try:
+            machine = repo.load_state_machine(project_id)
+        except NotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        if machine.is_paused_at_gate:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "the pipeline is at a gate: submit a gate decision"
+            )
+        try:
+            transition = machine.transition(
+                body.target, actor=reviewer.display_name, actor_type=ActorType.HUMAN,
+                context=repo.build_guard_context(project_id), reason=body.reason,
+            )  # fmt: skip
+        except GuardViolationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, {"message": str(exc), "violations": exc.violations}
+            ) from exc
+        except StateTransitionError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        repo.record_transition(transition)
+        return _view(repo, project_id)
 
     @app.post("/projects/{project_id}/gates/{gate}")
     def decide_gate(

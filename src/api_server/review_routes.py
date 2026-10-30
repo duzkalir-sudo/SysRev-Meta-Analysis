@@ -157,6 +157,14 @@ def build_review_router(store: DocumentStore) -> APIRouter:
             "methods_statement": methods_statement(facts),
         }
 
+    @router.get("/screening/{stage}/decisions")
+    def list_decisions(
+        project_id: str, stage: ScreeningStage, session: SessionDep
+    ) -> list[dict[str, Any]]:
+        """All decisions at ``stage``; automated passes carry ``is_human: false``."""
+        decisions = Repository(session).load_screening_decisions(project_id)
+        return [d.model_dump(mode="json") for d in decisions if d.stage == stage]
+
     @router.get("/screening/{stage}/conflicts")
     def list_conflicts(
         project_id: str, stage: ScreeningStage, session: SessionDep
@@ -346,6 +354,31 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         if format == "csv":
             return Response(export_csv(rows), media_type="text/csv")
         return Response(export_json(rows), media_type="application/json")
+
+    @router.get("/extraction/ai-verifications")
+    def ai_verifications(project_id: str, session: SessionDep) -> list[dict[str, Any]]:
+        """Advisory second-model checks; never a review decision."""
+        rows = Repository(session).load_ai_verifications(project_id)
+        return [v.model_dump(mode="json") for v in rows]
+
+    # ------------------------------------------------------------------ AI usage (read-only)
+    @router.get("/ai/settings")
+    def ai_settings(project_id: str, session: SessionDep) -> dict[str, Any]:
+        settings = Repository(session).latest_ai_settings(project_id)
+        if settings is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no AI settings saved")
+        return settings.model_dump(mode="json")
+
+    @router.get("/ai/usage")
+    def ai_usage(project_id: str, session: SessionDep) -> dict[str, Any]:
+        """Estimated usage totals and the per-call audit trail (no prompts, no secrets)."""
+        repo = Repository(session)
+        _call(lambda: repo.get_project(project_id))
+        return {
+            "totals": repo.llm_usage_totals(project_id),
+            "calls": [c.model_dump(mode="json") for c in repo.load_llm_calls(project_id)],
+            "note": "costs are list-price estimates; the provider invoice is authoritative",
+        }
 
     # ------------------------------------------------------------------ risk of bias
     @router.get("/rob")

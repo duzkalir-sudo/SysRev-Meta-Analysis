@@ -679,7 +679,8 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | FastAPI (state, guards, gate decisions, Stage 2–4 review routes) | Implemented and tested; every human action requires an enrolled reviewer's bearer token. LLM runs and retrieval are started from Python, not over HTTP |
 | Reviewer enrollment CLI and token authentication | Implemented and tested; see §6 for the threat model and limitations |
 | Single-arm / case-series protocol and outcome schemas; crude vs KM vs cumulative-incidence distinction | Implemented and tested (schemas only; no statistics) |
-| LLM provider interface + registry (`src/llm`) | Implemented and tested with scripted providers. **No concrete vendor adapter ships**: a real provider must be registered explicitly, otherwise `ProviderNotConfiguredError` is raised |
+| LLM provider interface + registry (`src/llm`) | Implemented and tested with scripted providers. Session 4 adds Anthropic Messages and OpenAI Responses adapters (§9.6), registered only on request (`register_api_providers`) |
+| Anthropic / OpenAI adapters, capability catalogue, per-task model/effort, usage ledger, budget guard (Session 4) | Implemented and tested with **mocked HTTP only**. **No live API call was made during development** (no credentials in the build environment). OpenAI catalogue entries and Responses usage fields were checked against the official documentation on 2026-10-30; Anthropic entries come from Anthropic's API reference cached 2026-10-06 |
 | Dual automated screening, conservative policy, resume, conflicts, κ, authenticated adjudication, reporting facts | Implemented and tested (mocked models). Screening accuracy of any real model is **unvalidated** |
 | Stage 3 retrieval (Europe PMC XML, Unpaywall PDF), downloads, uploads, identity matching, manifest, pause/resume | Implemented and tested with respx-mocked HTTP only; **no live retrieval was executed** |
 | PDF parsing and evidence grounding | Implemented and tested on generated synthetic PDFs; not yet evaluated on real journal PDFs (multi-column layouts, rotated tables, unruled tables) |
@@ -691,7 +692,77 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
 | PRISMA diagram rendering, GRADE SoF | Not implemented |
 | Auditor | Contract (`AuditReport`) only |
-| UI | Placeholder |
+| Local UI (Streamlit, Session 4) | First usable version: projects, phase/blockers, authenticated advance and gate decisions, per-task model settings, keys, AI steps, screening queue and adjudication, PDF upload/identity, extraction accept/reject/arms, RoB approval, statistics and forest plots, usage/costs. Tested headlessly (Streamlit AppTest) on Linux; **not yet run on a Windows machine**. Not in the UI: protocol drafting, searches/imports, item corrections, study linking, double counting, analysis-plan editing (use the API/Python) |
+
+### 9.6 Real AI providers and the local UI (`src/llm`, `src/workflows`, `src/ui`) — Session 4
+
+**Adapters** (`src/llm/adapters.py`) call `POST /v1/messages` (Anthropic, header
+`anthropic-version: 2026-10-21`, adaptive thinking, `output_config.effort`) and
+`POST /v1/responses` (OpenAI, `reasoning.effort`, `store: false`) with `httpx`. They send
+the configured model and effort exactly as given: no fallback model, no automatic effort
+change, no `temperature` (removed on Anthropic API version 2026-10-21 and not accepted by
+reasoning models). A different served model (other than a dated snapshot of the requested
+ID) or, on OpenAI, a different echoed effort discards the result.
+
+**Capability catalogue** (`src/llm/model_catalogue.json`, overridable by
+`<data_dir>/model_catalogue.json`) lists, per exact model ID, the accepted effort values,
+output limit and list prices with their source. A configuration is validated against it
+*before* any request; unknown models, unlisted efforts, a temperature or an excessive
+output limit raise `UnsupportedConfigurationError`. Effort values are provider-specific
+strings and are not mapped across providers.
+
+**Errors.** `ProviderAccessError` (401/403/404), `InsufficientFundsError` (Anthropic
+`billing_error`/"credit balance", OpenAI `insufficient_quota`) and
+`UnsupportedConfigurationError` (400 parameter rejections) are never retried and halt a
+batch run (`LLMRunHaltError`). Rate limits, overload (529) and 5xx are retried at most
+twice with capped backoff; a connection failure before sending is retried; a read
+timeout is *not* retried because the request may already have been billed. Refusal,
+truncation at the output limit and empty output raise `LLMOutputError`; the item records
+nothing and can be retried.
+
+**Per-task settings** (`ProjectAISettings`, append-only versions in
+`project_ai_settings`): provider, exact model, effort (`None` = provider default, not
+sent) and output limit for `screening_reviewer_1`, `screening_reviewer_2`, `extraction`,
+`verification` and `risk_of_bias`, plus local warning/stop thresholds. No credentials.
+
+**Audit trail** (`llm_calls`, append-only): one row per call (also failed, budget-blocked
+and duplicate-skipped calls) with task, requested and served model, effort sent and
+effective, reported tokens (input, output, reasoning, cache read/write), list-price cost
+estimate and its basis, provider request id, attempts, latency and SHA-256 of prompt and
+reply. Prompts, replies and keys are not stored. Raw token fields are kept as reported;
+`total_tokens` (used for project totals and token thresholds) follows each provider's
+semantics: OpenAI `input_tokens` already include cached tokens and `output_tokens`
+include reasoning tokens (total = input + output); Anthropic input, cache-read and
+cache-creation tokens are disjoint (total = all three + output).
+
+**Cost controls** (issues #3/#4, minimal scope): bounded retries; resumable runs (existing
+decisions are skipped); identical successful requests (same task, model, effort, prompt)
+are not repeated unless forced — but only once their *validated* result was persisted
+(`llm_call_outcomes` links the call to the saved extraction items, verification or RoB
+draft); a reply that failed JSON/schema validation or grounding is billed and logged but
+never blocks an ordinary retry; the two screening passes never share a cache key; a
+local stop threshold refuses to *start* calls once recorded estimated spend or tokens
+reach it. This is not a hard spending cap (estimates can differ from invoices; a call in
+flight completes); a cost threshold with an unpriced model is refused. No batching,
+adaptive routing or response caching is implemented.
+
+**Advisory verification** (`src/extraction/ai_verification.py`): a separately configured
+model judges whether the quote/page supports a pending AI-proposed value as recorded.
+Stored in `ai_verifications` with `is_human = false`; it never changes an item's status.
+The deterministic evidence check remains the gate.
+
+**Credentials** (`src/llm/credentials.py`): UI session memory → environment / `.env` →
+OS credential store (`keyring`, optional). Keys are registered for redaction; error
+texts, ledger rows and log records pass through `redact()`. Claude subscription or
+Claude Code development credits and ChatGPT subscriptions do not pay for API calls.
+
+**UI** (`src/ui`): Streamlit, bound to 127.0.0.1. Human actions are API calls (in-process
+FastAPI app, or `SYSREV_API_URL`) with the reviewer's bearer token; AI steps run the
+existing runners through `src.workflows.AIWorkflow`, which checks the phase and never
+moves the state machine. New API endpoints: `GET /projects`, authenticated
+`POST /projects/{id}/advance` (non-gate transitions, guards apply), and read-only
+`/screening/{stage}/decisions`, `/extraction/ai-verifications`, `/ai/settings`,
+`/ai/usage`.
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
@@ -40,6 +41,7 @@ from src.core.schemas import (
     StateTransition,
     StudyRecord,
 )
+from src.core.schemas.ai import AIVerification
 from src.core.schemas.base import utc_now
 from src.core.schemas.master import (
     CohortContributionDecision,
@@ -57,8 +59,11 @@ from src.core.security import (
     parse_token,
     verify_secret,
 )
+from src.llm.tasks import ProjectAISettings
+from src.llm.usage import LLMCallRecord
 from src.screening.agreement import screening_status
 from src.state.db import (
+    AIVerificationORM,
     AnalysisPlanORM,
     AuditReportORM,
     CohortContributionDecisionORM,
@@ -71,6 +76,9 @@ from src.state.db import (
     FullTextDocumentORM,
     FullTextItemORM,
     GateDecisionORM,
+    LLMCallORM,
+    LLMCallOutcomeORM,
+    ProjectAISettingsORM,
     ProjectORM,
     ProtocolORM,
     QuantitativeUnavailabilityORM,
@@ -1086,6 +1094,123 @@ class Repository:
         return [QuantitativeUnavailability.model_validate(r.payload) for r in rows]
 
     # ------------------------------------------------------------------ Stage 5 statistics
+    def list_projects(self) -> list[ProjectORM]:
+        return list(self.session.scalars(select(ProjectORM).order_by(ProjectORM.created_at)))
+
+    # ------------------------------------------------------------------ AI settings & usage
+    def save_ai_settings(self, project_id: str, settings: ProjectAISettings) -> int:
+        """Append a new settings version (no credentials are part of the payload)."""
+        self.get_project(project_id)
+        latest = self.session.scalar(
+            select(func.max(ProjectAISettingsORM.version)).where(
+                ProjectAISettingsORM.project_id == project_id
+            )
+        )
+        version = (latest or 0) + 1
+        self.session.add(
+            ProjectAISettingsORM(
+                project_id=project_id, version=version, payload=settings.model_dump(mode="json")
+            )
+        )
+        self.session.flush()
+        return version
+
+    def latest_ai_settings(self, project_id: str) -> ProjectAISettings | None:
+        row = self.session.scalars(
+            select(ProjectAISettingsORM)
+            .where(ProjectAISettingsORM.project_id == project_id)
+            .order_by(ProjectAISettingsORM.seq.desc())
+            .limit(1)
+        ).first()
+        return ProjectAISettings.model_validate(row.payload) if row else None
+
+    def record_llm_call(self, record: LLMCallRecord) -> None:
+        self.get_project(record.project_id)
+        self.session.add(
+            LLMCallORM(
+                id=record.call_id, project_id=record.project_id, task=record.task,
+                provider=record.provider, requested_model=record.requested_model,
+                status=record.status, call_key=record.call_key,
+                total_tokens=record.total_tokens, cost_usd_estimate=record.cost_usd_estimate,
+                payload=record.model_dump(mode="json"),
+            )
+        )  # fmt: skip
+        self.session.flush()
+
+    def load_llm_calls(self, project_id: str) -> list[LLMCallRecord]:
+        rows = self.session.scalars(
+            select(LLMCallORM).where(LLMCallORM.project_id == project_id).order_by(LLMCallORM.seq)
+        )
+        return [LLMCallRecord.model_validate(r.payload) for r in rows]
+
+    def record_persisted_result(
+        self, project_id: str, records: Sequence[LLMCallRecord], result_ref: str
+    ) -> None:
+        """Link successful calls to the validated result they produced (after it was saved).
+
+        Only these links suppress a repeat of an identical request; a provider reply that
+        failed validation leaves no link, so the request can simply be retried.
+        """
+        for record in records:
+            if record.status != "ok" or record.project_id != project_id:
+                continue
+            self.session.add(
+                LLMCallOutcomeORM(
+                    project_id=project_id, call_id=record.call_id, call_key=record.call_key,
+                    result_ref=result_ref,
+                )
+            )  # fmt: skip
+        self.session.flush()
+
+    def has_persisted_result(self, project_id: str, call_key: str) -> bool:
+        return (
+            self.session.scalars(
+                select(LLMCallOutcomeORM.seq).where(
+                    LLMCallOutcomeORM.project_id == project_id,
+                    LLMCallOutcomeORM.call_key == call_key,
+                )
+            ).first()
+            is not None
+        )
+
+    def llm_usage_totals(self, project_id: str) -> dict[str, float | int]:
+        """Project totals over successful and failed calls (estimates, not invoices)."""
+        calls = self.load_llm_calls(project_id)
+        ok = [c for c in calls if c.status == "ok"]
+        return {
+            "calls": len(calls),
+            "successful_calls": len(ok),
+            "failed_calls": sum(c.status == "error" for c in calls),
+            "tokens": sum(c.total_tokens for c in calls),
+            "input_tokens": sum(c.input_tokens or 0 for c in calls),
+            "output_tokens": sum(c.output_tokens or 0 for c in calls),
+            "reasoning_tokens": sum(c.reasoning_tokens or 0 for c in calls),
+            "cache_read_tokens": sum(c.cache_read_tokens or 0 for c in calls),
+            "cost_usd_estimate": round(sum(c.cost_usd_estimate or 0.0 for c in calls), 9),
+            "unpriced_successful_calls": sum(c.cost_usd_estimate is None for c in ok),
+        }
+
+    def save_ai_verification(self, project_id: str, verification: AIVerification) -> None:
+        item = self.get_extraction_item(project_id, verification.item_id)
+        if item.record_id != verification.record_id:
+            raise SysRevError("verification record_id does not match the item")
+        self.session.add(
+            AIVerificationORM(
+                id=verification.verification_id, project_id=project_id,
+                item_id=verification.item_id, verdict=verification.verdict,
+                payload=verification.model_dump(mode="json"),
+            )
+        )  # fmt: skip
+        self.session.flush()
+
+    def load_ai_verifications(self, project_id: str) -> list[AIVerification]:
+        rows = self.session.scalars(
+            select(AIVerificationORM)
+            .where(AIVerificationORM.project_id == project_id)
+            .order_by(AIVerificationORM.seq)
+        )
+        return [AIVerification.model_validate(r.payload) for r in rows]
+
     def save_analysis_plan(self, project_id: str, plan: AnalysisPlan) -> None:
         """Append a plan version. Approval must come from an active enrolled reviewer, and an
         approved plan must be consistent with the protocol's outcomes."""

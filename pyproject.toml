@@ -28,7 +28,10 @@ stats = [
     "matplotlib>=3.9",  # forest plots (src.stats_engine.report)
 ]
 r = ["rpy2>=3.5"]
-ui = ["streamlit>=1.36"]
+ui = [
+    "streamlit>=1.36",
+    "keyring>=24",  # optional OS credential store (Windows Credential Manager, Keychain)
+]
 orchestration = ["langgraph>=0.2"]
 dev = [
     "pytest>=8.2",
@@ -43,6 +46,9 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.llm" = ["model_catalogue.json"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

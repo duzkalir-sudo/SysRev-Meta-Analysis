@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     http_timeout_seconds: float = Field(default=30.0, gt=0)
     http_max_retries: int = Field(default=5, ge=0, le=10)
 
+    # LLM provider keys: read from the environment or .env (never logged or stored).
+    anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
+    openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
+
     dedup_title_threshold: float = Field(default=95.0, ge=50.0, le=100.0)
     cohort_overlap_flag_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
 
