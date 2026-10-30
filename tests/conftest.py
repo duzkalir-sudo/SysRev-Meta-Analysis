@@ -76,6 +76,7 @@ READY = GuardContext(
     stats_output_problems=(),
     manuscript_present=True,
     audit_passed=True,
+    audit_problems=(),
 )
 
 # What the repository reports for a freshly created project: nothing recorded yet.
@@ -112,6 +113,7 @@ EMPTY = GuardContext(
     stats_output_problems=(),
     manuscript_present=False,
     audit_passed=None,
+    audit_problems=(),
 )
 
 

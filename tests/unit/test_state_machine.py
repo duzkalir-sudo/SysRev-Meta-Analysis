@@ -177,7 +177,8 @@ def test_rejection_moves_back_and_skips_guards(gate_phase: Phase) -> None:
          {"manuscript_present": False}, "manuscript"),
         (Phase.STAGE6_AUDIT, Phase.COMPLETED, {"audit_passed": False}, "not passed"),
         (Phase.STAGE6_AUDIT, Phase.COMPLETED, {"audit_passed": None}, "not passed"),
-        (Phase.STAGE6_AUDIT, Phase.STAGE6_MANUSCRIPT, {"audit_passed": True}, "no failed"),
+        (Phase.STAGE6_AUDIT, Phase.COMPLETED, {"audit_problems": ("no human sign-off",)},
+         "sign-off"),
     ],
 )  # fmt: skip
 def test_guards_block_unsafe_progress(
@@ -197,6 +198,13 @@ def test_guards_block_unsafe_progress(
 def test_failed_audit_loops_back_to_drafting() -> None:
     m = PipelineStateMachine("p1", Phase.STAGE6_AUDIT)
     system_step(m, Phase.STAGE6_MANUSCRIPT, dataclasses.replace(READY, audit_passed=False))
+    assert m.phase == Phase.STAGE6_MANUSCRIPT
+
+
+def test_revision_after_passing_audit_is_allowed() -> None:
+    """Returning to drafting never certifies anything (Session 6)."""
+    m = PipelineStateMachine("p1", Phase.STAGE6_AUDIT)
+    system_step(m, Phase.STAGE6_MANUSCRIPT, READY)
     assert m.phase == Phase.STAGE6_MANUSCRIPT
 
 

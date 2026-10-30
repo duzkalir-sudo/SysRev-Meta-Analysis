@@ -32,6 +32,9 @@ class AITask(StrEnum):
     EXTRACTION = "extraction"
     VERIFICATION = "verification"
     RISK_OF_BIAS = "risk_of_bias"
+    # Session 6 (absent from older saved settings, which therefore remain valid)
+    MANUSCRIPT_DRAFTING = "manuscript_drafting"
+    CLAIM_REVIEW = "claim_review"
 
 
 TASK_LABELS: dict[AITask, str] = {
@@ -40,6 +43,8 @@ TASK_LABELS: dict[AITask, str] = {
     AITask.EXTRACTION: "PDF data extraction (proposals)",
     AITask.VERIFICATION: "Advisory verification of extracted values",
     AITask.RISK_OF_BIAS: "Risk-of-bias drafts",
+    AITask.MANUSCRIPT_DRAFTING: "Manuscript prose drafting (numbers/citations as markers only)",
+    AITask.CLAIM_REVIEW: "Advisory claim-support review (never an approval)",
 }
 
 
