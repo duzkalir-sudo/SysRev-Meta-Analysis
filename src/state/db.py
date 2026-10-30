@@ -534,6 +534,100 @@ class SearchRawRecordORM(Base):
     raw: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class ManuscriptVersionORM(Base):
+    """Stage 6 manuscript versions (append-only; edits create a new version)."""
+
+    __tablename__ = "manuscript_versions"
+    __table_args__ = (UniqueConstraint("project_id", "version"),)
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    content_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    actor_type: Mapped[str] = mapped_column(String(16))
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("reviewers.id"), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class ReferenceEntryORM(Base):
+    """Background literature imported by identifier (append-only; latest row per key wins)."""
+
+    __tablename__ = "reference_entries"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    ref_key: Mapped[str] = mapped_column(String(64), index=True)
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("reviewers.id"), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class ReferenceVerificationORM(Base):
+    """Live PubMed/Crossref identity checks, including failed ('unavailable') attempts."""
+
+    __tablename__ = "reference_verifications"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    ref_key: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(16))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class EvidenceExcerptORM(Base):
+    __tablename__ = "evidence_excerpts"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    ref_key: Mapped[str] = mapped_column(String(64), index=True)
+    reviewer_id: Mapped[str] = mapped_column(ForeignKey("reviewers.id"))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class FindingAcknowledgementORM(Base):
+    __tablename__ = "finding_acknowledgements"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    audit_report_id: Mapped[str] = mapped_column(ForeignKey("audit_reports.id"), index=True)
+    finding_id: Mapped[str] = mapped_column(String(64))
+    reviewer_id: Mapped[str] = mapped_column(ForeignKey("reviewers.id"))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class ManuscriptApprovalORM(Base):
+    __tablename__ = "manuscript_approvals"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    manuscript_version: Mapped[int] = mapped_column(Integer)
+    audit_report_id: Mapped[str] = mapped_column(ForeignKey("audit_reports.id"))
+    reviewer_id: Mapped[str] = mapped_column(ForeignKey("reviewers.id"))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class ClaimReviewORM(Base):
+    """Advisory model opinions on claim support (never human assessments)."""
+
+    __tablename__ = "claim_reviews"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    audit_report_id: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
 APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     ProtocolEventORM,
     SearchRunORM,
@@ -548,6 +642,14 @@ APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     LLMCallORM,
     LLMCallOutcomeORM,
     AIVerificationORM,
+    AuditReportORM,
+    ManuscriptVersionORM,
+    ReferenceEntryORM,
+    ReferenceVerificationORM,
+    EvidenceExcerptORM,
+    FindingAcknowledgementORM,
+    ManuscriptApprovalORM,
+    ClaimReviewORM,
 )
 
 

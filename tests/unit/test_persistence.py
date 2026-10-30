@@ -212,7 +212,10 @@ def test_prisma_and_audit_persistence(repo: Repository) -> None:
             )
         ],
     )
-    repo.save_audit_report(report)
-    loaded = repo.latest_audit_report("p1")
-    assert loaded == report and loaded is not None and loaded.passed
-    assert repo.build_guard_context("p1").audit_passed is True
+    # Session 6: a hand-built report with one verified citation is incomplete — it neither
+    # passes nor can be recorded (only the Auditor's own, recomputable reports are stored).
+    assert not report.complete and not report.passed
+    with pytest.raises(SysRevError, match="incomplete"):
+        repo.save_audit_report(report)
+    assert repo.latest_audit_report("p1") is None
+    assert repo.build_guard_context("p1").audit_passed is None

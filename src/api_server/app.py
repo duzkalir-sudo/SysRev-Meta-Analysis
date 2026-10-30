@@ -106,6 +106,7 @@ def create_app(
     *,
     search_clients: SearchClients | None = None,
 ) -> FastAPI:
+    from src.api_server.manuscript_routes import build_manuscript_router
     from src.api_server.review_routes import build_review_router
     from src.api_server.search_routes import build_search_router
     from src.core.config import get_settings
@@ -128,6 +129,7 @@ def create_app(
     app.state.search_clients = search_clients  # None: built from settings on first use
     app.include_router(build_review_router(store))
     app.include_router(build_search_router(DocumentStore(root / "searches")))
+    app.include_router(build_manuscript_router())
 
     def _view(repo: Repository, project_id: str) -> ProjectView:
         project = repo.get_project(project_id)

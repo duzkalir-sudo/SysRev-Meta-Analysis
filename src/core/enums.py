@@ -262,6 +262,12 @@ class OverlapResolution(StrEnum):
 
 
 class CheckStatus(StrEnum):
+    """Outcome of one audit check. Only ``VERIFIED`` counts as established support."""
+
     VERIFIED = "verified"
-    MISMATCH = "mismatch"
-    NOT_FOUND = "not_found"
+    MISMATCH = "mismatch"  # contradicted by the approved source
+    NOT_FOUND = "not_found"  # the cited key / record / reference does not exist
+    MISSING = "missing"  # an expected reportable item or required structure is absent
+    UNSUPPORTED = "unsupported"  # no approved source supports the statement
+    NOT_CHECKED = "not_checked"  # the check could not be performed (e.g. API unavailable)
+    REQUIRES_HUMAN_REVIEW = "requires_human_review"  # cannot be established automatically

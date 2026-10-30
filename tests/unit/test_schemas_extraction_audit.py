@@ -23,6 +23,7 @@ from src.core.schemas import (
     RiskOfBiasAssessment,
     parse_reported_number,
 )
+from src.core.schemas.audit import REQUIRED_SCOPES, CoverageItem
 from src.core.schemas.extraction import ROB2_DOMAINS, ROBINS_I_DOMAINS
 from tests.conftest import make_arm, make_evidence, make_value
 
@@ -285,15 +286,47 @@ def test_audit_report_passed_is_derived() -> None:
         numeric_checks=[_numeric(CheckStatus.VERIFIED)],
         citation_checks=[cite],
     )
-    assert good.passed and good.failures == 0
-    bad = good.model_copy(update={"numeric_checks": [_numeric(CheckStatus.MISMATCH, 0.7)]})
+    # Session 6: verified checks alone do not certify a manuscript — the report must be
+    # complete (manuscript hash, evidence fingerprint, every required scope, coverage).
+    assert good.failures == 0 and not good.complete and not good.passed
+    complete = good.model_copy(
+        update={
+            "manuscript_sha256": "e" * 64,
+            "evidence_fingerprint": {"stats_output_sha256": "c" * 64},
+            "scopes_checked": dict.fromkeys(REQUIRED_SCOPES, 1),
+            "coverage": [
+                CoverageItem(
+                    key="k", description="d", required_in=["results"], status=CheckStatus.VERIFIED
+                )
+            ],
+        }
+    )
+    assert complete.complete and complete.passed
+    one_scope_short = complete.model_copy(
+        update={"scopes_checked": dict.fromkeys(sorted(REQUIRED_SCOPES)[1:], 1)}
+    )
+    assert not one_scope_short.complete and not one_scope_short.passed
+    missing = complete.model_copy(
+        update={
+            "coverage": [
+                CoverageItem(
+                    key="k", description="d", required_in=["results"], status=CheckStatus.MISSING
+                )
+            ]
+        }
+    )
+    assert not missing.passed and missing.failures == 1
+    bad = complete.model_copy(update={"numeric_checks": [_numeric(CheckStatus.MISMATCH, 0.7)]})
     assert not bad.passed
     empty = AuditReport(project_id="p1", manuscript_version=1, stats_output_sha256="c" * 64)
     assert not empty.passed  # nothing checked is not a pass
 
     # Round-trip works; a forged verdict is rejected.
-    dumped = good.model_dump(mode="json")
+    dumped = complete.model_dump(mode="json")
     assert AuditReport.model_validate(dumped).passed
+    forged_good = good.model_dump(mode="json") | {"passed": True}
+    with pytest.raises(ValidationError, match="contradicts"):
+        AuditReport.model_validate(forged_good)
     forged = bad.model_dump(mode="json") | {"passed": True}
     with pytest.raises(ValidationError, match="contradicts"):
         AuditReport.model_validate(forged)

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from src.core.enums import (
     ActorType,
+    CheckStatus,
     FullTextStatus,
     OverlapResolution,
     Phase,
@@ -45,6 +46,16 @@ from src.core.schemas import (
 )
 from src.core.schemas.ai import AIVerification
 from src.core.schemas.base import utc_now
+from src.core.schemas.manuscript import (
+    ClaimReview,
+    EvidenceExcerpt,
+    FindingAcknowledgement,
+    ManuscriptApproval,
+    ManuscriptVersion,
+    ReferenceEntry,
+    ReferenceVerification,
+    fingerprint_sha256,
+)
 from src.core.schemas.master import (
     CohortContributionDecision,
     ExtractionItem,
@@ -69,23 +80,30 @@ from src.state.db import (
     AIVerificationORM,
     AnalysisPlanORM,
     AuditReportORM,
+    ClaimReviewORM,
     CohortContributionDecisionORM,
     CohortOverlapWarningORM,
     DuplicateCandidateORM,
+    EvidenceExcerptORM,
     ExtractedArmORM,
     ExtractedValueORM,
     ExtractionItemORM,
     ExtractionReviewEventORM,
+    FindingAcknowledgementORM,
     FullTextDocumentORM,
     FullTextItemORM,
     GateDecisionORM,
     LLMCallORM,
     LLMCallOutcomeORM,
+    ManuscriptApprovalORM,
+    ManuscriptVersionORM,
     ProjectAISettingsORM,
     ProjectORM,
     ProtocolEventORM,
     ProtocolORM,
     QuantitativeUnavailabilityORM,
+    ReferenceEntryORM,
+    ReferenceVerificationORM,
     ReviewerORM,
     RiskOfBiasORM,
     ScreeningConflictORM,
@@ -1555,8 +1573,165 @@ class Repository:
             )
         return problems
 
+    # ------------------------------------------------------------------ manuscript (Stage 6)
+    STAGE6_EDITABLE = (Phase.STAGE6_MANUSCRIPT.value, Phase.STAGE6_AUDIT.value)
+
+    def save_manuscript_version(self, version: ManuscriptVersion) -> None:
+        """Append a version. Versions are numbered consecutively, only in Stage 6, and a human
+        edit must come from an active enrolled reviewer."""
+        project = self.get_project(version.project_id)
+        if project.phase not in self.STAGE6_EDITABLE:
+            raise SysRevError(f"manuscripts can only be written in Stage 6 (phase={project.phase})")
+        latest = self.latest_manuscript_version(version.project_id)
+        expected = 1 if latest is None else latest.version + 1
+        if version.version != expected:
+            raise SysRevError(f"next manuscript version must be {expected}")
+        if latest is not None and version.parent_version is None:
+            raise SysRevError("a new version names its parent version")
+        if version.actor_type == ActorType.HUMAN or version.reviewer_id is not None:
+            reviewer = self.require_active_reviewer(version.reviewer_id)
+            if version.created_by != reviewer.display_name:
+                raise SysRevError("created_by does not match the enrolled reviewer")
+        self.session.add(
+            ManuscriptVersionORM(
+                project_id=version.project_id, version=version.version,
+                content_sha256=version.content_sha256, actor_type=version.actor_type.value,
+                reviewer_id=version.reviewer_id, payload=version.model_dump(mode="json"),
+            )
+        )  # fmt: skip
+        project.manuscript_version = version.version
+        self.session.flush()
+
+    def _version_from_row(self, row: ManuscriptVersionORM) -> ManuscriptVersion:
+        version = ManuscriptVersion.model_validate(
+            {k: v for k, v in row.payload.items() if k != "content_sha256"}
+        )
+        if version.content_sha256 != row.content_sha256:
+            raise SysRevError(f"stored manuscript version {row.version} fails its content hash")
+        return version
+
+    def latest_manuscript_version(self, project_id: str) -> ManuscriptVersion | None:
+        row = self.session.scalars(
+            select(ManuscriptVersionORM)
+            .where(ManuscriptVersionORM.project_id == project_id)
+            .order_by(ManuscriptVersionORM.version.desc())
+            .limit(1)
+        ).first()
+        return None if row is None else self._version_from_row(row)
+
+    def get_manuscript_version(self, project_id: str, version: int) -> ManuscriptVersion:
+        row = self.session.scalars(
+            select(ManuscriptVersionORM).where(
+                ManuscriptVersionORM.project_id == project_id,
+                ManuscriptVersionORM.version == version,
+            )
+        ).first()
+        if row is None:
+            raise NotFoundError(f"manuscript version {version} not found")
+        return self._version_from_row(row)
+
+    def list_manuscript_versions(self, project_id: str) -> list[ManuscriptVersion]:
+        rows = self.session.scalars(
+            select(ManuscriptVersionORM)
+            .where(ManuscriptVersionORM.project_id == project_id)
+            .order_by(ManuscriptVersionORM.version)
+        )
+        return [self._version_from_row(r) for r in rows]
+
+    def save_reference_entry(self, project_id: str, entry: ReferenceEntry) -> None:
+        """Register imported literature (fetched by identifier). Included-study references are
+        derived from stored records and are never written here."""
+        self.get_project(project_id)
+        if entry.origin != "imported_literature":
+            raise SysRevError("only imported literature is stored; study references are derived")
+        reviewer = self.require_active_reviewer(entry.reviewer_id)
+        if entry.added_by != reviewer.display_name:
+            raise SysRevError("added_by does not match the enrolled reviewer")
+        self.session.add(ReferenceEntryORM(project_id=project_id, ref_key=entry.ref_key,
+                                           reviewer_id=entry.reviewer_id,
+                                           payload=entry.model_dump(mode="json")))  # fmt: skip
+        self.session.flush()
+
+    def load_reference_entries(self, project_id: str) -> list[ReferenceEntry]:
+        rows = self.session.scalars(
+            select(ReferenceEntryORM)
+            .where(ReferenceEntryORM.project_id == project_id)
+            .order_by(ReferenceEntryORM.seq)
+        )
+        latest = {r.ref_key: ReferenceEntry.model_validate(r.payload) for r in rows}
+        return [latest[k] for k in sorted(latest)]
+
+    def save_reference_verification(self, project_id: str, v: ReferenceVerification) -> None:
+        self.get_project(project_id)
+        if v.source == "human_attestation":
+            self._check_attestation(project_id, v)
+        self.session.add(ReferenceVerificationORM(
+            id=v.verification_id, project_id=project_id, ref_key=v.ref_key, status=v.status,
+            payload=v.model_dump(mode="json"),
+        ))  # fmt: skip
+        self.session.flush()
+
+    def _check_attestation(self, project_id: str, v: ReferenceVerification) -> None:
+        """Human identity attestation: only for an included report with no DOI/PMID, whose
+        linked PDF identity was confirmed, against the reference's current metadata."""
+        from src.manuscript.evidence import record_reference
+
+        reviewer = self.require_active_reviewer(v.reviewer_id)
+        if v.checked_by != reviewer.display_name:
+            raise SysRevError("checked_by does not match the enrolled reviewer")
+        included = self.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
+        rid = next((r for r in included if f"study-{r}"[:64] == v.ref_key), None)
+        if rid is None:
+            raise SysRevError("attestation is only for references of included reports")
+        record = self.get_record(project_id, rid)
+        if record.doi or record.pmid:
+            raise SysRevError("this reference has a DOI/PMID: verify it live (PubMed/Crossref)")
+        if v.metadata_sha256 != record_reference(record).metadata_sha256():
+            raise SysRevError("attestation does not match the reference's current metadata")
+        item = self.get_fulltext_item(project_id, rid)
+        if item is None or not item.has_usable_pdf:
+            raise SysRevError(
+                "the report has no PDF with a confirmed identity to attest the reference against"
+            )
+        if v.pdf_sha256 != item.pdf_sha256:
+            raise SysRevError("the attestation does not name the report's current confirmed PDF")
+
+    def load_reference_verifications(self, project_id: str) -> list[ReferenceVerification]:
+        rows = self.session.scalars(
+            select(ReferenceVerificationORM)
+            .where(ReferenceVerificationORM.project_id == project_id)
+            .order_by(ReferenceVerificationORM.seq)
+        )
+        return [ReferenceVerification.model_validate(r.payload) for r in rows]
+
+    def save_evidence_excerpt(self, project_id: str, excerpt: EvidenceExcerpt) -> None:
+        reviewer = self.require_active_reviewer(excerpt.reviewer_id)
+        if excerpt.added_by != reviewer.display_name:
+            raise SysRevError("added_by does not match the enrolled reviewer")
+        self.session.add(EvidenceExcerptORM(
+            id=excerpt.excerpt_id, project_id=project_id, ref_key=excerpt.ref_key,
+            reviewer_id=excerpt.reviewer_id, payload=excerpt.model_dump(mode="json"),
+        ))  # fmt: skip
+        self.session.flush()
+
+    def load_evidence_excerpts(self, project_id: str) -> list[EvidenceExcerpt]:
+        rows = self.session.scalars(
+            select(EvidenceExcerptORM)
+            .where(EvidenceExcerptORM.project_id == project_id)
+            .order_by(EvidenceExcerptORM.seq)
+        )
+        return [EvidenceExcerpt.model_validate(r.payload) for r in rows]
+
     # ------------------------------------------------------------------ audit
     def save_audit_report(self, report: AuditReport) -> None:
+        """Store an audit (append-only). Refused unless it is exactly what the Auditor
+        computes for the stored manuscript version and the current evidence — a hand-built or
+        selectively populated report cannot be recorded."""
+        from src.manuscript.service import verify_audit_report
+
+        problems = verify_audit_report(self, report)
+        if problems:
+            raise SysRevError("audit report rejected: " + "; ".join(problems))
         self.session.add(
             AuditReportORM(
                 id=report.report_id,
@@ -1573,10 +1748,98 @@ class Repository:
         row = self.session.scalars(
             select(AuditReportORM)
             .where(AuditReportORM.project_id == project_id)
-            .order_by(AuditReportORM.generated_at.desc())
+            .order_by(AuditReportORM.generated_at.desc(), AuditReportORM.id)
             .limit(1)
         ).first()
         return None if row is None else AuditReport.model_validate(row.payload)
+
+    def list_audit_reports(self, project_id: str) -> list[AuditReport]:
+        rows = self.session.scalars(
+            select(AuditReportORM)
+            .where(AuditReportORM.project_id == project_id)
+            .order_by(AuditReportORM.generated_at)
+        )
+        return [AuditReport.model_validate(r.payload) for r in rows]
+
+    def get_audit_report(self, project_id: str, report_id: str) -> AuditReport:
+        row = self.session.get(AuditReportORM, report_id)
+        if row is None or row.project_id != project_id:
+            raise NotFoundError(f"audit report {report_id} not found")
+        return AuditReport.model_validate(row.payload)
+
+    def save_acknowledgement(self, ack: FindingAcknowledgement) -> None:
+        """A human's assessment of a REQUIRES_HUMAN_REVIEW finding (blocking ones refused)."""
+        reviewer = self.require_active_reviewer(ack.reviewer_id)
+        if ack.reviewer_name != reviewer.display_name:
+            raise SysRevError("reviewer_name does not match the enrolled reviewer")
+        report = self.get_audit_report(ack.project_id, ack.audit_report_id)
+        finding = next((f for f in report.findings if f.finding_id == ack.finding_id), None)
+        if finding is None:
+            raise NotFoundError(f"finding {ack.finding_id} is not in audit {report.report_id}")
+        if finding.status != CheckStatus.REQUIRES_HUMAN_REVIEW:
+            raise SysRevError(
+                f"finding {ack.finding_id} is {finding.status}: only findings that require human "
+                "review can be acknowledged; blocking findings must be fixed"
+            )
+        if ack.manuscript_sha256 != report.manuscript_sha256 or ack.evidence_sha256 != (
+            fingerprint_sha256(report.evidence_fingerprint)
+        ):
+            raise SysRevError("acknowledgement does not match the audited manuscript/evidence")
+        self.session.add(FindingAcknowledgementORM(
+            id=ack.ack_id, project_id=ack.project_id, audit_report_id=ack.audit_report_id,
+            finding_id=ack.finding_id, reviewer_id=ack.reviewer_id,
+            payload=ack.model_dump(mode="json"),
+        ))  # fmt: skip
+        self.session.flush()
+
+    def load_acknowledgements(self, project_id: str) -> list[FindingAcknowledgement]:
+        rows = self.session.scalars(
+            select(FindingAcknowledgementORM)
+            .where(FindingAcknowledgementORM.project_id == project_id)
+            .order_by(FindingAcknowledgementORM.seq)
+        )
+        return [FindingAcknowledgement.model_validate(r.payload) for r in rows]
+
+    def save_manuscript_approval(self, approval: ManuscriptApproval) -> None:
+        """Human sign-off. Refused unless the approval matches the current manuscript, a
+        current passing audit, and every human-review finding is acknowledged."""
+        from src.manuscript.service import approval_blockers
+
+        reviewer = self.require_active_reviewer(approval.reviewer_id)
+        if approval.reviewer_name != reviewer.display_name:
+            raise SysRevError("reviewer_name does not match the enrolled reviewer")
+        problems = approval_blockers(self, approval.project_id, approval)
+        if problems:
+            raise SysRevError("manuscript cannot be approved: " + "; ".join(problems))
+        self.session.add(ManuscriptApprovalORM(
+            id=approval.approval_id, project_id=approval.project_id,
+            manuscript_version=approval.manuscript_version,
+            audit_report_id=approval.audit_report_id, reviewer_id=approval.reviewer_id,
+            payload=approval.model_dump(mode="json"),
+        ))  # fmt: skip
+        self.session.flush()
+
+    def load_manuscript_approvals(self, project_id: str) -> list[ManuscriptApproval]:
+        rows = self.session.scalars(
+            select(ManuscriptApprovalORM)
+            .where(ManuscriptApprovalORM.project_id == project_id)
+            .order_by(ManuscriptApprovalORM.seq)
+        )
+        return [ManuscriptApproval.model_validate(r.payload) for r in rows]
+
+    def save_claim_review(self, review: ClaimReview) -> None:
+        self.session.add(ClaimReviewORM(id=review.review_id, project_id=review.project_id,
+                                        audit_report_id=review.audit_report_id,
+                                        payload=review.model_dump(mode="json")))  # fmt: skip
+        self.session.flush()
+
+    def load_claim_reviews(self, project_id: str) -> list[ClaimReview]:
+        rows = self.session.scalars(
+            select(ClaimReviewORM)
+            .where(ClaimReviewORM.project_id == project_id)
+            .order_by(ClaimReviewORM.seq)
+        )
+        return [ClaimReview.model_validate(r.payload) for r in rows]
 
     # ------------------------------------------------------------------ guards
     def build_guard_context(self, project_id: str) -> GuardContext:
@@ -1720,6 +1983,11 @@ class Repository:
                 )
 
         audit = self.latest_audit_report(project_id)
+        audit_problems: tuple[str, ...] = ()
+        if project.phase in (Phase.STAGE6_MANUSCRIPT.value, Phase.STAGE6_AUDIT.value):
+            from src.manuscript.service import completion_problems
+
+            audit_problems = tuple(completion_problems(self, project_id))
         return GuardContext(
             protocol_blockers=protocol_blockers,
             search_problems=tuple(self.search_identification_problems(project_id)),
@@ -1758,6 +2026,7 @@ class Repository:
             stats_output_problems=tuple(self.stats_output_problems(project_id)),
             manuscript_present=project.manuscript_version is not None,
             audit_passed=None if audit is None else audit.passed,
+            audit_problems=audit_problems,
         )
 
     def _authenticated_approval(self, protocol: PICOProtocol) -> bool:

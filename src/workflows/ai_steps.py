@@ -370,6 +370,136 @@ class AIWorkflow:
         report.warnings = budget.warnings()
         return report
 
+    # ------------------------------------------------------------------ Stage 6
+    def run_manuscript_drafting(
+        self,
+        section_ids: Sequence[str],
+        *,
+        instructions: str | None = None,
+        actor_name: str = "manuscript-drafting-model",
+        force: bool = False,
+    ) -> StepReport:
+        """Model-drafted prose for ``section_ids``, validated (no typed numbers, registry
+        citations only) and saved as one new manuscript version. A rejected reply saves
+        nothing. The result is an unaudited draft: it changes nothing else."""
+        from src.core.schemas.manuscript import GenerationProvenance
+        from src.manuscript.drafting import ManuscriptDrafter
+        from src.manuscript.service import Actor, ManuscriptService
+
+        self._require_phase(Phase.STAGE6_MANUSCRIPT)
+        service = ManuscriptService(self.repo, self.project_id)
+        latest = self.repo.latest_manuscript_version(self.project_id)
+        if latest is None:
+            raise WorkflowStepError("create the deterministic draft first")
+        package = service.package()
+        budget = self.budget()
+        provider, config = self._provider(AITask.MANUSCRIPT_DRAFTING, budget, dedupe=not force)
+        drafter = ManuscriptDrafter(provider, config)
+        report = StepReport("manuscript_drafting")
+        drafted = []
+        calls: list[str] = []
+        prompts: list[str] = []
+        replies: list[str] = []
+        for sid in section_ids:
+            current = latest.section(sid)
+            before = len(provider.records)
+            try:
+                result = drafter.draft(
+                    sid, current.source if current else "", package, latest.style, instructions
+                )
+                drafted.append(result.section)
+                calls += [r.call_id for r in provider.records[before:]]
+                prompts.append(result.prompt_sha256)
+                replies.append(result.response_sha256)
+                report.done.append(f"{sid}: drafted (unaudited; review and audit required)")
+            except LLMRunHaltError as exc:
+                report.halted = str(exc)
+                break
+            except RedundantCallError as exc:
+                report.skipped.append(f"{sid}: {exc}")
+            except Exception as exc:  # rejected or failed reply: nothing saved for the section
+                report.failed.append(f"{sid}: {redact(str(exc))[:300]}")
+            finally:
+                self._commit()
+        if drafted:
+            version = service.add_model_sections(
+                drafted,
+                Actor(actor_name, ActorType.AGENT),
+                GenerationProvenance(
+                    method="llm",
+                    sections=[s.section_id for s in drafted],
+                    provider=config.provider,
+                    model_id=config.model_id,
+                    effort=config.effort,
+                    llm_call_ids=calls,
+                    prompt_sha256=prompts,
+                    response_sha256=replies,
+                    note=instructions,
+                ),
+            )
+            ok = [r for r in provider.records if r.call_id in calls]
+            self.repo.record_persisted_result(
+                self.project_id, ok, f"manuscript:version {version.version}"
+            )
+            report.done.append(f"saved as manuscript version {version.version}")
+            self._commit()
+        report.warnings += budget.warnings()
+        return report
+
+    def run_claim_review(self, *, force: bool = False) -> StepReport:
+        """Advisory model review of claim-support findings that have recorded excerpts."""
+        from src.core.enums import CheckStatus
+        from src.manuscript.advisory import LLMClaimReviewer
+        from src.manuscript.service import ManuscriptService
+
+        self._require_phase(Phase.STAGE6_MANUSCRIPT, Phase.STAGE6_AUDIT)
+        report_ = self.repo.latest_audit_report(self.project_id)
+        if report_ is None:
+            raise WorkflowStepError("run the audit first")
+        package = ManuscriptService(self.repo, self.project_id).package()
+        budget = self.budget()
+        provider, config = self._provider(AITask.CLAIM_REVIEW, budget, dedupe=not force)
+        reviewer = LLMClaimReviewer(provider, config)
+        step = StepReport("claim_review")
+        done = {
+            (r.audit_report_id, r.finding_id) for r in self.repo.load_claim_reviews(self.project_id)
+        }
+        for f in report_.findings:
+            if f.scope != "claim_support" or f.status != CheckStatus.REQUIRES_HUMAN_REVIEW:
+                continue
+            state = package.references.get(f.source_key or "")
+            if state is None or not state.excerpts:
+                step.skipped.append(
+                    f"{f.finding_id}: no excerpt (a model may not judge from memory)"
+                )
+                continue
+            if (report_.report_id, f.finding_id) in done and not force:
+                step.skipped.append(f"{f.finding_id}: already reviewed")
+                continue
+            before = len(provider.records)
+            try:
+                review = reviewer.review(
+                    self.project_id, report_.report_id, f, [e.text for e in state.excerpts]
+                )
+                call_id = provider.records[-1].call_id if len(provider.records) > before else None
+                review = review.model_copy(update={"call_id": call_id})
+                self.repo.save_claim_review(review)
+                self.repo.record_persisted_result(
+                    self.project_id, provider.records[before:], f"claim_review:{review.review_id}"
+                )
+                step.done.append(f"{f.finding_id}: {review.verdict} (advisory)")
+            except LLMRunHaltError as exc:
+                step.halted = str(exc)
+                break
+            except RedundantCallError as exc:
+                step.skipped.append(f"{f.finding_id}: {exc}")
+            except Exception as exc:
+                step.failed.append(f"{f.finding_id}: {redact(str(exc))[:300]}")
+            finally:
+                self._commit()
+        step.warnings += budget.warnings()
+        return step
+
     def run_statistics(self, output_dir: Path) -> Stage5Artifacts:
         """Deterministic Stage 5 engine (no LLM involved)."""
         artifacts = run_stage5(self.repo, self.project_id, output_dir=output_dir)

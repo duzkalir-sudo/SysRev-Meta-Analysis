@@ -35,7 +35,8 @@ src/
   extraction/      Stage 4: proposals → verification → Master Extraction Table; RoB drafts
   stats_engine/    Stage 5 deterministic statistics (§9.5), validated against R metafor
 validation/        R reference script, metafor comparison, VALIDATION_REPORT.md
-  auditor/         Stage 6 Auditor Agent                     (contract only — not implemented)
+  auditor/         Stage 6 deterministic, completeness-aware Auditor (Session 6)
+  manuscript/      Stage 6 evidence package, marker renderer, drafting, references, exports
   api_server/      FastAPI app: project state, guards, gate decisions, Stage 2-4 review routes
   search/          Session 5: database registry, protocol editor, search execution, RIS/BibTeX/CSV
                    import, preparation for screening, PRISMA derivation, PRISMA-S report
@@ -126,8 +127,8 @@ even if no `ScreeningConflict` row was ever saved.
 | Gate 3 → Stage 5 | As above, plus every arm approved by a human; **0 master-table items awaiting review; every included study has a human-approved risk-of-bias assessment; no outcome receives arm data from two reports of the same cohort without a documented human resolution (§9.3)**; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
 | Stage 5 → Stage 6 | **A verified `stats_output.json`**: stored (append-only) with a matching SHA-256, schema- and results-hash-valid, computed from the *latest* human-approved analysis plan and from the *current* approved extraction data (input hash recomputed; any later change blocks Stage 6 until Stage 5 is re-run) (§9.5) |
 | Stage 6 → Audit | Manuscript draft exists |
-| Audit → COMPLETED | Latest `AuditReport.passed is True` |
-| Audit → Stage 6 | Latest `AuditReport.passed is False` |
+| Audit → COMPLETED | **Session 6:** the latest `AuditReport` is complete and passed, examined the *current* manuscript version (content SHA-256) and the *current* evidence fingerprint (recomputed); every `REQUIRES_HUMAN_REVIEW` finding is acknowledged by an active enrolled reviewer for that exact content/evidence; and an authenticated human signed off that version and audit (§9.8) |
+| Audit → Stage 6 | Always allowed (returning to drafting certifies nothing) |
 
 **PRISMA cross-check.** The stored `PRISMACounts` snapshot must agree with the database:
 total identified = stored records; duplicates removed = records with `duplicate_of`;
@@ -248,13 +249,28 @@ stamps and draft rules (§9.4); `ScreeningDecision` gained `reviewer_id` (humans
 `EvidenceCheck`, `ExtractionReviewEvent`, `StudyReportLink` and
 `QuantitativeUnavailability` (§9.3).
 
-### 4.4 Stage 6 — `audit.py`
-* **`NumericClaimCheck`** — manuscript number vs `stats_output.json` key with tolerance;
-  the status must agree with the numbers.
-* **`CitationCheck`** — citation vs a record in the project database (PMID/DOI).
-* **`AuditReport`** — `passed` and `failures` are **computed**; a serialised report that
-  claims `passed: true` while containing a failing check is rejected on load. An empty
-  report does not pass.
+### 4.4 Stage 6 — `audit.py`, `manuscript.py`
+* **`CheckStatus`** — `verified`, `mismatch`, `not_found`, `missing`, `unsupported`,
+  `not_checked` (blocking) and `requires_human_review`. Only `verified` is support.
+* **`NumericClaimCheck`** — manuscript number vs an approved key with tolerance; the
+  status must agree with the numbers.
+* **`CitationCheck`** — citation vs a registry entry (PMID/DOI).
+* **`AuditFinding`** — scope, status, manuscript location and excerpt, source key and
+  value, message and required action; deterministic id.
+* **`CoverageItem`** — an expected reportable output and where it was found.
+* **`AuditReport`** — `complete`, `passed`, `failures`, `requires_human_review` are
+  **computed**. `complete` requires the manuscript SHA-256, the evidence fingerprint, every
+  scope in `REQUIRED_SCOPES` and a non-empty coverage list; `passed` requires `complete`
+  and no blocking status anywhere. A hand-built report with one verified number or
+  citation is therefore incomplete and never passes; a forged `passed`/`complete` claim is
+  rejected on load, and `Repository.save_audit_report()` refuses any report that differs
+  from the Auditor's own recomputation (`results_sha256()`).
+* **`ManuscriptVersion`** — section sources with markers, frozen `NumericBinding`s, the
+  rendered Markdown, style/journal settings, evidence fingerprint, creator and
+  `GenerationProvenance`; `content_sha256` computed. **`ReferenceEntry`**,
+  **`ReferenceVerification`**, **`EvidenceExcerpt`**, **`FindingAcknowledgement`**,
+  **`ManuscriptApproval`**, **`ClaimReview`** (advisory, `is_human=False`). `JournalSettings`
+  limits are accepted only with their stated source.
 
 ### 4.5 Pipeline — `pipeline.py`
 * **`GateDecision`** (frozen; carries `reviewer_id` of the authenticated reviewer),
@@ -480,10 +496,10 @@ index (shared author key, registry ID or institution token) to avoid all-pairs w
    approval of every arm.
 6. **Deterministic statistics** — Stage 5 writes `stats_output.json`; its SHA-256 is
    stored on the project and referenced by every `AuditReport`.
-7. **Independent audit** — each manuscript number is matched to a `stats_output.json`
-   key (with explicit tolerance) and each citation to a database record re-verified via
-   Crossref/PubMed. `COMPLETED` is reachable only from a passing report; a failing report
-   sends the manuscript back for redrafting.
+7. **Independent audit** — the stored manuscript is re-rendered and checked against the
+   current evidence package scope by scope (§9.8). `COMPLETED` is reachable only from a
+   current, complete, passing report with every human-review item acknowledged and a human
+   sign-off.
 
 ### 9.1 Stage 3 — full-text retrieval (`src/fulltext`) — Session 2
 `FullTextRetriever.run()` processes title/abstract-included records one at a time and
@@ -690,11 +706,12 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | Master Extraction Table, review workflow, arms, exports, study linking, qualitative-only | Implemented and tested |
 | LLM extraction proposals / RoB drafts | Implemented and tested with scripted replies; real-model quality unvalidated |
 | JATS XML parsing for evidence; OCR; supplementary-file retrieval | Not implemented (XML is stored with provenance only; image-only pages are flagged) |
-| PICO structuring / manuscript drafting agents | Not implemented |
+| PICO structuring agent | Not implemented |
+| Manuscript drafting (Session 6): evidence package, marker renderer, deterministic template draft, validated model drafting, Vancouver references, versioning, Markdown/DOCX export | Implemented and tested with synthetic projects and **mocked** model replies; **no live model call**; real-world prose quality unvalidated |
 | Statistics engine (`stats_engine`, Session 3) | Implemented for crude proportions (GLMM + logit IV), KM / cumulative incidence at time *t* (from reported CIs), RR, OR (IV, MH), MD, SMD; validated against metafor 4.4-0 / lme4 (1,475 comparisons; `validation/VALIDATION_REPORT.md`). HR, RD, IRR, rates, means, medians: reported as unsupported |
 | Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
 | PRISMA diagram rendering, GRADE SoF | Not implemented |
-| Auditor | Contract (`AuditReport`) only |
+| Auditor (Session 6) | Implemented: deterministic, completeness-aware checks (§9.8), human acknowledgement and sign-off, advisory model claim review. Prose checks are rule-based and incomplete (limitations in §9.8 and in every report); reference verification tested with in-memory PubMed/Crossref fakes only — **no live lookup was made** |
 | Protocol editor, database selection, search execution (PubMed/Europe PMC/OpenAlex), RIS/BibTeX/CSV import, preparation for screening, search log, PRISMA derivation, PRISMA-S report (Session 5) | Implemented and tested with **mocked HTTP and synthetic export files only**; no live database call; parsers not tested on real vendor exports. Subscription-database APIs and a ClinicalTrials.gov API search are not implemented (manual import). Protocol amendments after Gate 1 and update (top-up) searches after screening has started are not supported |
 | Model discovery / "Refresh Models" (issue #9) | Not implemented (deferred from Session 5): needs official model-list calls for both providers, versioned catalogue snapshots with sources, unverified-model flags that block execution, a reviewed manual override, and the mocked acceptance scenarios listed in the issue |
 | Local UI (Streamlit, Session 4) | First usable version: projects, phase/blockers, authenticated advance and gate decisions, per-task model settings, keys, AI steps, screening queue and adjudication, PDF upload/identity, extraction accept/reject/arms, RoB approval, statistics and forest plots, usage/costs. Tested headlessly (Streamlit AppTest) on Linux; **not yet run on a Windows machine**. Session 5 adds protocol editing/approval, searches, imports, deduplication decisions and PRISMA recomputation. Not in the UI: item corrections, study linking, double counting, analysis-plan editing (use the API/Python) |
@@ -728,7 +745,9 @@ nothing and can be retried.
 **Per-task settings** (`ProjectAISettings`, append-only versions in
 `project_ai_settings`): provider, exact model, effort (`None` = provider default, not
 sent) and output limit for `screening_reviewer_1`, `screening_reviewer_2`, `extraction`,
-`verification` and `risk_of_bias`, plus local warning/stop thresholds. No credentials.
+`verification` and `risk_of_bias` (Session 6 adds `manuscript_drafting` and
+`claim_review`; settings saved before Session 6 remain valid and simply leave them
+unconfigured), plus local warning/stop thresholds. No credentials.
 
 **Audit trail** (`llm_calls`, append-only): one row per call (also failed, budget-blocked
 and duplicate-skipped calls) with task, requested and served model, effort sent and
@@ -855,6 +874,132 @@ from stored records, decisions and manifest rows with the same status functions 
 guards. **PRISMA-S report** (`reporting.py`, `GET /searches/report`): databases searched
 are only those with an execution or import; selected databases without one are listed as
 not searched (with the recorded reason).
+
+### 9.8 Stage 6 — manuscript and independent audit (`src/manuscript`, `src/auditor`) — Session 6
+
+**Evidence package** (`evidence.py`). Built only from persisted, approved records: the
+approved protocol, search log (PRISMA-S), screening decisions (`methods_statement`, which
+never presents automated passes as human reviewers), extraction items/arms, approved
+risk-of-bias assessments, the PRISMA snapshot, the latest approved analysis plan and the
+verified `stats_output.json` (building refuses when `stats_output_problems()` is non-empty).
+Each `Fact` has a key, journal-ready text, the full-precision value behind every displayed
+number (`DisplayNumber`: value, decimals, relation), and semantics used by the Auditor:
+role (pooled / single-study / study estimate, p-value, I², count…), estimator (crude,
+Kaplan–Meier, cumulative incidence), model, null value and CI, count unit (records,
+reports, studies, participants, events). Keys exist only for what was computed: a no-data
+or unsupported analysis has a status statement but no estimate key; single-group p-values
+(tests of logit = 0) are not offered. The package lists the **expected reportable outputs**
+(PRISMA boxes, each analysis' main result or reason for none, k and heterogeneity of pooled
+analyses, engine warnings/limitations, methods facts, primary outcomes in the abstract,
+forest-plot legends, both tables, a citation of every included report) and a
+**fingerprint**: SHA-256 of the statistics output, plan, extraction inputs, protocol,
+PRISMA, search log, RoB, reference registry (entries, verifications, excerpts), facts and
+table/figure templates.
+
+**Display rules** (`formatting.py`). Probabilities as percentages with 1 decimal; ratios,
+differences and Q with the plan's `display_decimals`; τ² with 4; I² as a whole number;
+p-values with 3 decimals or `p < 0.001`; Unicode minus; intervals "X to Y". Tolerance for a
+number shown with *d* decimals: |shown − source| ≤ 0.5·10⁻ᵈ (+1e-9 relative), counts exact,
+`p < 0.001` only if p < 0.001. Numbers inside descriptive text facts match only exactly.
+
+**Typed numbers** (review of PR #11). The parser recognises signed values (Unicode minus or
+a hyphen not preceded by a word character), grouped thousands, mid-dot decimals, leading
+decimals (`.032`), and scientific notation (`3.2e-5`, `3.2E−05`, `3.2 × 10^-5`, `3.2 × 10⁻⁵`),
+and the Auditor also reads spelled-out numbers followed by a unit ("seven studies", "five
+percent"). Digits inside words or hyphenated terms (HbA1c, ICD-10, COVID-19, SF-36, T2) and
+identifiers (DOIs, URLs, PMIDs/PMCIDs, NCT/CRD numbers, bracketed citation numbers) are not
+read as numbers. A typed number matches a source value only if it is a correct rounding at
+the precision it is written (scientific notation included: "3.2e-5" has tolerance 5·10⁻⁷);
+counts must match exactly. The title is audited like any other section.
+
+**Rendering** (`document.py`). `{{key}}` → fact text, `{{table:…}}`/`{{figure:forest:…}}`
+→ templates whose cells are themselves markers, `[@ref]` → Vancouver numbers in order of
+first appearance (`[1]`, `[1,2]`, `[1–3]`); the bibliography uses stored fields only
+(absent volume/issue/pages are omitted, never guessed). Each version freezes its bindings
+(key, rendered text, fact SHA-256) and rendered Markdown.
+
+**Drafting** (`drafting.py`). The template draft writes every section from facts and leaves
+`[[AUTHOR INPUT: …]]` for background, interpretation, conclusions, registration status (no
+PROSPERO ID is invented) and searches when no search log exists. Model drafting
+(`AITask.MANUSCRIPT_DRAFTING`) sees the facts (key, meaning, rendered text) and the
+registry; `validate_section_text()` rejects any typed digit (except named tools such as
+PRISMA 2020, RoB 2, Table/Figure n), unknown keys or references, typed citation numbers,
+"et al." without a registry citation, DOIs, PMIDs and URLs. Calls use the existing
+`AuditedProvider`/`BudgetGuard` (exact model and effort, tokens, cost estimate, request
+id); only explicit user action starts them; the result is a new, unaudited version.
+
+**PRISMA consistency.** The evidence package re-derives the PRISMA counts from the stored
+records, decisions, manifest and study links (`derive_prisma`) and reports every difference
+from the stored snapshot (identification per source, duplicates, screening, retrieval,
+assessment, exclusion reasons, reports included), plus snapshot invariants and a non-final
+flow. **Studies included** must equal exactly the number of distinct studies documented by
+authenticated report-to-study links (`StudyReportLink`; an unlinked report is its own
+study). A cohort-overlap resolution records overlapping participants, not study identity,
+so it never changes the count: reports of one study must be linked explicitly, and
+different studies with overlapping populations remain separate studies (their double
+counting is handled in the analyses, §9.3). Differences become blocking `provenance` findings; the
+stored values are shown as they are and never repaired.
+
+**References** (`references.py`). Included-study references are derived from stored
+records; background literature is imported by PMID (PubMed EFetch) or DOI (Crossref).
+Identity: a record retrieved by the PubMed E-utilities client counts as verified by
+provenance; otherwise a live lookup must agree on title (token-sort ≥ 90), year,
+first-author surname and DOI/PMID. Network/API failures are stored as `unavailable` and
+reported as `not_checked` (blocking). A failed lookup never erases an earlier decisive one.
+An included report with **neither DOI nor PMID** has nothing to look up; an active enrolled
+reviewer may record a `human_attestation` (confirmed or contradicted, with the basis),
+accepted only if the report's linked PDF has a confirmed identity and only for the
+reference's current metadata. The attestation records that PDF's SHA-256; it counts only
+while the same PDF is still the report's identity-confirmed PDF. A replaced or changed PDF,
+or a revoked identity confirmation, voids it (the reference becomes *not checked* until a
+new attestation against the current confirmed PDF), and because each included report's PDF
+identity is part of the evidence fingerprint, any audit or sign-off made before the change
+no longer authorises completion. A reference with an identifier can never be attested instead
+of verified live.
+
+**Audit scopes** (`auditor.py`):
+
+| Scope | Deterministic check | Status when not established |
+|---|---|---|
+| provenance | version fingerprint = current fingerprint; frozen re-render = stored text | mismatch |
+| structure | required sections, structured-abstract headings, author-input markers, unknown keys, Table/Figure references resolve and are cited, journal limits *if supplied with a source* | missing / not_found / mismatch |
+| numeric_bindings | every frozen binding re-resolved; each displayed number within its tolerance (`NumericClaimCheck`) | mismatch / not_found |
+| literal_numbers | typed numbers (all formats above, title included): role inferred from context (estimate, CI bound, I², p, τ², timepoint, count + unit) and compared with the fact of the analysis named in the sentence; "x of n (z%)" arithmetic; zero for an unavailable result | mismatch; a correct but unbound number → requires review; a count that matches no total and is not presented as a total (no "included/identified/pooled…" wording, not in the title) may describe a subset → requires review; untraceable → unsupported; a number attributed to cited literature → requires review |
+| semantic_labels | pooled vs single study; estimator; model; transformed scale; relative vs absolute; significance vs CI and null value; "no difference" and "clinically important" | mismatch / unsupported / requires review |
+| methods | human dual-screening or dual-extraction claims, registration, databases vs search log, analyses never performed (meta-regression, subgroups, publication-bias tests, trim-and-fill, leave-one-out, Bayesian, network, GRADE, mean/SD conversion, HR pooling, IPD), estimators/models not used, RoB tools not used; negated statements are not flagged | mismatch / unsupported |
+| claims | overclaiming, comparative claims in single-arm reviews; causal, recommendation and mechanistic language | unsupported / requires review |
+| coverage | every expected output bound in an allowed section; every included report cited | missing |
+| consistency | statistics in the abstract/conclusions also reported in Results/Tables | missing |
+| citations | registry membership, typed citation numbers, author attribution without citation, identity status, duplicates (DOI, PMID, title + year) | not_found / unsupported / not_checked / mismatch |
+| narrative | every prose sentence (title to conclusions) that is not system text written by the template from the evidence package (compared by wording with markers as keys) and not already flagged; exempt only: headings, sentences consisting of markers, pure table/figure pointers | requires review (assertions without a binding or citation, author wording around verified values, citations whose support is not established) |
+| claim_support | included study: sentence values belong to the cited report (else mismatch); listing sentences verified; background literature: numbers must appear in recorded excerpts and content-word overlap ≥ 25 % (else unsupported), otherwise requires review; no excerpt → requires review | as stated |
+
+**Versioning, acknowledgement, sign-off** (`service.py`, repository). Versions,
+reference entries, verifications, excerpts, audits, acknowledgements, approvals and claim
+reviews are append-only. Versions are written only in Stage 6 phases; human edits need an
+active enrolled reviewer. An acknowledgement is valid only for a `requires_human_review`
+finding and for the exact manuscript content and evidence fingerprint audited; blocking
+findings cannot be acknowledged. Sign-off is accepted only in the audit phase, from an
+active enrolled reviewer, for the current version, the latest current passing audit and
+with every review item acknowledged. Any later edit, re-render or evidence change (new
+statistics output, plan, extraction data, PRISMA, search log, RoB, references) invalidates
+it. Older versions and failed audits remain stored.
+
+**Advisory claim review** (`advisory.py`, `AITask.CLAIM_REVIEW`): for claim-support findings
+with excerpts only, a model judges from the excerpts alone; stored as `ClaimReview`
+(`is_human=False`), shown separately, never changes a finding or counts as an
+acknowledgement.
+
+**Known limits.** No semantic verification of prose is claimed: the narrative scope only
+guarantees that author statements reach a human. Sentence segmentation and cue lists are
+heuristic; prose that avoids the
+cues (e.g. an unusual paraphrase of a causal claim, or an estimate described with wording
+the cue lists do not contain) is not detected, and the Auditor does not understand
+arbitrary text. It cannot verify that background literature supports a statement beyond a
+lexical comparison with human-entered excerpts, nor judge clinical interpretation.
+`StudyRecord` does not store volume/issue/pages, so Vancouver entries for included studies
+omit them. Recomputing the audit on save and the evidence package on every guard check is
+deliberately conservative and makes Stage 6 checks slower than earlier stages.
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

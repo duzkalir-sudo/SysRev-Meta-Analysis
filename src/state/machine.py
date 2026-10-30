@@ -101,6 +101,10 @@ class GuardContext:
     stats_output_problems: tuple[str, ...]
     manuscript_present: bool
     audit_passed: bool | None
+    # Session 6: why the manuscript cannot be completed (empty = ready): the latest audit must
+    # cover the current manuscript version and current evidence, have passed, have every
+    # human-review finding acknowledged, and the version must be signed off by a human.
+    audit_problems: tuple[str, ...]
 
 
 Guard = Callable[[GuardContext], list[str]]
@@ -245,11 +249,17 @@ def _manuscript_present(c: GuardContext) -> list[str]:
 
 
 def _audit_passed(c: GuardContext) -> list[str]:
-    return [] if c.audit_passed is True else ["latest audit report has not passed"]
+    """Audit → COMPLETED: a current, complete, passing audit; every human-review finding
+    acknowledged; and an authenticated human sign-off of that exact manuscript version."""
+    v = [] if c.audit_passed is True else ["latest audit report has not passed"]
+    return v + [p for p in c.audit_problems if p not in v]
 
 
-def _audit_failed(c: GuardContext) -> list[str]:
-    return [] if c.audit_passed is False else ["no failed audit report to act on"]
+def _revision_allowed(c: GuardContext) -> list[str]:
+    """Audit → Stage 6: returning to drafting never certifies anything, so it is always
+    allowed (after a failed, stale or not-yet-approved audit, or to revise text)."""
+    del c
+    return []
 
 
 GUARDS: dict[tuple[Phase, Phase], Guard] = {
@@ -263,7 +273,7 @@ GUARDS: dict[tuple[Phase, Phase], Guard] = {
     (Phase.STAGE5_META_ANALYSIS, Phase.STAGE6_MANUSCRIPT): _stats_valid,
     (Phase.STAGE6_MANUSCRIPT, Phase.STAGE6_AUDIT): _manuscript_present,
     (Phase.STAGE6_AUDIT, Phase.COMPLETED): _audit_passed,
-    (Phase.STAGE6_AUDIT, Phase.STAGE6_MANUSCRIPT): _audit_failed,
+    (Phase.STAGE6_AUDIT, Phase.STAGE6_MANUSCRIPT): _revision_allowed,
 }
 
 

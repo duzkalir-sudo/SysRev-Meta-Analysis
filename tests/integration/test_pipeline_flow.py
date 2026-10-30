@@ -1,8 +1,7 @@
 """End-to-end flow across Stages 1-6 with mocked literature APIs and a real SQLite database.
 
-Stage 5 runs the real statistics engine. Stage 6 content (manuscript drafting, auditing)
-is not implemented yet; those steps are simulated with hand-built, schema-valid objects
-so the state machine, guards and persistence are exercised end to end.
+Stage 5 runs the real statistics engine; Stage 6 runs the deterministic manuscript drafter,
+the independent Auditor and the human acknowledgement / sign-off workflow (Session 6).
 """
 
 from __future__ import annotations
@@ -39,16 +38,14 @@ from src.core.enums import (
 )
 from src.core.exceptions import GuardViolationError, StatisticsInputError
 from src.core.schemas import (
-    AuditReport,
-    CitationCheck,
     ExtractedValue,
     FullTextItem,
     GateDecision,
-    NumericClaimCheck,
     ScreeningDecision,
 )
 from src.core.schemas.stats import AnalysisPlan, AnalysisSpec
-from src.extraction import record_unavailability
+from src.extraction import link_reports_to_study, record_unavailability
+from src.manuscript.service import Actor, ManuscriptService
 from src.screening import (
     CohortOverlapDetector,
     Deduplicator,
@@ -68,6 +65,7 @@ from tests.conftest import (
     make_evidence,
     make_protocol,
 )
+from tests.manuscript_helpers import complete_manuscript
 from tests.unit.test_api_clients import EPMC_RESULT, OPENALEX_WORK, esearch_json
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -383,6 +381,11 @@ async def test_full_pipeline(
         reason="follow-up report of the main cohort",
         outcome_id="hba1c",
     )
+    # The follow-up is a second report of the same study: a documented human decision, which
+    # is what makes PRISMA count one study (cohort overlap alone never does).
+    link_reports_to_study(repo, PID, [main_id, follow_id], study_id="study-main",
+                          primary_record_id=main_id, reviewer=human,
+                          note="follow-up publication of the same trial")  # fmt: skip
     decide(repo, gate(GateId.GATE_3))
     assert repo.get_project(PID).phase == Phase.STAGE5_META_ANALYSIS
 
@@ -423,50 +426,55 @@ async def test_full_pipeline(
         stage5.output.to_canonical_json()
     )
     advance(repo, Phase.STAGE6_MANUSCRIPT)
-    project.manuscript_version = 1
+    with pytest.raises(GuardViolationError, match="no manuscript draft"):
+        advance(repo, Phase.STAGE6_AUDIT)
+
+    # ---------------- Stage 6: evidence-grounded draft -> independent audit -> sign-off ----
+    svc = ManuscriptService(repo, PID)
+    draft = svc.create_template_draft(Actor("orchestrator", ActorType.SYSTEM))
+    # every number in the draft comes from the evidence package, e.g. the single-study MD
+    assert "only one study contributed data" in draft.rendered_markdown
     advance(repo, Phase.STAGE6_AUDIT)
-
-    def report(reported: float, status: CheckStatus, version: int) -> AuditReport:
-        return AuditReport(
-            project_id=PID,
-            manuscript_version=version,
-            stats_output_sha256=stage5.sha256,
-            generated_at=NOW.replace(minute=version),
-            numeric_checks=[
-                NumericClaimCheck(
-                    claim_text=f"MD {reported}",
-                    manuscript_location="Results",
-                    reported_value=reported,
-                    stats_key="hba1c.md",
-                    expected_value=-0.5,
-                    tolerance=0.005,
-                    status=status,
-                )
-            ],
-            citation_checks=[
-                CitationCheck(
-                    citation_text="Synthetica 2021",
-                    manuscript_location="ref 1",
-                    pmid="90000001",
-                    matched_record_id=main_id,
-                    status=CheckStatus.VERIFIED,
-                )
-            ],
-        )
-
-    repo.save_audit_report(report(-0.6, CheckStatus.MISMATCH, 1))
+    first = svc.audit()
+    assert first.complete and not first.passed  # [[AUTHOR INPUT]] markers block it
+    assert any(
+        f.status == CheckStatus.MISSING and "author input" in f.message for f in first.findings
+    )
     with pytest.raises(GuardViolationError, match="not passed"):
         advance(repo, Phase.COMPLETED)
     advance(repo, Phase.STAGE6_MANUSCRIPT)  # audit failed -> redraft
-    project.manuscript_version = 2
+    reviewer = Actor("Dr Human Reviewer", ActorType.HUMAN, REVIEWER["id"])
+    complete_manuscript(svc, reviewer)
+    # the earlier audit examined version 1 and can never authorise version 2
+    assert any("examined version 1" in p for p in repo.build_guard_context(PID).audit_problems)
     advance(repo, Phase.STAGE6_AUDIT)
-    repo.save_audit_report(report(-0.5, CheckStatus.VERIFIED, 2))
+    report = svc.audit()
+    assert report.passed, [f.message for f in report.findings if f.blocking]
+    for f in report.findings:
+        if f.needs_human:
+            svc.acknowledge(
+                report.report_id,
+                f.finding_id,
+                decision="confirmed_supported",
+                note="checked against the source by the reviewer",
+                reviewer_id=REVIEWER["id"],
+                reviewer_name="Dr Human Reviewer",
+            )
+    with pytest.raises(GuardViolationError, match="sign-off"):
+        advance(repo, Phase.COMPLETED)
+    svc.approve(
+        reviewer_id=REVIEWER["id"],
+        reviewer_name="Dr Human Reviewer",
+        statement="I have read the manuscript and the audit and approve version 2.",
+    )
     advance(repo, Phase.COMPLETED)
 
     machine = repo.load_state_machine(PID)
     assert machine.is_terminal
     phases = [t.to_phase for t in machine.history]
     assert phases.count(Phase.STAGE6_AUDIT) == 2
+    assert [v.version for v in repo.list_manuscript_versions(PID)] == [1, 2]
+    assert len(repo.list_audit_reports(PID)) == 2  # the failed audit is preserved
     human_gate_steps = [t for t in machine.history if t.gate_decision is not None]
     assert {t.gate_decision.gate for t in human_gate_steps if t.gate_decision} == set(GateId)
     final = repo.load_prisma(PID)
