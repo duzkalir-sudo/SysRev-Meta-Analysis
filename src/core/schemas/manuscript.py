@@ -230,15 +230,20 @@ class ReferenceVerification(FrozenModel):
     checked_at: AwareDatetime = Field(default_factory=utc_now)
     checked_by: NonEmptyStr
     reviewer_id: Identifier | None = None
+    # human attestations only: the identity-confirmed PDF the metadata was compared with. The
+    # attestation is valid only while that exact PDF remains the report's confirmed PDF.
+    pdf_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _attestation(self) -> ReferenceVerification:
         if self.source == "human_attestation":
             if self.reviewer_id is None or len(self.message.strip()) < 10:
                 raise ValueError("an identity attestation needs the reviewer and its basis")
+            if self.pdf_sha256 is None:
+                raise ValueError("an identity attestation names the PDF (SHA-256) it relied on")
             if self.status not in ("verified", "mismatch"):
                 raise ValueError("an attestation either confirms or contradicts the identity")
-        elif self.reviewer_id is not None:
+        elif self.reviewer_id is not None or self.pdf_sha256 is not None:
             raise ValueError("live lookups are not human attestations")
         return self
 

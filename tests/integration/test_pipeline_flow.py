@@ -44,7 +44,7 @@ from src.core.schemas import (
     ScreeningDecision,
 )
 from src.core.schemas.stats import AnalysisPlan, AnalysisSpec
-from src.extraction import record_unavailability
+from src.extraction import link_reports_to_study, record_unavailability
 from src.manuscript.service import Actor, ManuscriptService
 from src.screening import (
     CohortOverlapDetector,
@@ -381,6 +381,11 @@ async def test_full_pipeline(
         reason="follow-up report of the main cohort",
         outcome_id="hba1c",
     )
+    # The follow-up is a second report of the same study: a documented human decision, which
+    # is what makes PRISMA count one study (cohort overlap alone never does).
+    link_reports_to_study(repo, PID, [main_id, follow_id], study_id="study-main",
+                          primary_record_id=main_id, reviewer=human,
+                          note="follow-up publication of the same trial")  # fmt: skip
     decide(repo, gate(GateId.GATE_3))
     assert repo.get_project(PID).phase == Phase.STAGE5_META_ANALYSIS
 

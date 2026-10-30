@@ -57,7 +57,7 @@ from src.manuscript.formatting import (
     parse_number,
 )
 
-AUDITOR_VERSION = "stage6-auditor-1.1.0"
+AUDITOR_VERSION = "stage6-auditor-1.2.0"
 ESTIMATE_ROLES = frozenset(
     {"pooled_estimate", "single_study_estimate", "study_estimate", "sensitivity_estimate"}
 )

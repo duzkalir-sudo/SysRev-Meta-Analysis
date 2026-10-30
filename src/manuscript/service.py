@@ -364,6 +364,11 @@ class ManuscriptService:
         state = self.package().references.get(ref_key)
         if state is None:
             raise SysRevError(f"reference {ref_key} is not in the registry")
+        item = (
+            self.repo.get_fulltext_item(self.project_id, state.entry.record_id)
+            if state.entry.record_id
+            else None
+        )
         v = ReferenceVerification(
             ref_key=ref_key,
             metadata_sha256=state.entry.metadata_sha256(),
@@ -372,6 +377,7 @@ class ManuscriptService:
             message=basis,
             checked_by=reviewer_name,
             reviewer_id=reviewer_id,
+            pdf_sha256=item.pdf_sha256 if item is not None else None,
         )
         self.repo.save_reference_verification(self.project_id, v)
         return v

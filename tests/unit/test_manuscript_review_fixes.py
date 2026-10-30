@@ -5,7 +5,9 @@
 2. unbound narrative assertions never pass silently: they require human review;
 3. follow-up timepoints in the characteristics table are source-bound facts;
 4. a PRISMA snapshot that contradicts the stored records blocks the audit;
-5. included reports without DOI/PMID have an evidence-based human identity attestation.
+5. included reports without DOI/PMID have an evidence-based human identity attestation;
+6. the PRISMA study count equals the documented report-to-study links exactly;
+7. an attestation is bound to the exact identity-confirmed PDF it relied on.
 """
 
 from __future__ import annotations
@@ -13,15 +15,26 @@ from __future__ import annotations
 import pytest
 from sqlalchemy.orm import Session
 
-from src.core.enums import CheckStatus, SourceDatabase, TimepointType
+from src.core.enums import (
+    CheckStatus,
+    OverlapResolution,
+    OverlapSeverity,
+    Phase,
+    SourceDatabase,
+    TimepointType,
+)
 from src.core.exceptions import SysRevError
 from src.core.schemas.audit import REQUIRED_SCOPES, AuditReport
+from src.core.schemas.cohort import CohortOverlapWarning, OverlapSignal
 from src.core.schemas.manuscript import ReferenceVerification
 from src.core.schemas.pipeline import PRISMACounts
 from src.core.schemas.protocol import FollowUpTimepoint
-from src.manuscript.evidence import build_evidence_package
+from src.extraction import link_reports_to_study
+from src.manuscript.evidence import build_evidence_package, prisma_consistency_problems
 from src.manuscript.formatting import DisplayNumber, find_numbers, mask_identifiers
-from src.manuscript.service import ManuscriptService
+from src.manuscript.service import ManuscriptService, completion_problems
+from src.search.prisma_sync import derive_prisma
+from src.state.repository import Repository
 from tests.manuscript_helpers import REVIEWER, complete_manuscript, human, single_arm_project
 from tests.stats_helpers import LAST_FU, MONTHS_24, stats_arm
 from tests.unit.test_manuscript_audit import Ctx, _ctx, blocking, findings
@@ -345,3 +358,202 @@ def test_attested_mismatch_blocks(session: Session) -> None:
     svc.rerender(human(svc.repo, rid))
     r = svc.audit()
     assert findings(r, CheckStatus.MISMATCH, "citations") and not r.passed
+
+
+# --------------------------------------------------------------------------- 6. study count
+# (second review of PR #11: the exact study count, and PDF-bound attestations)
+
+
+def _overlap(repo: Repository, rid: str, a: str, b: str) -> None:
+    w = CohortOverlapWarning(
+        record_id_a=a,
+        record_id_b=b,
+        overlap_score=0.8,
+        severity=OverlapSeverity.HIGH,
+        signals=[OverlapSignal(kind="coauthor_overlap", score=0.8, detail="synthetic")],
+    )
+    repo.save_overlap_warning("ms1", w)
+    repo.resolve_overlap_warning(
+        "ms1",
+        w.warning_id,
+        resolution=OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
+        reviewer_id=rid,
+        note="overlapping recruitment at one centre",
+    )
+
+
+def _study_count_problems(repo: Repository, n: int) -> list[str]:
+    snapshot = derive_prisma(repo, "ms1").model_copy(update={"studies_included": n})
+    return prisma_consistency_problems(repo, "ms1", snapshot)
+
+
+def test_overlapping_cohorts_are_not_one_study(session: Session) -> None:
+    repo, rid, _ = single_arm_project(session)
+    _overlap(repo, rid, "s1", "s2")
+    _overlap(repo, rid, "s3", "s4")
+    # six reports, no report-to-study link: six studies, whatever the participant overlap
+    assert _study_count_problems(repo, 6) == []
+    for wrong in (4, 5):  # the cohort count and an intermediate count are both refused
+        problems = _study_count_problems(repo, wrong)
+        assert any("exactly 6 distinct studies" in p for p in problems), problems
+
+
+def test_multiple_reports_of_one_study_need_a_documented_link(session: Session) -> None:
+    repo, rid, _ = single_arm_project(session)
+    reviewer = repo.require_active_reviewer(rid)
+    assert _study_count_problems(repo, 5)  # not yet documented
+    link_reports_to_study(
+        repo,
+        "ms1",
+        ["s1", "s2"],
+        study_id="study-a",
+        primary_record_id="s1",
+        reviewer=reviewer,
+        note="s2 is the long-term follow-up of s1",
+    )
+    assert _study_count_problems(repo, 5) == []  # exact, reproducible from the links
+    assert _study_count_problems(repo, 6) and _study_count_problems(repo, 4)
+
+
+def test_intermediate_study_count_blocks_the_audit(session: Session) -> None:
+    repo, rid, _ = single_arm_project(
+        session,
+        study_links=[["s1", "s2"]],
+        before_stats=lambda r, reviewer_id: _overlap(r, reviewer_id, "s3", "s4"),
+    )
+    # the documented count is 5; 4 would equal the number of distinct cohorts
+    repo.save_prisma("ms1", derive_prisma(repo, "ms1").model_copy(update={"studies_included": 4}))
+    svc = ManuscriptService(repo, "ms1")
+    complete_manuscript(svc, human(repo, rid))
+    report = svc.audit()
+    assert not report.passed
+    assert any(
+        "exactly 5 distinct studies" in m
+        for m in findings(report, CheckStatus.MISMATCH, "provenance")
+    )
+    repo.save_prisma("ms1", derive_prisma(repo, "ms1"))
+    svc.rerender(human(repo, rid))
+    assert svc.audit().passed
+
+
+# --------------------------------------------------------------------------- 7. PDF-bound
+
+
+def _attested(session: Session) -> tuple[ManuscriptService, str]:
+    svc, rid = _no_ids(session)
+    svc.attest_reference(
+        "study-s1",
+        confirmed=True,
+        basis="title, authors and year match the identity-confirmed PDF title page",
+        reviewer_id=rid,
+        reviewer_name=REVIEWER,
+    )
+    svc.rerender(human(svc.repo, rid))
+    return svc, rid
+
+
+def _sign_off(svc: ManuscriptService, rid: str) -> None:
+    report = svc.audit()
+    assert report.passed, blocking(report)
+    for f in report.findings:
+        if f.needs_human:
+            svc.acknowledge(
+                report.report_id,
+                f.finding_id,
+                decision="confirmed_supported",
+                note="checked against the sources",
+                reviewer_id=rid,
+                reviewer_name=REVIEWER,
+            )
+    svc.repo.get_project("ms1").phase = Phase.STAGE6_AUDIT.value
+    svc.approve(reviewer_id=rid, reviewer_name=REVIEWER, statement="Approved after review.")
+    assert completion_problems(svc.repo, "ms1") == []
+
+
+def test_attestation_records_the_exact_pdf(session: Session) -> None:
+    svc, _ = _attested(session)
+    attestation = next(
+        v for v in svc.repo.load_reference_verifications("ms1") if v.source == "human_attestation"
+    )
+    item = svc.repo.get_fulltext_item("ms1", "s1")
+    assert item is not None and attestation.pdf_sha256 == item.pdf_sha256
+    with pytest.raises(ValueError, match="names the PDF"):
+        ReferenceVerification(
+            ref_key="k",
+            metadata_sha256="0" * 64,
+            source="human_attestation",
+            status="verified",
+            message="compared with the PDF",
+            checked_by="x",
+            reviewer_id="r",
+        )
+
+
+def test_unchanged_pdf_evidence_remains_valid(session: Session) -> None:
+    svc, rid = _attested(session)
+    _sign_off(svc, rid)
+    item = svc.repo.get_fulltext_item("ms1", "s1")
+    assert item is not None
+    svc.repo.save_fulltext_item("ms1", item)  # re-saving identical evidence changes nothing
+    assert completion_problems(svc.repo, "ms1") == []
+
+
+def test_replaced_pdf_invalidates_attestation_audit_and_approval(session: Session) -> None:
+    svc, rid = _attested(session)
+    _sign_off(svc, rid)
+    item = svc.repo.get_fulltext_item("ms1", "s1")
+    assert item is not None
+    replaced = item.model_copy(update={"pdf_sha256": "c" * 64, "pdf_filename": "s1_v2.pdf"})
+    svc.repo.save_fulltext_item("ms1", replaced)  # a new PDF, even with a confirmed identity
+    problems = completion_problems(svc.repo, "ms1")
+    assert any("evidence changed" in p and "references_sha256" in p for p in problems)
+    svc.rerender(human(svc.repo, rid))
+    r = svc.audit()
+    stale = findings(r, CheckStatus.NOT_CHECKED, "citations")
+    assert any("no longer valid" in m and "attest again" in m for m in stale) and not r.passed
+    # re-verification against the replacement PDF restores it
+    with pytest.raises(SysRevError, match="current confirmed PDF"):
+        svc.repo.save_reference_verification(
+            "ms1",
+            ReferenceVerification(
+                ref_key="study-s1",
+                metadata_sha256=svc.package().references["study-s1"].entry.metadata_sha256(),
+                source="human_attestation",
+                status="verified",
+                message="relying on the old PDF",
+                checked_by=REVIEWER,
+                reviewer_id=rid,
+                pdf_sha256=item.pdf_sha256,
+            ),
+        )
+    svc.attest_reference(
+        "study-s1",
+        confirmed=True,
+        basis="title page of the replacement PDF matches the stored metadata",
+        reviewer_id=rid,
+        reviewer_name=REVIEWER,
+    )
+    svc.rerender(human(svc.repo, rid))
+    assert svc.audit().passed
+
+
+def test_revoked_pdf_identity_invalidates_attestation(session: Session) -> None:
+    svc, rid = _attested(session)
+    _sign_off(svc, rid)
+    item = svc.repo.get_fulltext_item("ms1", "s1")
+    assert item is not None
+    svc.repo.save_fulltext_item("ms1", item.model_copy(update={"match_status": None}))
+    assert any("evidence changed" in p for p in completion_problems(svc.repo, "ms1"))
+    svc.rerender(human(svc.repo, rid))
+    r = svc.audit()
+    assert any(
+        "confirmed PDF is now none" in m for m in findings(r, CheckStatus.NOT_CHECKED, "citations")
+    )
+    with pytest.raises(SysRevError, match="confirmed identity"):
+        svc.attest_reference(
+            "study-s1",
+            confirmed=True,
+            basis="compared with the PDF again",
+            reviewer_id=rid,
+            reviewer_name=REVIEWER,
+        )

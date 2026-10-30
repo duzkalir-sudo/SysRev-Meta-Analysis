@@ -1693,6 +1693,8 @@ class Repository:
             raise SysRevError(
                 "the report has no PDF with a confirmed identity to attest the reference against"
             )
+        if v.pdf_sha256 != item.pdf_sha256:
+            raise SysRevError("the attestation does not name the report's current confirmed PDF")
 
     def load_reference_verifications(self, project_id: str) -> list[ReferenceVerification]:
         rows = self.session.scalars(

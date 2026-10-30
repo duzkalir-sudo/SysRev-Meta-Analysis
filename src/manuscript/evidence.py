@@ -175,6 +175,10 @@ class ReferenceState:
     verifications: tuple[ReferenceVerification, ...]
     provenance_basis: str | None  # identity established by retrieval from a bibliographic API
     excerpts: tuple[EvidenceExcerpt, ...]
+    # human attestations no longer backed by the report's current confirmed PDF (ignored)
+    invalid_attestations: tuple[str, ...] = ()
+    # current PDF identity of an included report ("<sha256>:<match status>"), fingerprinted
+    pdf_identity: str | None = None
 
     @property
     def identity_status(self) -> str:
@@ -195,7 +199,8 @@ class ReferenceState:
             )
         if self.provenance_basis:
             return self.provenance_basis
-        return "; ".join(v.message for v in self.verifications) or "never verified"
+        notes = [v.message for v in self.verifications] + list(self.invalid_attestations)
+        return "; ".join(notes) or "never verified"
 
 
 @dataclass
@@ -615,9 +620,27 @@ def build_evidence_package(repo: Repository, project_id: str) -> EvidencePackage
     excerpts = repo.load_evidence_excerpts(project_id)
     for key, state in list(references.items()):
         meta = state.entry.metadata_sha256()
+        item = (
+            repo.get_fulltext_item(project_id, state.entry.record_id)
+            if state.entry.origin == "included_study_record" and state.entry.record_id
+            else None
+        )
+        confirmed_pdf = item.pdf_sha256 if item is not None and item.has_usable_pdf else None
         latest: dict[str, ReferenceVerification] = {}
+        invalid: list[str] = []
         for v in verifications:  # chronological: later lookups replace earlier ones
             if v.ref_key != key or v.metadata_sha256 != meta:
+                continue
+            if v.source == "human_attestation" and (
+                confirmed_pdf is None or v.pdf_sha256 != confirmed_pdf
+            ):
+                # The attestation relied on a PDF that is no longer the report's
+                # identity-confirmed PDF (replaced, changed or confirmation revoked).
+                invalid.append(
+                    f"attestation by {v.checked_by} ({v.checked_at.date()}) no longer valid: it "
+                    f"relied on PDF {str(v.pdf_sha256)[:12]}…, the report's confirmed PDF is now "
+                    f"{confirmed_pdf[:12] + '…' if confirmed_pdf else 'none'}; attest again"
+                )
                 continue
             prior = latest.get(v.source)
             if v.status == "unavailable" and prior is not None and prior.status != "unavailable":
@@ -628,6 +651,8 @@ def build_evidence_package(repo: Repository, project_id: str) -> EvidencePackage
             tuple(latest.values()),
             state.provenance_basis,
             tuple(e for e in excerpts if e.ref_key == key),
+            tuple(invalid),
+            None if item is None else f"{item.pdf_sha256}:{item.match_status}",
         )
 
     # ---- statistics
@@ -728,16 +753,20 @@ def prisma_consistency_problems(
     problems = [f"PRISMA: {v}" for v in stored.invariant_violations()]
     if not stored.is_final:
         problems.append("PRISMA: the flow is not final (records/reports still awaiting a decision)")
-    # Studies: reports linked to one study count once; reports a human resolved as describing
-    # overlapping cohorts may or may not be one study, so any count between the number of
-    # distinct cohorts and the number of distinct linked studies is consistent.
+    # Studies: exactly the number of distinct studies documented by authenticated
+    # report-to-study links (an unlinked report is its own study). A cohort-overlap decision
+    # says that participants overlap, not that two reports describe one study, so it never
+    # changes this count; reports of one study must be linked (``link_reports_to_study``).
     included = repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
-    most = len(set(repo.study_ids(project_id, set(included)).values()))
-    least = len(set(repo.cohort_ids(project_id, set(included)).values()))
-    if not least <= stored.studies_included <= most:
+    studies = repo.study_ids(project_id, set(included))
+    exact = len(set(studies.values()))
+    if stored.studies_included != exact:
+        linked = sorted({sid for rid, sid in studies.items() if sid != rid})
         problems.append(
-            f"PRISMA studies_included is {stored.studies_included} in the stored snapshot but the "
-            f"stored records imply between {least} (distinct cohorts) and {most} (linked studies)"
+            f"PRISMA studies_included is {stored.studies_included} in the stored snapshot but "
+            f"the documented report-to-study links give exactly {exact} distinct studies from "
+            f"{len(included)} included reports (linked studies: {linked or 'none'}); link the "
+            "reports of one study, or correct the snapshot"
         )
     for name in PRISMA_FIELDS:
         if name == "studies_included":
@@ -1434,6 +1463,8 @@ def _fingerprint(
             "verifications": [v.verification_id for v in s.verifications],
             "basis": s.provenance_basis,
             "excerpts": [e.excerpt_id for e in s.excerpts],
+            # a replaced PDF or a revoked identity confirmation changes the evidence state
+            "pdf_identity": s.pdf_identity,
         }
         for k, s in sorted(package.references.items())
     }

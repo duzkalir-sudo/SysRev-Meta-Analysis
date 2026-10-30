@@ -13,6 +13,7 @@ DOIs use the 10.5555 test prefix and PMIDs are invented (9xxxxxxx).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 from typing import Any
 
@@ -36,6 +37,7 @@ from src.core.schemas import FullTextItem, ScreeningDecision, StudyRecord
 from src.core.schemas.search import SearchRun
 from src.core.schemas.stats import AnalysisSpec
 from src.core.schemas.study import SearchProvenance
+from src.extraction import link_reports_to_study
 from src.manuscript.service import Actor, ManuscriptService
 from src.search.prisma_sync import derive_prisma
 from src.state.repository import Repository
@@ -157,6 +159,8 @@ def single_arm_project(
     *,
     extra_arms: list[Any] | None = None,
     record_overrides: dict[str, dict[str, Any]] | None = None,
+    study_links: list[list[str]] | None = None,
+    before_stats: Callable[[Repository, str], None] | None = None,
 ) -> tuple[Repository, str, str]:
     """A single-arm review in Stage 6 with a verified statistics artifact.
 
@@ -194,6 +198,18 @@ def single_arm_project(
         repo.save_extracted_arm(pid, km_arm(r, est, lo, hi))
     for rec in records:
         repo.save_rob(pid, approved_rob(rec.record_id, rid, name=REVIEWER))
+    for group in study_links or []:  # documented before Stage 5 (the links are an input)
+        link_reports_to_study(
+            repo,
+            pid,
+            group,
+            study_id=f"study-{group[0]}",
+            primary_record_id=group[0],
+            reviewer=repo.require_active_reviewer(rid),
+            note="synthetic: reports of one study",
+        )
+    if before_stats is not None:  # further human decisions that are Stage 5 inputs
+        before_stats(repo, rid)
     repo.save_prisma(pid, derive_prisma(repo, pid))
     _to_stage6(
         repo,

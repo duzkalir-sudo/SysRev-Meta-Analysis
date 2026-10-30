@@ -931,9 +931,13 @@ id); only explicit user action starts them; the result is a new, unaudited versi
 **PRISMA consistency.** The evidence package re-derives the PRISMA counts from the stored
 records, decisions, manifest and study links (`derive_prisma`) and reports every difference
 from the stored snapshot (identification per source, duplicates, screening, retrieval,
-assessment, exclusion reasons, reports included; studies included must lie between the
-number of human-resolved cohorts and the number of linked studies), plus snapshot
-invariants and a non-final flow. Differences become blocking `provenance` findings; the
+assessment, exclusion reasons, reports included), plus snapshot invariants and a non-final
+flow. **Studies included** must equal exactly the number of distinct studies documented by
+authenticated report-to-study links (`StudyReportLink`; an unlinked report is its own
+study). A cohort-overlap resolution records overlapping participants, not study identity,
+so it never changes the count: reports of one study must be linked explicitly, and
+different studies with overlapping populations remain separate studies (their double
+counting is handled in the analyses, §9.3). Differences become blocking `provenance` findings; the
 stored values are shown as they are and never repaired.
 
 **References** (`references.py`). Included-study references are derived from stored
@@ -945,7 +949,12 @@ reported as `not_checked` (blocking). A failed lookup never erases an earlier de
 An included report with **neither DOI nor PMID** has nothing to look up; an active enrolled
 reviewer may record a `human_attestation` (confirmed or contradicted, with the basis),
 accepted only if the report's linked PDF has a confirmed identity and only for the
-reference's current metadata. A reference with an identifier can never be attested instead
+reference's current metadata. The attestation records that PDF's SHA-256; it counts only
+while the same PDF is still the report's identity-confirmed PDF. A replaced or changed PDF,
+or a revoked identity confirmation, voids it (the reference becomes *not checked* until a
+new attestation against the current confirmed PDF), and because each included report's PDF
+identity is part of the evidence fingerprint, any audit or sign-off made before the change
+no longer authorises completion. A reference with an identifier can never be attested instead
 of verified live.
 
 **Audit scopes** (`auditor.py`):
