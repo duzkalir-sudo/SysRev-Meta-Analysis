@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.core.enums import Phase, ScreeningStage
+from src.core.enums import Phase
 from src.core.exceptions import StatisticsInputError
 from src.core.schemas.base import utc_now
 from src.core.schemas.stats import StatsOutput, canonical_json
@@ -45,11 +45,7 @@ def run_stage5(
     plan = repo.latest_analysis_plan(project_id)
     if plan is None:
         raise StatisticsInputError("no human-approved analysis plan")
-    inputs = repo.load_stage5_inputs(project_id)
-    included = repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
-    stray = sorted({a.record_id for a in inputs.arms} - included)
-    if stray:
-        raise StatisticsInputError(f"arms exist for reports not included at full text: {stray}")
+    inputs = repo.load_stage5_inputs(project_id)  # validated by run_plan (fail closed)
     output = run_plan(plan, inputs, project_id=project_id, generated_at=generated_at or utc_now())
     sha = repo.record_stats_output(project_id, output)
     files = write_artifacts(output, output_dir, render_plots=render_plots)

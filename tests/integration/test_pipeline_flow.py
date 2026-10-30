@@ -398,7 +398,15 @@ async def test_full_pipeline(
     # one study: its own MD is reported, nothing is "pooled" and no heterogeneity is computed
     assert (md.status, md.k, md.heterogeneity) == ("single_study", 1, None)
     assert md.studies[0].estimate_natural == pytest.approx(-0.5)
-    assert [e.reason_code for e in md.excluded] == ["recorded_unavailable"]
+    # the follow-up report belongs to the included cohort: it is not a separate excluded
+    # study, but the per-report ledger accounts for it with the human's reason
+    assert md.excluded == []
+    ledger = {r.record_id: r for r in md.reports}
+    assert set(ledger) == {main_id, follow_id}
+    assert ledger[main_id].status == "included"
+    follow = ledger[follow_id]
+    assert (follow.status, follow.reason_code) == ("excluded", "recorded_unavailable")
+    assert follow.reason is not None and "not counted as a separate study" in follow.reason
     assert (tmp_path / "stats" / "stats_output.json").read_text() == (
         stage5.output.to_canonical_json()
     )

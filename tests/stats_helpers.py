@@ -153,11 +153,15 @@ OUTCOMES = {
 }
 
 
-def inputs(arms: list[ExtractedStudyArm], **kw: Any) -> AnalysisInputs:
-    rids = sorted({a.record_id for a in arms})
+def inputs(
+    arms: list[ExtractedStudyArm], *, eligible: list[str] | None = None, **kw: Any
+) -> AnalysisInputs:
+    """Inputs for ``arms``; the eligible universe defaults to the reports that have arms."""
+    rids = sorted(set(eligible if eligible is not None else []) | {a.record_id for a in arms})
     data: dict[str, Any] = {
         "outcomes": OUTCOMES,
         "arms": arms,
+        "eligible_record_ids": frozenset(rids),
         "study_of": {r: r for r in rids},
         "cohort_of": {r: r for r in rids},
         "labels": {r: f"Synthetic {r}" for r in rids},

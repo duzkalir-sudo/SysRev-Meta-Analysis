@@ -8,16 +8,27 @@ import pytest
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from src.core.enums import Phase, ReviewDesign, StudyDesign
+from src.core.enums import (
+    FullTextStatus,
+    Phase,
+    ReviewDesign,
+    ReviewerRole,
+    ScreeningStage,
+    ScreeningVerdict,
+    StudyDesign,
+)
 from src.core.exceptions import StatisticsInputError, SysRevError
+from src.core.schemas import FullTextItem, ScreeningDecision, StudyRecord
 from src.core.schemas.protocol import FollowUpTimepoint
-from src.core.schemas.stats import AnalysisSpec
+from src.core.schemas.stats import AnalysisResult, AnalysisSpec, StatsOutput, results_fingerprint
+from src.state import repository as repository_module
 from src.state.db import AppendOnlyViolationError, StatsOutputORM
 from src.state.machine import PipelineStateMachine
 from src.state.repository import Repository
 from src.stats_engine.engine import run_plan
 from src.stats_engine.stage5 import run_stage5, write_artifacts
 from tests.conftest import NOW, make_protocol, make_record
+from tests.fakes import include_at_title_abstract
 from tests.stats_helpers import LAST_FU, NECROSIS, OUTCOMES, REVIEWER, plan, stats_arm
 
 PID = "p5"
@@ -39,14 +50,33 @@ def repo(session: Session) -> Repository:
             outcomes=[OUTCOMES["control_crude"], OUTCOMES["necrosis"]],
         ),
     )
-    r.save_records(
-        PID, [make_record(rid, f"Synthetic case series {rid}") for rid, _, _ in NECROSIS]
-    )
+    records = [make_record(rid, f"Synthetic case series {rid}") for rid, _, _ in NECROSIS]
+    r.save_records(PID, records)
+    include_at_full_text(r, records)
     for rid, x, n in NECROSIS:
         r.save_extracted_arm(
             PID, stats_arm(rid, "necrosis", follow_up=LAST_FU, events=x, n_analyzed=n)
         )
     return r
+
+
+def include_at_full_text(repo: Repository, records: list[StudyRecord]) -> None:
+    """Synthetic dual include decisions at both screening stages, with a retrieved PDF."""
+    include_at_title_abstract(repo, PID, records)
+    for rec in records:
+        repo.save_fulltext_item(
+            PID,
+            FullTextItem(record_id=rec.record_id, title=rec.title,
+                         status=FullTextStatus.OA_DOWNLOADED, pdf_filename=f"{rec.record_id}.pdf",
+                         pdf_sha256="b" * 64),
+        )  # fmt: skip
+        for role in (ReviewerRole.REVIEWER_1, ReviewerRole.REVIEWER_2):
+            repo.save_screening_decision(
+                PID,
+                ScreeningDecision(record_id=rec.record_id, reviewer=role,
+                                  reviewer_identity=f"agent-{role}", stage=ScreeningStage.FULL_TEXT,
+                                  verdict=ScreeningVerdict.INCLUDE, rationale="synthetic include"),
+            )  # fmt: skip
 
 
 def _reviewer(repo: Repository) -> str:
@@ -178,7 +208,11 @@ def test_run_stage5_refusals(repo: Repository, tmp_path: Path) -> None:
     with pytest.raises(StatisticsInputError, match="analysis plan"):
         run_stage5(repo, PID, output_dir=tmp_path)
     repo.save_analysis_plan(PID, plan(NEC, reviewer_id=_reviewer(repo)))
-    # no screening decisions recorded: the arms belong to reports not included at full text
+    # an arm for a report that was never included at full-text assessment
+    repo.save_records(PID, [make_record("stray", "Synthetic excluded report")])
+    repo.save_extracted_arm(
+        PID, stats_arm("stray", "necrosis", follow_up=LAST_FU, events="1", n_analyzed="9")
+    )
     with pytest.raises(StatisticsInputError, match="not included at full text"):
         run_stage5(repo, PID, output_dir=tmp_path)
 
@@ -199,3 +233,57 @@ def test_artifacts_written_with_manifest(repo: Repository, tmp_path: Path) -> No
     } <= set(files)
     assert (tmp_path / "stats_output.json").read_text() == output.to_canonical_json()
     assert output.sha256() in (tmp_path / "manifest.json").read_text()
+
+
+def _forged(output: StatsOutput, path: tuple[str, ...], delta: float) -> StatsOutput:
+    """Alter one number and rebuild every hash so the artifact is self-consistent."""
+    payload = output.model_dump(mode="json")
+    target = payload["analyses"][0]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] += delta
+    analyses = [AnalysisResult.model_validate(a) for a in payload["analyses"]]
+    payload["results_sha256"] = results_fingerprint(
+        analyses, output.plan_sha256, output.input_sha256
+    )
+    return StatsOutput.model_validate(payload)  # passes schema and fingerprint checks
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("random_effects", "estimate"),
+        ("primary", "ci_upper_natural"),
+        ("studies", 0, "yi"),
+        ("heterogeneity", "q"),
+    ],
+)
+def test_numerically_altered_self_consistent_output_rejected(
+    repo: Repository, path: tuple[object, ...]
+) -> None:
+    rid = _reviewer(repo)
+    _to_stage5(repo)
+    approved = plan(NEC, reviewer_id=rid)
+    repo.save_analysis_plan(PID, approved)
+    genuine = run_plan(approved, repo.load_stage5_inputs(PID), project_id=PID, generated_at=NOW)
+    forged = _forged(genuine, path, 1e-9)  # type: ignore[arg-type]
+    assert forged.results_sha256 != genuine.results_sha256
+    with pytest.raises(SysRevError, match="deterministic recomputation") as err:
+        repo.record_stats_output(PID, forged)
+    assert str(path[0]) in str(err.value)
+    assert repo.get_project(PID).stats_output_sha256 is None
+    assert repo.record_stats_output(PID, genuine) == genuine.sha256()
+
+
+def test_status_checks_do_not_recompute_statistics(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rid = _reviewer(repo)
+    _to_stage5(repo)
+    _record(repo, rid)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the engine must not run on a status request")
+
+    monkeypatch.setattr(repository_module, "run_plan", boom)
+    assert repo.build_guard_context(PID).stats_output_problems == ()

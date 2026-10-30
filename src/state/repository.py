@@ -85,6 +85,7 @@ from src.state.db import (
     StudyReportLinkORM,
 )
 from src.state.machine import GuardContext, PipelineStateMachine
+from src.stats_engine.engine import run_plan
 from src.stats_engine.inputs import AnalysisInputs
 
 
@@ -1145,7 +1146,8 @@ class Repository:
         """Every persisted fact the statistics engine may read (all human-reviewed)."""
         protocol = self.latest_protocol(project_id)
         arms = self.load_extracted_arms(project_id)
-        record_ids = {a.record_id for a in arms}
+        eligible = self.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
+        record_ids = eligible | {a.record_id for a in arms}
         labels: dict[str, str] = {}
         for rid in sorted(record_ids):
             rec = self.get_record(project_id, rid)
@@ -1155,6 +1157,7 @@ class Repository:
         return AnalysisInputs(
             outcomes={} if protocol is None else {o.outcome_id: o for o in protocol.outcomes},
             arms=arms,
+            eligible_record_ids=frozenset(eligible),
             study_of=self.study_ids(project_id, record_ids),
             cohort_of=self.cohort_ids(project_id, record_ids),
             labels=labels,
@@ -1166,13 +1169,17 @@ class Repository:
         """Store a ``stats_output.json`` and make it the project's statistics artifact.
 
         Refused unless the project is in Stage 5 and the artifact verifies against the
-        current approved plan and the current approved extraction data.
+        current approved plan and the current approved extraction data, **and** its analyses
+        are exactly what the deterministic engine computes from them (numerical provenance:
+        the plan is re-run here once; status checks later only re-verify hashes).
         """
         project = self.get_project(project_id)
         if project.phase != Phase.STAGE5_META_ANALYSIS.value:
             raise SysRevError(f"statistics can only be recorded in Stage 5 (phase={project.phase})")
         content = output.to_canonical_json()
         problems = self._verify_stats(project_id, output, content)
+        if not problems:
+            problems = self._verify_provenance(project_id, output)
         if problems:
             raise SysRevError("statistics artifact rejected: " + "; ".join(problems))
         sha = output.sha256()
@@ -1186,6 +1193,33 @@ class Repository:
         project.stats_output_sha256 = sha
         self.session.flush()
         return sha
+
+    def _verify_provenance(self, project_id: str, output: StatsOutput) -> list[str]:
+        """Recompute every analysis from the approved plan and current data; any difference
+        in any field (bit-for-bit, via the results fingerprint) rejects the artifact."""
+        plan = self.latest_analysis_plan(project_id)
+        if plan is None:  # pragma: no cover - _verify_stats reports this first
+            return ["no approved analysis plan"]
+        try:
+            expected = run_plan(
+                plan,
+                self.load_stage5_inputs(project_id),
+                project_id=project_id,
+                generated_at=output.generated_at,
+            )
+        except SysRevError as exc:
+            return [f"the approved plan cannot be recomputed from current data: {exc}"]
+        if expected.results_sha256 == output.results_sha256:
+            return []
+        diffs = _first_differences(
+            [a.model_dump(mode="json") for a in expected.analyses],
+            [a.model_dump(mode="json") for a in output.analyses],
+            "analyses",
+        )
+        return [
+            "numerical results do not match a deterministic recomputation by the statistics "
+            "engine (first differences: " + "; ".join(diffs[:5]) + ")"
+        ]
 
     def current_stats_output(self, project_id: str) -> StatsOutput | None:
         project = self.get_project(project_id)
@@ -1466,3 +1500,18 @@ class Repository:
             ):
                 human.add(rid)
         return set(final) - human
+
+
+def _first_differences(expected: object, actual: object, path: str) -> list[str]:
+    """Paths where two JSON-like values differ (used to explain a provenance rejection)."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        out: list[str] = []
+        for key in sorted(set(expected) | set(actual)):
+            out += _first_differences(expected.get(key), actual.get(key), f"{path}.{key}")
+        return out
+    if isinstance(expected, list) and isinstance(actual, list) and len(expected) == len(actual):
+        out = []
+        for i, (x, y) in enumerate(zip(expected, actual, strict=True)):
+            out += _first_differences(x, y, f"{path}[{i}]")
+        return out
+    return [] if expected == actual else [f"{path}: engine {expected!r} != artifact {actual!r}"]

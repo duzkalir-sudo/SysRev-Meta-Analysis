@@ -577,11 +577,12 @@ scope until Session 4.
 ### 9.5 Stage 5 — deterministic meta-analysis (`src/stats_engine`) — Session 3
 
 **Inputs.** `Repository.load_stage5_inputs()` gathers the protocol outcomes, the extracted
-arms, report → study links, cohort labels (study links plus human-resolved overlap
+arms, the **full-text-eligible report universe**, report → study links, cohort labels (study links plus human-resolved overlap
 warnings), recorded unavailability and `CohortContributionDecision`s, and the
 first-author/year labels; its canonical SHA-256 is the *input hash*. `run_stage5()` refuses
 to run outside Stage 5, without an approved plan, or with arms for reports not included at
-full text; `run_plan()` refuses any arm not approved by a human.
+full text; `run_plan()` refuses any arm not approved by a human or belonging to a report
+outside the eligible set.
 
 **Analysis plan** (`AnalysisPlan` / `AnalysisSpec`, `src/core/schemas/stats.py`). Approved
 by an enrolled reviewer (`POST /projects/{id}/stats/plan`, bearer token; the persistence
@@ -602,6 +603,21 @@ must equal a plan timepoint exactly (no unit conversion; "24 months" ≠ "2 year
 one arm per role unless the plan selects one; several reports of one cohort only if a
 human documented non-overlapping participants for that outcome — otherwise all are
 excluded as `overlapping_cohort`. Every exclusion is listed with a reason code.
+
+**Report accounting.** Every full-text-eligible report appears exactly once in each
+analysis's `reports` ledger: `included` (with its analysis unit) or `excluded` with a reason
+code — including `recorded_unavailable` and `outcome_not_reported` for eligible reports
+without approved data for the outcome (missing data are never treated as zero events).
+`excluded` lists a study/cohort once, with all its reports, and only when none of its
+reports contributes; a non-contributing report of a contributing cohort is recorded in the
+ledger only, so duplicate reports are never counted as separate studies.
+
+**Independent model failures.** Each model is estimated on its own. If one fails (e.g. a
+zero Hartung-Knapp SE when all study estimates are identical), the others are kept: a
+failed sensitivity model is reported as a warning with its reason, and a failed primary
+model gives `not_estimable` with the reason while the included studies, heterogeneity and
+any estimable auxiliary models remain in the output, labelled as sensitivity results. No
+other interval is substituted as primary.
 
 **Methods** (each validated against metafor; see `validation/VALIDATION_REPORT.md`).
 
@@ -633,8 +649,13 @@ stored at full binary64 precision. `write_artifacts()` writes `stats_output.json
 deterministic SVG forest plots and a `manifest.json` of file hashes. `flatten()` gives the
 Auditor `"<analysis>.<model>.<field>"` keys.
 
-**Pipeline integration.** `record_stats_output()` (Stage 5 only) stores the canonical JSON
-in the append-only `stats_outputs` table and sets the project hash. The Stage 5 → 6 guard
+**Pipeline integration.** `record_stats_output()` (Stage 5 only) **re-runs the approved
+plan on the current data once and rejects the artifact unless its analyses are identical**
+(results fingerprint; the first differing fields are reported), so a numerically altered
+but hash-consistent `StatsOutput` cannot be recorded. It then stores the canonical JSON in
+the append-only `stats_outputs` table and sets the project hash. Status checks and guards
+do not recompute; they re-verify hashes, plan identity and the input hash. Direct writes to
+the database file bypass this and remain outside the threat model (§6). The Stage 5 → 6 guard
 re-verifies the stored artifact (§3.2), so setting a hash by hand, editing the stored JSON,
 approving a new plan or changing approved data after the run all block Stage 6.
 

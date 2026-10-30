@@ -210,27 +210,61 @@ class StudyResult(FrozenModel):
     notes: list[str] = Field(default_factory=list)
 
 
+ExclusionCode = Literal[
+    "recorded_unavailable",
+    "outcome_not_reported",  # eligible report without approved data for this outcome
+    "incompatible_estimator",
+    "timepoint_mismatch",
+    "timepoint_missing",
+    "arm_ambiguous",
+    "arm_missing",
+    "missing_data",
+    "overlapping_cohort",
+    "non_informative",
+    "boundary_estimate",
+    "ci_inconsistent",
+    "unit_mismatch",
+    "invalid_data",
+    "unsupported_measure",
+    "analysis_failed",
+]
+
+
 class ExcludedStudy(FrozenModel):
+    """A study/cohort that contributes nothing to the analysis (reports grouped by cohort)."""
+
     study_id: Identifier
     record_ids: list[Identifier]
     label: NonEmptyStr
     arm_ids: list[Identifier] = Field(default_factory=list)
-    reason_code: Literal[
-        "recorded_unavailable",
-        "incompatible_estimator",
-        "timepoint_mismatch",
-        "timepoint_missing",
-        "arm_ambiguous",
-        "arm_missing",
-        "missing_data",
-        "overlapping_cohort",
-        "non_informative",
-        "boundary_estimate",
-        "ci_inconsistent",
-        "unit_mismatch",
-        "invalid_data",
-    ]
+    reason_code: ExclusionCode
     reason: NonEmptyStr
+
+
+class ReportAccount(FrozenModel):
+    """Fate of one full-text-eligible report in one analysis (complete per-report ledger).
+
+    Reports of a study/cohort that already contributes are listed here with their reason
+    but are not counted again as separate studies.
+    """
+
+    record_id: Identifier
+    study_id: Identifier
+    cohort_id: NonEmptyStr
+    label: NonEmptyStr
+    status: Literal["included", "excluded"]
+    unit_id: Identifier | None = Field(default=None, description="analysis unit it enters")
+    reason_code: ExclusionCode | None = None
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> ReportAccount:
+        if self.status == "included":
+            if self.unit_id is None or self.reason_code is not None:
+                raise ValueError("an included report names its unit and carries no reason")
+        elif self.reason_code is None or not (self.reason and self.reason.strip()):
+            raise ValueError("an excluded report needs a reason code and reason")
+        return self
 
 
 class PooledResult(FrozenModel):
@@ -280,6 +314,9 @@ class AnalysisResult(FrozenModel):
     k: int = Field(ge=0)
     studies: list[StudyResult] = Field(default_factory=list)
     excluded: list[ExcludedStudy] = Field(default_factory=list)
+    reports: list[ReportAccount] = Field(
+        default_factory=list, description="every full-text-eligible report and its fate"
+    )
     primary: PooledResult | None = None
     common_effect: PooledResult | None = None
     random_effects: PooledResult | None = None
@@ -305,6 +342,14 @@ class AnalysisResult(FrozenModel):
             raise ValueError("single_study status requires exactly one study")
         if self.heterogeneity is not None and self.k < 2:
             raise ValueError("heterogeneity statistics are meaningless for k < 2")
+        ledger = [r.record_id for r in self.reports]
+        if len(ledger) != len(set(ledger)):
+            raise ValueError("each report appears once in the report ledger")
+        in_studies = sorted(rid for s in self.studies for rid in s.record_ids)
+        if sorted(r.record_id for r in self.reports if r.status == "included") != in_studies:
+            raise ValueError("included reports in the ledger must match the included studies")
+        if any(rid not in ledger for e in self.excluded for rid in e.record_ids):
+            raise ValueError("every excluded report must appear in the report ledger")
         return self
 
 

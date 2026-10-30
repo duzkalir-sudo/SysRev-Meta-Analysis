@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from src.core.enums import ArmRole, EstimateType
 from src.core.exceptions import StatisticsInputError
 from src.core.schemas.master import CohortContributionDecision, QuantitativeUnavailability
-from src.core.schemas.stats import AnalysisSpec, ArmSelection, StatsOutput
+from src.core.schemas.stats import AnalysisSpec, ArmSelection, ReportAccount, StatsOutput
 from src.stats_engine import effect_sizes as es
 from src.stats_engine.engine import run_analysis, run_plan
 from src.stats_engine.glmm import glmm_logit
@@ -629,3 +629,127 @@ def test_km_ci_at_boundary_or_zero_width_excluded() -> None:
     ]
     codes = {e.study_id: e.reason_code for e in run(KM, arms).excluded}
     assert codes == {"edge": "ci_inconsistent", "flat": "invalid_data"}
+
+
+# --------------------------------------------------------------------------- review fixes
+
+
+def _half_arms() -> list:  # type: ignore[type-arg]
+    return [stats_arm(r, "necrosis", follow_up=LAST_FU, events="5", n_analyzed="10")
+            for r in ("h1", "h2")]  # fmt: skip
+
+
+def test_identical_proportions_glmm_primary_survives_iv_failure() -> None:
+    """5/10 and 5/10: the HKSJ SE of the IV sensitivity model is zero; the GLMM is fine."""
+    res = run(NEC, _half_arms())
+    assert res.status == "pooled" and res.k == 2
+    assert [s.data for s in res.studies] == [{"events": 5, "n": 10}] * 2
+    g = res.primary
+    assert g is not None and g == res.random_effects and "GLMM" in g.method
+    assert g.estimate == pytest.approx(0.0, abs=1e-6)
+    assert g.estimate_natural == pytest.approx(0.5, abs=1e-6)
+    assert g.tau2 == 0.0
+    assert g.se == pytest.approx(math.sqrt(1 / 10 + 1 / 10), rel=1e-4)  # binomial ML, τ = 0
+    # the failed sensitivity analysis is explained, not replaced by another interval
+    assert not any("inverse variance" in r.method for r in res.sensitivity)
+    failed = [w for w in res.warnings if w.startswith("Sensitivity analysis")]
+    assert len(failed) == 1 and "Hartung-Knapp standard error is zero" in failed[0]
+    assert res.heterogeneity is not None and res.heterogeneity.q == pytest.approx(0.0, abs=1e-12)
+    assert [r.status for r in res.reports] == ["included", "included"]
+
+
+def test_identical_proportions_iv_primary_reports_its_failure() -> None:
+    spec = NEC.model_copy(update={"proportion_method": "logit_inverse_variance"})
+    res = run(spec, _half_arms())
+    assert res.status == "not_estimable" and res.k == 2
+    assert "Hartung-Knapp standard error is zero" in res.status_reason
+    assert res.primary is None and res.random_effects is None and res.common_effect is None
+    assert [s.data for s in res.studies] == [{"events": 5, "n": 10}] * 2
+    # estimable auxiliary models stay visible, explicitly labelled, never promoted to primary
+    methods = [r.method for r in res.sensitivity]
+    assert any("GLMM" in m for m in methods)
+    assert any(m == "binomial maximum likelihood" for m in methods)
+    assert res.heterogeneity is not None
+    adhoc = spec.model_copy(update={"random_effects_ci": "hksj_adhoc"})
+    assert run(adhoc, _half_arms()).status == "pooled"
+
+
+def test_every_eligible_report_is_accounted_for() -> None:
+    """20 eligible reports: 12 with the outcome, 8 without (never read as zero events)."""
+    with_data = [(f"d{i:02d}", str(i % 4), str(20 + i)) for i in range(12)]
+    arms = [stats_arm(r, "necrosis", follow_up=LAST_FU, events=x, n_analyzed=n)
+            for r, x, n in with_data]  # fmt: skip
+    no_data = [f"n{i:02d}" for i in range(8)]
+    unavailable = [
+        QuantitativeUnavailability(
+            record_id=rid, outcome_id=None if rid == "n03" else "necrosis",
+            reason_code="not_reported", reason="necrosis not assessed (synthetic)",
+            recorded_by="Dr Stats Reviewer", reviewer_id="rvw1",
+        )
+        for rid in no_data[:4]
+    ]  # fmt: skip
+    res = run(NEC, arms, eligible=no_data, unavailability=unavailable)
+    assert res.k == 12 and len(res.reports) == 20
+    status = {r.record_id: (r.status, r.reason_code) for r in res.reports}
+    assert all(status[r] == ("included", None) for r, _, _ in with_data)
+    assert [status[r][1] for r in no_data] == ["recorded_unavailable"] * 4 + [
+        "outcome_not_reported"
+    ] * 4
+    assert sorted(e.record_ids[0] for e in res.excluded) == no_data  # one entry per study
+    assert res.total_participants == sum(int(n) for _, _, n in with_data)
+    assert res.total_events == sum(int(x) for _, x, _ in with_data)
+    # the 8 reports without data change nothing in the calculation
+    alone = run(NEC, arms)
+    assert alone.primary is not None and res.primary is not None
+    assert res.primary.estimate == alone.primary.estimate
+    assert res.heterogeneity == alone.heterogeneity
+
+
+def test_reports_of_one_cohort_are_not_counted_as_separate_studies() -> None:
+    arms = necrosis_arms()[:2]  # s1, s2
+    cohorts = {"s1": "A", "s1b": "A", "s2": "s2", "c1": "C", "c2": "C"}
+    res = run(NEC, arms, eligible=["s1b", "c1", "c2"], cohort_of=cohorts)
+    assert res.k == 2 and len(res.reports) == 5
+    # s1b: another report of contributing cohort A -> ledger only, not an excluded study
+    s1b = next(r for r in res.reports if r.record_id == "s1b")
+    assert s1b.reason_code == "outcome_not_reported" and s1b.reason is not None
+    assert "not counted as a separate study" in s1b.reason
+    # cohort C contributes nothing -> exactly one excluded study listing both reports
+    assert [(e.record_ids, e.reason_code) for e in res.excluded] == [
+        (["c1", "c2"], "outcome_not_reported")
+    ]
+
+
+def test_unsupported_measure_still_accounts_for_every_report() -> None:
+    spec = AnalysisSpec(analysis_id="os", outcome_id="survival", effect_measure="HR")
+    res = run(spec, [], eligible=["a", "b"])
+    assert res.status == "unsupported"
+    assert {r.reason_code for r in res.reports} == {"unsupported_measure"}
+    assert len(res.reports) == 2
+
+
+def test_arms_of_non_eligible_reports_abort() -> None:
+    arms = necrosis_arms()[:2]
+    data = inputs(arms)
+    restricted = type(data)(**(vars(data) | {"eligible_record_ids": frozenset({"s1"})}))
+    with pytest.raises(StatisticsInputError, match="not included at full text"):
+        run_analysis(NEC, OUTCOMES["necrosis"], restricted)
+
+
+def test_report_ledger_invariants() -> None:
+    res = run(NEC, necrosis_arms()[:3], eligible=["x1"])
+    payload = res.model_dump(mode="json")
+    dup = payload | {"reports": [*payload["reports"], payload["reports"][0]]}
+    with pytest.raises(ValidationError, match="appears once"):
+        type(res).model_validate(dup)
+    dropped = payload | {"reports": payload["reports"][1:]}
+    with pytest.raises(ValidationError, match="must match the included studies"):
+        type(res).model_validate(dropped)
+    orphan = payload | {"reports": [r for r in payload["reports"] if r["record_id"] != "x1"]}
+    with pytest.raises(ValidationError, match="must appear in the report ledger"):
+        type(res).model_validate(orphan)
+    entry = payload["reports"][0]
+    with pytest.raises(ValidationError, match="names its unit"):
+        ReportAccount.model_validate(entry | {"reason_code": "missing_data"})
+    with pytest.raises(ValidationError, match="needs a reason"):
+        ReportAccount.model_validate(entry | {"status": "excluded", "unit_id": None})

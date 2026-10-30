@@ -39,7 +39,14 @@ from src.core.schemas.stats import (
 )
 from src.stats_engine import effect_sizes as es
 from src.stats_engine.glmm import glmm_logit
-from src.stats_engine.inputs import AnalysisInputs, Unit, select_units
+from src.stats_engine.inputs import (
+    AnalysisInputs,
+    Selection,
+    Unit,
+    account_reports,
+    all_reports_excluded,
+    select_units,
+)
 from src.stats_engine.mantel_haenszel import mantel_haenszel
 from src.stats_engine.numerics import (
     EstimationError,
@@ -197,16 +204,17 @@ class _Analysis:
         self.methods: list[str] = []
         self.limitations: list[str] = []
         self.sensitivity: list[PooledResult] = []
+        self.selection: Selection | None = None
 
     # ---- framework
     def run(self) -> AnalysisResult:
         measure = self.spec.effect_measure
         if measure not in POOLABLE_MEASURES:
-            return self._result(
-                "unsupported", _UNSUPPORTED.get(measure, _UNSUPPORTED_DEFAULT), scale="none"
-            )
+            reason = _UNSUPPORTED.get(measure, _UNSUPPORTED_DEFAULT)
+            self.selection = all_reports_excluded(self.inputs, "unsupported_measure", reason)
+            return self._result("unsupported", reason, scale="none")
         selection = select_units(self.spec, self.outcome, self.inputs)
-        self.excluded.extend(selection.excluded)
+        self.selection = selection
         self.warnings.extend(selection.notes)
         handler = {
             EffectMeasure.PROPORTION: self._proportion,
@@ -248,6 +256,11 @@ class _Analysis:
         self, status: str, reason: str, *, scale: str, k_data: _Data | None = None, **kw: Any
     ) -> AnalysisResult:
         studies = [StudyResult.model_validate(s) for s in (k_data.studies if k_data else [])]
+        selection = self.selection or all_reports_excluded(
+            self.inputs, "analysis_failed", f"analysis not completed: {reason}"
+        )
+        included = {rid: s.study_id for s in studies for rid in s.record_ids}
+        excluded, reports = account_reports(self.inputs, selection, included, self.excluded)
         return AnalysisResult.model_validate(
             {
                 "analysis_id": self.spec.analysis_id,
@@ -260,7 +273,8 @@ class _Analysis:
                 "status_reason": reason,
                 "k": len(studies),
                 "studies": studies,
-                "excluded": sorted(self.excluded, key=lambda e: (e.label, e.study_id)),
+                "excluded": excluded,
+                "reports": reports,
                 "sensitivity": self.sensitivity,
                 "settings": self._settings(),
                 "methods": self.methods,
@@ -281,17 +295,28 @@ class _Analysis:
         """Common-effect (IV) and random-effects results + heterogeneity from yi/vi."""
         k = len(d.yi)
         fe = fixed_effect(d.yi, d.vi, level=self.level)
-        re = random_effects(
-            d.yi,
-            d.vi,
-            tau2_method=self.spec.tau2_estimator,
-            ci_method=self.spec.random_effects_ci,
-            level=self.level,
-        )
         w_fe = 1 / np.asarray(d.vi)
         w_fe = w_fe / w_fe.sum()
-        for s, wf, wr in zip(d.studies, w_fe, re.weights, strict=True):
+        for s, wf in zip(d.studies, w_fe, strict=True):
             s["weight_common_pct"] = float(100 * wf)
+        self._small_k_warnings(k)
+        common = _pooled_result(
+            fe, model="common_effect", method="inverse variance", scale=scale, back=back, k=k
+        )
+        het = _heterogeneity(d.yi, d.vi, f"inverse-variance weights on the {scale} scale")
+        # The random-effects fit can fail on its own (e.g. a zero Hartung-Knapp SE when all
+        # estimates are identical); that must not discard the estimable results above.
+        try:
+            re = random_effects(
+                d.yi,
+                d.vi,
+                tau2_method=self.spec.tau2_estimator,
+                ci_method=self.spec.random_effects_ci,
+                level=self.level,
+            )
+        except EstimationError as exc:
+            return {"common": common, "random": None, "random_error": str(exc), "het": het}
+        for s, wr in zip(d.studies, re.weights, strict=True):
             s["weight_random_pct"] = float(100 * wr)
         if self.spec.random_effects_ci == "hksj":
             wald = random_effects(
@@ -302,11 +327,10 @@ class _Analysis:
                     "The Hartung-Knapp interval is narrower than the Wald interval (q < 1); "
                     "the ad hoc variant (random_effects_ci='hksj_adhoc') would not be."
                 )
-        self._small_k_warnings(k)
         return {
-            "common": _pooled_result(
-                fe, model="common_effect", method="inverse variance", scale=scale, back=back, k=k
-            ),
+            "common": common,
+            "random_error": None,
+            "het": het,
             "random": _pooled_result(
                 re.pooled,
                 model="random_effects",
@@ -316,7 +340,6 @@ class _Analysis:
                 k=k,
                 re=re,
             ),
-            "het": _heterogeneity(d.yi, d.vi, f"inverse-variance weights on the {scale} scale"),
         }
 
     def _finish(
@@ -326,17 +349,37 @@ class _Analysis:
         common: PooledResult | None,
         random: PooledResult | None,
         het: HeterogeneityResult | None,
+        *,
+        random_error: str | None = None,
+        common_error: str | None = None,
         **kw: Any,
     ) -> AnalysisResult:
-        primary = random if self.spec.primary_model == "random_effects" else common
+        """Assemble a pooled result; a failed model is reported, never replaced."""
+        is_random = self.spec.primary_model == "random_effects"
+        primary = random if is_random else common
         if primary is None:
+            error = (random_error if is_random else common_error) or "see warnings"
+            # other estimable models stay visible, explicitly labelled as auxiliary
+            self.sensitivity.extend(r for r in (common, random) if r is not None)
             return self._result(
                 "not_estimable",
-                "the primary model could not be estimated",
+                f"the primary {self.spec.primary_model.replace('_', '-')} model is not "
+                f"estimable: {error}. No substitute interval is reported as primary.",
                 scale=scale,
                 k_data=d,
+                heterogeneity=het,
                 **kw,
             )
+        failed: list[tuple[str, PooledResult | None, str | None]] = [
+            ("random-effects", random, random_error),
+            ("common-effect", common, common_error),
+        ]
+        for model, result, failure in failed:
+            if result is None and failure is not None:
+                self.warnings.append(
+                    f"The {model} model is not estimable: {failure}. No substitute interval is "
+                    "reported."
+                )
         return self._result(
             "pooled",
             f"{len(d.yi)} studies pooled ({self.spec.primary_model} primary)",
@@ -352,11 +395,14 @@ class _Analysis:
     def _no_pool(self, d: _Data, scale: str, **kw: Any) -> AnalysisResult | None:
         k = len(d.studies)
         if k == 0:
-            if self.excluded:
+            sel = self.selection
+            codes = [e.reason_code for e in self.excluded]
+            if sel is not None:
+                codes += [e.reason_code for e in sel.excluded]
+                codes += [r.code for r in sel.record_reasons.values()]
+            if codes:
                 return self._result(
-                    "descriptive_only"
-                    if any(e.reason_code in _DESCRIBABLE for e in self.excluded)
-                    else "no_data",
+                    "descriptive_only" if any(c in _DESCRIBABLE for c in codes) else "no_data",
                     "no study provides data that can be analysed for this plan; see excluded "
                     "studies and their reasons",
                     scale=scale,
@@ -425,7 +471,7 @@ class _Analysis:
                     "notes": notes,
                 }
             )
-        totals = {"total_events": sum(xs), "total_participants": sum(ns)}
+        totals: dict[str, Any] = {"total_events": sum(xs), "total_participants": sum(ns)}
         scale = "logit"
         self.methods.append(
             "Crude proportions (events ÷ n analysed, censoring ignored) on the logit scale. "
@@ -448,17 +494,20 @@ class _Analysis:
                 **totals,
             )
         iv = self._pool_iv(d, scale, es.expit)
-        iv_random = iv["random"].model_copy(
-            update={
-                "method": "logit transform, 0.5 continuity correction for 0 % / 100 % "
-                "studies; " + iv["random"].method
-            }
-        )
+        iv_random: PooledResult | None = None
+        if iv["random"] is not None:
+            iv_random = iv["random"].model_copy(
+                update={
+                    "method": "logit transform, 0.5 continuity correction for 0 % / 100 % "
+                    "studies; " + iv["random"].method
+                }
+            )
+        glmm_error: str | None = None
         try:
             g = glmm_logit(xs, ns, n_agq=GLMM_NODES, level=self.level)
         except EstimationError as exc:
             g = None
-            self.warnings.append(f"GLMM not estimable: {exc}")
+            glmm_error = str(exc)
         glmm_res: PooledResult | None = None
         if g is not None:
             pi = None
@@ -511,12 +560,19 @@ class _Analysis:
             "variance weights (0.5 correction for 0 % / 100 % studies)."
         )
         if self.spec.proportion_method == "glmm":
-            random = glmm_res
-            self.sensitivity.append(iv_random)
+            random, random_error = glmm_res, glmm_error
+            aux, aux_error, aux_name = iv_random, iv["random_error"], "inverse-variance logit"
         else:
-            random = iv_random
-            if glmm_res is not None:
-                self.sensitivity.append(glmm_res)
+            random, random_error = iv_random, iv["random_error"]
+            aux, aux_error, aux_name = glmm_res, glmm_error, "binomial-normal GLMM"
+        if aux is not None:
+            self.sensitivity.append(aux)
+        else:
+            self.warnings.append(
+                f"Sensitivity analysis ({aux_name} random-effects model) not estimable: "
+                f"{aux_error}. No substitute interval is reported; the primary result is "
+                "unaffected."
+            )
         self.limitations.append(
             "Crude proportions ignore censoring and differing follow-up durations; they are not "
             "actuarial or Kaplan-Meier probabilities."
@@ -526,16 +582,9 @@ class _Analysis:
             "information; with few studies it may be too narrow. Compare it with the "
             "inverse-variance Hartung-Knapp sensitivity analysis."
         )
-        if random is None and self.spec.primary_model == "random_effects":
-            return self._result(
-                "not_estimable",
-                "the GLMM could not be estimated; see "
-                "warnings and the inverse-variance sensitivity analysis",
-                scale=scale,
-                k_data=d,
-                **totals,
-            )
-        return self._finish(d, scale, common, random, iv["het"], **totals)
+        return self._finish(
+            d, scale, common, random, iv["het"], random_error=random_error, **totals
+        )
 
     # ---- KM / cumulative incidence at time t
     def _time_t(self, units: list[Unit]) -> AnalysisResult:
@@ -600,7 +649,9 @@ class _Analysis:
             return early
         back: Transform = lambda t: es.from_scale(t, scale)  # noqa: E731
         iv = self._pool_iv(d, scale, back)
-        return self._finish(d, scale, iv["common"], iv["random"], iv["het"])
+        return self._finish(
+            d, scale, iv["common"], iv["random"], iv["het"], random_error=iv["random_error"]
+        )
 
     # ---- comparative dichotomous
     def _ratio(self, units: list[Unit]) -> AnalysisResult:
@@ -662,7 +713,7 @@ class _Analysis:
                     else [],
                 }
             )
-        totals = {
+        totals: dict[str, Any] = {
             "total_events": sum(t[0] + t[2] for t in tables),
             "total_participants": sum(t[1] + t[3] for t in tables),
         }
@@ -677,6 +728,7 @@ class _Analysis:
             return early
         iv = self._pool_iv(d, scale, math.exp)
         common: PooledResult | None = iv["common"]
+        common_error: str | None = None
         use_mh = self.spec.common_effect_method in ("auto", "mantel_haenszel")
         if use_mh:
             try:
@@ -695,12 +747,21 @@ class _Analysis:
                 self.methods.append("Common-effect model: Mantel-Haenszel on raw counts.")
             except EstimationError as exc:
                 common = None
-                self.warnings.append(f"Mantel-Haenszel estimate not estimable: {exc}")
+                common_error = f"Mantel-Haenszel estimate not estimable: {exc}"
                 self.sensitivity.append(iv["common"])
         else:
             self.methods.append("Common-effect model: inverse variance.")
         self.methods.append(f"Random-effects model: {_re_method_label(self.spec)}.")
-        return self._finish(d, scale, common, iv["random"], iv["het"], **totals)
+        return self._finish(
+            d,
+            scale,
+            common,
+            iv["random"],
+            iv["het"],
+            random_error=iv["random_error"],
+            common_error=common_error,
+            **totals,
+        )
 
     # ---- comparative continuous
     def _continuous(self, units: list[Unit]) -> AnalysisResult:
@@ -793,7 +854,9 @@ class _Analysis:
         self.methods.append(
             f"Common-effect: inverse variance. Random effects: {_re_method_label(self.spec)}."
         )
-        return self._finish(d, scale, iv["common"], iv["random"], iv["het"])
+        return self._finish(
+            d, scale, iv["common"], iv["random"], iv["het"], random_error=iv["random_error"]
+        )
 
 
 _DESCRIBABLE = frozenset(
@@ -939,7 +1002,7 @@ def run_plan(
     """Run every analysis of an approved plan. Fails closed on unapproved inputs."""
     if plan.status != "approved":
         raise StatisticsInputError("the analysis plan has not been approved by a human reviewer")
-    inputs.require_approved()
+    inputs.validate()
     analyses: list[AnalysisResult] = []
     for spec in plan.analyses:
         outcome = inputs.outcomes.get(spec.outcome_id)

@@ -4,7 +4,12 @@ The engine accepts only human-approved arms. For each analysis it keeps, per stu
 arm(s) whose **outcome**, **estimator** and **structured follow-up timepoint** match the
 approved analysis plan, and refuses (with a recorded reason) anything ambiguous:
 
-* an arm that is not human-approved aborts the whole run (fail closed);
+* every **full-text-eligible report** is accounted for in every analysis — included,
+  recorded as unavailable, without data for the outcome (never read as zero events), or
+  excluded with a reason — and reports of one study/cohort are never counted as separate
+  studies;
+* an arm that is not human-approved, or that belongs to a report outside the eligible
+  set, aborts the whole run (fail closed);
 * a report recorded as unavailable for the outcome is excluded with the human's reason;
 * estimators are never substituted (crude counts ≠ Kaplan-Meier ≠ cumulative incidence);
 * follow-up timepoints must match one declared in the plan exactly — no unit conversion
@@ -28,7 +33,13 @@ from src.core.exceptions import StatisticsInputError
 from src.core.schemas.extraction import ExtractedStudyArm
 from src.core.schemas.master import CohortContributionDecision, QuantitativeUnavailability
 from src.core.schemas.protocol import FollowUpTimepoint, OutcomeDefinition
-from src.core.schemas.stats import AnalysisSpec, ExcludedStudy, canonical_sha256
+from src.core.schemas.stats import (
+    AnalysisSpec,
+    ExcludedStudy,
+    ExclusionCode,
+    ReportAccount,
+    canonical_sha256,
+)
 
 CRUDE = frozenset({None, EstimateType.CRUDE_PROPORTION})
 
@@ -39,18 +50,34 @@ class AnalysisInputs:
 
     outcomes: dict[str, OutcomeDefinition]
     arms: list[ExtractedStudyArm]
+    eligible_record_ids: frozenset[str]  # reports included at full-text assessment
     study_of: dict[str, str]  # record_id -> study_id
     cohort_of: dict[str, str]  # record_id -> cohort label (studies + human-resolved overlap)
     labels: dict[str, str]  # record_id -> "Author Year"
     unavailability: list[QuantitativeUnavailability] = field(default_factory=list)
     contributions: list[CohortContributionDecision] = field(default_factory=list)
 
-    def require_approved(self) -> None:
+    def validate(self) -> None:
+        """Fail closed: only human-approved arms of full-text-eligible reports."""
         unapproved = sorted(a.arm_id for a in self.arms if not a.approved_by_human)
         if unapproved:
             raise StatisticsInputError(
                 f"{len(unapproved)} extracted arm(s) are not human-approved: {unapproved[:5]}"
             )
+        stray = sorted({a.record_id for a in self.arms} - self.eligible_record_ids)
+        if stray:
+            raise StatisticsInputError(
+                f"arms exist for reports not included at full text: {stray[:5]}"
+            )
+
+    def study(self, record_id: str) -> str:
+        return self.study_of.get(record_id, record_id)
+
+    def cohort(self, record_id: str) -> str:
+        return self.cohort_of.get(record_id, self.study(record_id))
+
+    def label(self, record_id: str) -> str:
+        return self.labels.get(record_id, record_id)
 
     def sha256(self) -> str:
         return canonical_sha256(
@@ -61,6 +88,7 @@ class AnalysisInputs:
                 "arms": [
                     a.model_dump(mode="json") for a in sorted(self.arms, key=lambda a: a.arm_id)
                 ],
+                "eligible_record_ids": sorted(self.eligible_record_ids),
                 "study_of": dict(sorted(self.study_of.items())),
                 "cohort_of": dict(sorted(self.cohort_of.items())),
                 "labels": dict(sorted(self.labels.items())),
@@ -90,32 +118,96 @@ class Unit:
         return [a.arm_id for _, a in sorted(self.arms.items())]
 
 
+@dataclass(frozen=True)
+class RecordReason:
+    code: ExclusionCode
+    reason: str
+    arm_ids: tuple[str, ...] = ()
+
+
 @dataclass
 class Selection:
     units: list[Unit]
-    excluded: list[ExcludedStudy]
+    excluded: list[ExcludedStudy]  # cohort-level exclusions decided during selection
+    record_reasons: dict[str, RecordReason]  # per-report reasons (cohort grouping later)
     notes: list[str]
 
 
-class _Exclusions:
-    def __init__(self, inputs: AnalysisInputs) -> None:
-        self.inputs = inputs
-        self.items: list[ExcludedStudy] = []
+def _excluded_study(
+    inputs: AnalysisInputs, rids: Iterable[str], code: ExclusionCode, reason: str,
+    arms: Iterable[str] = (),
+) -> ExcludedStudy:  # fmt: skip
+    rid_list = sorted(set(rids))
+    return ExcludedStudy(
+        study_id=inputs.study(rid_list[0]),
+        record_ids=rid_list,
+        label=" + ".join(inputs.label(r) for r in rid_list),
+        arm_ids=sorted(arms),
+        reason_code=code,
+        reason=reason,
+    )
 
-    def add(self, rids: Iterable[str], code: str, reason: str, arms: Iterable[str] = ()) -> None:
-        rid_list = sorted(set(rids))
-        self.items.append(
-            ExcludedStudy.model_validate(
-                {
-                    "study_id": self.inputs.study_of.get(rid_list[0], rid_list[0]),
-                    "record_ids": rid_list,
-                    "label": " + ".join(self.inputs.labels.get(r, r) for r in rid_list),
-                    "arm_ids": sorted(arms),
-                    "reason_code": code,
-                    "reason": reason,
-                }
+
+def all_reports_excluded(inputs: AnalysisInputs, code: ExclusionCode, reason: str) -> Selection:
+    """Accounting for an analysis that selects nothing (e.g. an unsupported measure)."""
+    reasons = {rid: RecordReason(code, reason) for rid in inputs.eligible_record_ids}
+    return Selection(units=[], excluded=[], record_reasons=reasons, notes=[])
+
+
+def account_reports(
+    inputs: AnalysisInputs,
+    selection: Selection,
+    included: dict[str, str],
+    unit_exclusions: list[ExcludedStudy],
+) -> tuple[list[ExcludedStudy], list[ReportAccount]]:
+    """Cohort-level exclusions and the per-report ledger for one analysis.
+
+    ``included`` maps each report used in the calculation to its unit. A study/cohort is
+    listed as excluded once, with all of its reports, and only if none of its reports
+    contributes; every eligible report appears exactly once in the ledger.
+    """
+    contributing = {inputs.cohort(rid) for rid in included}
+    excluded = [*selection.excluded, *unit_exclusions]
+    reasons: dict[str, tuple[ExclusionCode, str]] = {}
+    for e in excluded:
+        for rid in e.record_ids:
+            reasons[rid] = (e.reason_code, e.reason)
+    represented = contributing | {inputs.cohort(r) for e in excluded for r in e.record_ids}
+    pending: dict[str, list[str]] = defaultdict(list)
+    for rid, rr in selection.record_reasons.items():
+        note = ""
+        if inputs.cohort(rid) in contributing:
+            note = (" (another report of this study/cohort contributes; this report is not "
+                    "counted as a separate study)")  # fmt: skip
+        reasons[rid] = (rr.code, rr.reason + note)
+        if inputs.cohort(rid) not in represented:
+            pending[inputs.cohort(rid)].append(rid)
+    for _, rids in sorted(pending.items()):
+        rids.sort(key=lambda r: (selection.record_reasons[r].code == "outcome_not_reported", r))
+        first = selection.record_reasons[rids[0]]
+        reason = first.reason if len(rids) == 1 else "; ".join(
+            f"{inputs.label(r)}: {selection.record_reasons[r].reason}" for r in rids
+        )  # fmt: skip
+        arms = [a for r in rids for a in selection.record_reasons[r].arm_ids]
+        excluded.append(_excluded_study(inputs, rids, first.code, reason, arms))
+    ledger: list[ReportAccount] = []
+    for rid in sorted(inputs.eligible_record_ids | set(included)):
+        ids = {"record_id": rid, "study_id": inputs.study(rid), "cohort_id": inputs.cohort(rid),
+               "label": inputs.label(rid)}  # fmt: skip
+        if rid in included:
+            ledger.append(
+                ReportAccount.model_validate(ids | {"status": "included", "unit_id": included[rid]})
             )
-        )
+        elif rid in reasons:
+            code, reason = reasons[rid]
+            ledger.append(
+                ReportAccount.model_validate(
+                    ids | {"status": "excluded", "reason_code": code, "reason": reason}
+                )
+            )
+        else:  # pragma: no cover - every eligible report receives a reason in select_units
+            raise StatisticsInputError(f"report {rid} is not accounted for")
+    return sorted(excluded, key=lambda e: (e.label, e.study_id)), ledger
 
 
 def compatible_estimators(spec: AnalysisSpec) -> frozenset[EstimateType | None]:
@@ -145,12 +237,12 @@ def _roles(outcome: OutcomeDefinition) -> tuple[str, ...]:
 def select_units(
     spec: AnalysisSpec, outcome: OutcomeDefinition, inputs: AnalysisInputs
 ) -> Selection:
-    inputs.require_approved()
+    inputs.validate()
     problems = spec.check_against_outcome(outcome)
     if problems:
         raise StatisticsInputError(f"analysis {spec.analysis_id}: " + "; ".join(problems))
-    excluded = _Exclusions(inputs)
-    exclude = excluded.add
+    reasons: dict[str, RecordReason] = {}
+    group_excluded: list[ExcludedStudy] = []
     notes: list[str] = []
 
     by_record: dict[str, list[ExtractedStudyArm]] = defaultdict(list)
@@ -166,23 +258,28 @@ def select_units(
     roles = _roles(outcome)
     chosen: dict[str, dict[str, ExtractedStudyArm]] = {}
 
-    for rid in sorted(by_record):
-        arms = by_record[rid]
-        arm_ids = [a.arm_id for a in arms]
+    for rid in sorted(inputs.eligible_record_ids):
+        arms = by_record.get(rid, [])
+        arm_ids = tuple(a.arm_id for a in arms)
         u = unavailable.get((rid, spec.outcome_id)) or unavailable.get((rid, None))
         if u is not None:
-            exclude(
-                [rid],
+            reasons[rid] = RecordReason(
                 "recorded_unavailable",
                 f"recorded by {u.recorded_by} as unavailable ({u.reason_code}): {u.reason}",
                 arm_ids,
             )
             continue
+        if not arms:
+            reasons[rid] = RecordReason(
+                "outcome_not_reported",
+                "eligible report without approved extracted data for this outcome; missing "
+                "outcome data are never treated as zero events",
+            )
+            continue
         usable = [a for a in arms if a.estimate_type in estimators]
         if not usable:
             kinds = sorted({str(a.estimate_type or "raw counts/summaries") for a in arms})
-            exclude(
-                [rid],
+            reasons[rid] = RecordReason(
                 "incompatible_estimator",
                 f"reports {', '.join(kinds)}, not an estimate compatible with "
                 f"{spec.effect_measure}; estimators are never converted",
@@ -194,15 +291,13 @@ def select_units(
             reported = sorted({a.follow_up.label if a.follow_up else "none" for a in usable})
             wanted = ", ".join(t.label for t in spec.timepoints) or "no structured timepoint"
             if all(a.follow_up is None for a in usable):
-                exclude(
-                    [rid],
+                reasons[rid] = RecordReason(
                     "timepoint_missing",
                     f"no structured follow-up timepoint recorded; the plan requires {wanted}",
                     arm_ids,
                 )
             else:
-                exclude(
-                    [rid],
+                reasons[rid] = RecordReason(
                     "timepoint_mismatch",
                     f"reports at {', '.join(reported)}; the plan requires {wanted} "
                     "(timepoints are never converted or approximated)",
@@ -211,13 +306,13 @@ def select_units(
             continue
         picked, problem = _pick_arms(rid, timed, roles, spec)
         if problem is not None:
-            exclude([rid], problem[0], problem[1], arm_ids)
+            reasons[rid] = RecordReason(problem[0], problem[1], arm_ids)  # type: ignore[arg-type]
             continue
         chosen[rid] = picked
 
-    units = _group_cohorts(spec, inputs, chosen, excluded, notes)
+    units = _group_cohorts(spec, inputs, chosen, group_excluded, notes)
     _disambiguate_labels(units)
-    return Selection(units=units, excluded=excluded.items, notes=notes)
+    return Selection(units=units, excluded=group_excluded, record_reasons=reasons, notes=notes)
 
 
 def _pick_arms(
@@ -256,23 +351,19 @@ def _group_cohorts(
     spec: AnalysisSpec,
     inputs: AnalysisInputs,
     chosen: dict[str, dict[str, ExtractedStudyArm]],
-    exclusions: _Exclusions,
+    exclusions: list[ExcludedStudy],
     notes: list[str],
 ) -> list[Unit]:
     by_cohort: dict[str, list[str]] = defaultdict(list)
     for rid in chosen:
-        by_cohort[inputs.cohort_of.get(rid, inputs.study_of.get(rid, rid))].append(rid)
+        by_cohort[inputs.cohort(rid)].append(rid)
     declared = [set(c.record_ids) for c in inputs.contributions if c.outcome_id == spec.outcome_id]
     units: list[Unit] = []
     for cohort, rids in sorted(by_cohort.items()):
         rids = sorted(rids)
         if len(rids) == 1:
             rid = rids[0]
-            units.append(
-                Unit(
-                    inputs.study_of.get(rid, rid), (rid,), inputs.labels.get(rid, rid), chosen[rid]
-                )
-            )
+            units.append(Unit(inputs.study(rid), (rid,), inputs.label(rid), chosen[rid]))
             continue
         if any(set(rids) <= d for d in declared):
             notes.append(
@@ -280,15 +371,18 @@ def _group_cohorts(
                 "documented non-overlapping participants for this outcome"
             )
             for rid in rids:
-                units.append(Unit(rid, (rid,), inputs.labels.get(rid, rid), chosen[rid]))
+                units.append(Unit(rid, (rid,), inputs.label(rid), chosen[rid]))
             continue
         arm_ids = [a.arm_id for rid in rids for a in chosen[rid].values()]
-        exclusions.add(
-            rids,
-            "overlapping_cohort",
-            f"{len(rids)} reports of study/cohort {cohort} carry data for this analysis "
-            "without a human decision on overlap; none is used (no double counting)",
-            arm_ids,
+        exclusions.append(
+            _excluded_study(
+                inputs,
+                rids,
+                "overlapping_cohort",
+                f"{len(rids)} reports of study/cohort {cohort} carry data for this analysis "
+                "without a human decision on overlap; none is used (no double counting)",
+                arm_ids,
+            )
         )
     return units
 
