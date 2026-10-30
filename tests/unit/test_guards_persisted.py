@@ -17,6 +17,7 @@ from src.core.enums import (
     ScreeningStage,
     ScreeningVerdict,
     SourceDatabase,
+    UploadMatchStatus,
 )
 from src.core.exceptions import SysRevError
 from src.core.schemas import FullTextItem, PRISMACounts, ScreeningDecision
@@ -230,10 +231,14 @@ def test_manifest_entry_unlocks_gate2_only_when_resolved(repo: Repository) -> No
                           pdf_filename="a.pdf", pdf_sha256="a" * 64)  # fmt: skip
     with pytest.raises(SysRevError, match="authenticated"):
         repo.save_fulltext_item(PID, upload)  # an upload must name an enrolled reviewer
+    unverified = upload.model_copy(update={"recorded_by": "Dr Human",
+                                           "recorded_by_reviewer_id": HUMAN["id"]})  # fmt: skip
+    repo.save_fulltext_item(PID, unverified)
+    # a PDF whose identity was never checked does not release Gate 2
+    assert any("still missing" in x for x in violations(repo, *G2_TO_S4))
     repo.save_fulltext_item(
-        PID, upload.model_copy(update={"recorded_by": "Dr Human",
-                                       "recorded_by_reviewer_id": HUMAN["id"]}),
-    )  # fmt: skip
+        PID, unverified.model_copy(update={"match_status": UploadMatchStatus.CONFIRMED})
+    )
     assert violations(repo, *G2_TO_S4) == []
 
 
@@ -244,7 +249,8 @@ def _through_retrieval(repo: Repository) -> None:
     _through_screening(repo)
     repo.save_fulltext_item(
         PID, FullTextItem(record_id="a", title="T1", status=FullTextStatus.OA_DOWNLOADED,
-                          pdf_filename="a.pdf", pdf_sha256="a" * 64),
+                          pdf_filename="a.pdf", pdf_sha256="a" * 64,
+                          match_status=UploadMatchStatus.CONFIRMED),
     )  # fmt: skip
 
 

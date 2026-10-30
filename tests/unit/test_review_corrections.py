@@ -572,3 +572,69 @@ async def test_redirects_are_checked_hop_by_hop(tmp_path: Path) -> None:
     loop = await dl.fetch("https://oa.example.org/loop.pdf")
     assert loop.failure == "http_error" and loop.detail == "too many redirects"
     await dl.aclose()
+
+
+# --------------------------------------------------------------------------- 5. fail-closed
+
+
+def test_adjudication_alone_does_not_complete_dual_screening(repo: Repository) -> None:
+    human = enroll(repo)
+    # r1: human adjudication only; r2: one pass + adjudication; r3: both passes + adjudication
+    adjudicate(repo, PID, "r1", TA, verdict=INC, rationale="eligible", reviewer=human)
+    automated(repo, "r2", R1, INC)
+    adjudicate(repo, PID, "r2", TA, verdict=INC, rationale="eligible", reviewer=human)
+    automated(repo, "r3", R1, INC)
+    automated(repo, "r3", R2, EXC)
+    adjudicate(repo, PID, "r3", TA, verdict=INC, rationale="eligible", reviewer=human)
+    status = screening_status(
+        {"r1", "r2", "r3"}, repo.load_screening_decisions(PID), repo.load_conflicts(PID), TA
+    )
+    assert status.final == {"r1": INC, "r2": INC, "r3": INC}  # adjudication stays authoritative
+    assert status.incomplete_passes == ("r1", "r2")
+    ctx = repo.build_guard_context(PID)
+    assert ctx.ta_missing_decisions == 2
+    v = PipelineStateMachine(PID, Phase.STAGE2_SEARCH_SCREENING).check(
+        Phase.GATE1_5_SCREENING_CONFLICTS, ctx
+    )
+    assert any(
+        "2 unique record(s) lack title/abstract decisions from both reviewers" in x for x in v
+    )
+    for rid in ("r1", "r2"):
+        if rid == "r1":
+            automated(repo, rid, R1, INC)
+        automated(repo, rid, R2, INC)
+    assert repo.build_guard_context(PID).ta_missing_decisions == 0
+
+
+def test_pdf_without_identity_check_is_unconfirmed(repo: Repository, tmp_path: Path) -> None:
+    include_at_title_abstract(repo, PID, repo.load_records(PID)[:1])
+    human = enroll(repo)
+    doc = parse_pdf(synthetic_article(), filename="r1.pdf")
+    unchecked = FullTextItem(
+        record_id="r1",
+        title=SYNTHETIC_TITLE,
+        status=FullTextStatus.OA_DOWNLOADED,
+        pdf_filename="r1.pdf",
+        pdf_sha256=doc.pdf_sha256,
+    )  # match_status never set
+    assert unchecked.match_status is None
+    assert unchecked.match_unconfirmed and not unchecked.has_usable_pdf and unchecked.blocks_gate2
+    repo.save_fulltext_item(PID, unchecked)
+    assert repo.build_guard_context(PID).fulltext_items_blocking == 1
+    [row] = build_manifest(repo, PID)
+    assert row.record_id == "r1" and not row.usable_pdf and row.match_status is None
+    proposal = ProposedValue(domain="baseline", field_name="age", data_status="not_reported")
+    with pytest.raises(ReviewError, match="unconfirmed identity"):
+        submit_proposals(
+            repo, PID, "r1", doc, [proposal], proposed_by=ActorType.AGENT, proposer_identity="llm"
+        )
+    from src.fulltext import confirm_pdf_match
+
+    confirmed = confirm_pdf_match(
+        repo, PID, "r1", reviewer=human, note="checked title, authors and DOI against the record"
+    )
+    assert confirmed.has_usable_pdf
+    assert repo.build_guard_context(PID).fulltext_items_blocking == 0
+    assert submit_proposals(
+        repo, PID, "r1", doc, [proposal], proposed_by=ActorType.AGENT, proposer_identity="llm"
+    )

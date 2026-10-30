@@ -1244,7 +1244,8 @@ class Repository:
             records_identified=len(record_rows),
             records_unique=len(unique_ids),
             unresolved_duplicate_candidates=unresolved_duplicates,
-            ta_missing_decisions=len(ta.missing),
+            # mandatory dual title/abstract screening: an adjudication does not replace it
+            ta_missing_decisions=len(ta.incomplete_passes),
             ta_unresolved_conflicts=len(ta.unresolved),
             ta_included=len(ta_included),
             unresolved_cohort_warnings=warnings,

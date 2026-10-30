@@ -145,11 +145,15 @@ class ScreeningStatus:
     ``missing`` — records lacking a decision from Reviewer 1 and/or Reviewer 2 (and no
     human adjudication). ``unresolved`` — records whose reviewers disagree, or were both
     uncertain, with no human resolution. Neither is ever treated as complete.
+    ``incomplete_passes`` — records lacking a Reviewer 1 and/or Reviewer 2 decision,
+    *even if* a human adjudicated them: the adjudication is the authoritative verdict, but
+    it does not replace the mandatory dual screening passes.
     """
 
     final: dict[str, ScreeningVerdict]
     missing: tuple[str, ...]
     unresolved: tuple[str, ...]
+    incomplete_passes: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -181,8 +185,11 @@ def screening_status(
     final: dict[str, ScreeningVerdict] = {}
     missing: list[str] = []
     unresolved: list[str] = []
+    incomplete: list[str] = []
     for rid in sorted(set(record_ids)):
         roles = by_record.get(rid, {})
+        if ReviewerRole.REVIEWER_1 not in roles or ReviewerRole.REVIEWER_2 not in roles:
+            incomplete.append(rid)
         adjudication = roles.get(ReviewerRole.ADJUDICATOR)
         if (
             adjudication is not None
@@ -198,4 +205,9 @@ def screening_status(
             final[rid] = d1.verdict
         else:
             unresolved.append(rid)
-    return ScreeningStatus(final=final, missing=tuple(missing), unresolved=tuple(unresolved))
+    return ScreeningStatus(
+        final=final,
+        missing=tuple(missing),
+        unresolved=tuple(unresolved),
+        incomplete_passes=tuple(incomplete),
+    )

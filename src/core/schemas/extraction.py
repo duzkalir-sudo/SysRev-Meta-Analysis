@@ -142,9 +142,11 @@ class FullTextItem(StrictModel):
 
     @property
     def match_unconfirmed(self) -> bool:
-        return self.status in _PDF_STATUSES and self.match_status in (
-            UploadMatchStatus.UNCERTAIN,
-            UploadMatchStatus.MISMATCH,
+        """A linked PDF whose identity was not positively verified (fail closed: an absent
+        ``match_status`` means the check never ran, not that it passed)."""
+        return self.status in _PDF_STATUSES and self.match_status not in (
+            UploadMatchStatus.CONFIRMED,
+            UploadMatchStatus.HUMAN_CONFIRMED,
         )
 
     @property

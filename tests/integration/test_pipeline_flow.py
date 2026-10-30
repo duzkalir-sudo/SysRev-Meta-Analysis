@@ -33,6 +33,7 @@ from src.core.enums import (
     ScreeningStage,
     ScreeningVerdict,
     SourceDatabase,
+    UploadMatchStatus,
 )
 from src.core.exceptions import GuardViolationError
 from src.core.schemas import (
@@ -259,6 +260,7 @@ async def test_full_pipeline(
             status=FullTextStatus.OA_DOWNLOADED,
             pdf_filename="main.pdf",
             pdf_sha256="e" * 64,
+            match_status=UploadMatchStatus.CONFIRMED,  # synthetic: DOI matched on page 1
         ),
     )
     repo.save_fulltext_item(
@@ -284,6 +286,7 @@ async def test_full_pipeline(
                 "pdf_sha256": "f" * 64,
                 "recorded_by": "Dr Human Reviewer",
                 "recorded_by_reviewer_id": REVIEWER["id"],
+                "match_status": UploadMatchStatus.CONFIRMED,
             }
         ),
     )
