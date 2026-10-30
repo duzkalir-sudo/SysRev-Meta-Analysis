@@ -72,6 +72,7 @@ READY = GuardContext(
     included_studies_without_approved_rob=0,
     unresolved_double_counting=0,
     stats_output_present=True,
+    stats_output_problems=(),
     manuscript_present=True,
     audit_passed=True,
 )
@@ -106,6 +107,7 @@ EMPTY = GuardContext(
     included_studies_without_approved_rob=0,
     unresolved_double_counting=0,
     stats_output_present=False,
+    stats_output_problems=(),
     manuscript_present=False,
     audit_passed=None,
 )

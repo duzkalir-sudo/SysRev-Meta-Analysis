@@ -97,6 +97,7 @@ class GuardContext:
     unresolved_double_counting: int
     # Stages 5-6
     stats_output_present: bool
+    stats_output_problems: tuple[str, ...]
     manuscript_present: bool
     audit_passed: bool | None
 
@@ -230,8 +231,12 @@ def _extraction_approved(c: GuardContext) -> list[str]:
     return v
 
 
-def _stats_present(c: GuardContext) -> list[str]:
-    return [] if c.stats_output_present else ["stats_output.json has not been produced"]
+def _stats_valid(c: GuardContext) -> list[str]:
+    """Stage 5 → 6: a verified statistics artifact computed by the deterministic engine from
+    the current approved plan and the current approved extraction data."""
+    if not c.stats_output_present:
+        return ["stats_output.json has not been produced"]
+    return [f"stats_output.json: {p}" for p in c.stats_output_problems]
 
 
 def _manuscript_present(c: GuardContext) -> list[str]:
@@ -254,7 +259,7 @@ GUARDS: dict[tuple[Phase, Phase], Guard] = {
     (Phase.GATE2_MISSING_FULLTEXT, Phase.STAGE4_EXTRACTION_ROB): _fulltext_resolved,
     (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL): _extraction_grounded,
     (Phase.GATE3_EXTRACTION_APPROVAL, Phase.STAGE5_META_ANALYSIS): _extraction_approved,
-    (Phase.STAGE5_META_ANALYSIS, Phase.STAGE6_MANUSCRIPT): _stats_present,
+    (Phase.STAGE5_META_ANALYSIS, Phase.STAGE6_MANUSCRIPT): _stats_valid,
     (Phase.STAGE6_MANUSCRIPT, Phase.STAGE6_AUDIT): _manuscript_present,
     (Phase.STAGE6_AUDIT, Phase.COMPLETED): _audit_passed,
     (Phase.STAGE6_AUDIT, Phase.STAGE6_MANUSCRIPT): _audit_failed,

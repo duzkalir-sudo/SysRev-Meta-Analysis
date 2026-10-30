@@ -1,0 +1,25 @@
+{
+  "_note": "SYNTHETIC edge-case datasets invented for numerical validation only. They are not data from any real study and must never be cited as such.",
+  "proportions": {
+    "srs_radionecrosis_zero_events": {"xi": [0, 3, 1, 0, 5, 2], "ni": [25, 40, 18, 12, 60, 33]},
+    "srs_tumour_control_all_events": {"xi": [45, 30, 58, 22, 80], "ni": [45, 31, 60, 22, 85]},
+    "two_studies": {"xi": [4, 9], "ni": [20, 25]}
+  },
+  "two_by_two": {
+    "sparse_with_double_zero": {
+      "ai": [0, 1, 0, 2, 0, 3], "n1i": [20, 35, 15, 40, 10, 50],
+      "ci": [2, 0, 0, 5, 1, 4], "n2i": [22, 30, 16, 38, 12, 48]
+    }
+  },
+  "km_probabilities": {
+    "_note": "Reported 5-year probabilities (percent) with 95% CIs constructed on the log(-log) scale, printed to one decimal.",
+    "srs_5yr_local_control": {
+      "est": [92.3, 85.0, 88.6, 95.1], "lower": [87.7, 78.6, 83.6, 91.4], "upper": [95.2, 89.6, 92.1, 97.2],
+      "level": [95, 95, 95, 95]
+    }
+  },
+  "generic": {
+    "homogeneous_tau2_zero": {"yi": [0.10, 0.12, 0.11, 0.105], "vi": [0.01, 0.02, 0.015, 0.012]},
+    "two_studies_heterogeneous": {"yi": [-0.9, 0.4], "vi": [0.04, 0.05]}
+  }
+}
