@@ -133,3 +133,47 @@ def test_protocol_form_helpers() -> None:
     assert out == [{"outcome_id": "a", "n": 2}]
     s = pf.set_strategy([{"database": "pubmed", "q": 1}], "pubmed", None)
     assert s == []
+
+
+# ---------------------------------------------------------------------- export edge cases
+# Synthetic files imitating common export quirks; NOT actual vendor exports.
+def test_ris_with_bom_crlf_and_blank_lines_inside_entries() -> None:
+    text = (
+        "﻿TY  - JOUR\r\nTI  - First synthetic title\r\n\r\nAU  - Smith, J. M.\r\n"
+        "AU  - O'Brien, K.\r\nPY  - 2020///\r\nER  - \r\n\r\nTY  - JOUR\r\nT1  - Second\r\n"
+        "ER  -\r\n"
+    )
+    parsed = parse_file(text.encode("utf-8"), "ris")
+    assert parsed.encoding == "utf-8-sig" and not parsed.errors
+    assert [e.title for e in parsed.entries] == ["First synthetic title", "Second"]
+    assert [a.last_name for a in parsed.entries[0].authors] == ["Smith", "O'Brien"]
+    assert parsed.entries[0].year == 2020
+
+
+def test_semicolon_csv_with_multiline_quoted_abstract() -> None:
+    text = (
+        "Title;Authors;Year;DOI;Abstract\n"
+        '"Synthetic; a title with a semicolon";"Smith J.; Doe A.";2019;10.5555/csv.1;'
+        '"Line one\nline two"\n'
+        '"Second synthetic title";"Roe R.";2020;;"Short"\n'
+    )
+    parsed = parse_file(text.encode(), "csv")
+    assert len(parsed.entries) == 2 and not parsed.errors
+    first = parsed.entries[0]
+    assert first.title == "Synthetic; a title with a semicolon"
+    assert first.abstract == "Line one line two" and first.doi == "10.5555/csv.1"
+    assert [a.full_name for a in first.authors] == ["Smith J.", "Doe A."]
+    assert parsed.entries[1].doi is None
+
+
+def test_bibtex_comment_string_and_unquoted_fields_are_skipped_or_kept() -> None:
+    text = (
+        '@comment{exported by a synthetic tool}\n@string{jsm = "J Synth Med"}\n'
+        '@ARTICLE{Key2021,\n  title = "Quoted {Synthetic} title",\n  year = 2021,\n'
+        "  month = mar,\n  doi = {https://doi.org/10.5555/BIB.9}\n}\n"
+    )
+    entries = parse_bibtex(text)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.title == "Quoted Synthetic title" and e.year == 2021
+    assert e.doi == "10.5555/bib.9" and e.raw["month"] == "mar"

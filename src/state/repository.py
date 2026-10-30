@@ -641,6 +641,17 @@ class Repository:
         self.save_duplicate_candidate(project_id, resolved)
         return resolved
 
+    def reapply_duplicate_resolution(self, project_id: str, candidate: DuplicateCandidate) -> None:
+        """Re-apply a stored human decision after the deduplicator was re-run.
+
+        ``distinct`` needs no change (the pair stays separate); ``duplicate_keep_*`` re-links
+        the dropped cluster to the kept one. The decision row itself is not modified.
+        """
+        if candidate.resolution == "duplicate_keep_a":
+            self._merge_clusters(project_id, keep=candidate.record_id_a, drop=candidate.record_id_b)
+        elif candidate.resolution == "duplicate_keep_b":
+            self._merge_clusters(project_id, keep=candidate.record_id_b, drop=candidate.record_id_a)
+
     def _merge_clusters(self, project_id: str, *, keep: str, drop: str) -> None:
         def representative(record_id: str) -> str:
             row = self.session.get(StudyRecordORM, record_id)

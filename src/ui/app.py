@@ -498,8 +498,10 @@ def page_searches(be: UIBackend) -> None:
         with st.expander(f"{s['database']} · {s['status']} · {sha[:12]}"):
             st.code(s["query"], language=None)
             st.caption(
-                f"Limits: {s['date_from'] or '—'} to {s['date_to'] or '—'}; filters: "
-                f"{'; '.join(s['filters']) or 'none'}. {dbi.note}"
+                f"Protocol restrictions — dates: {s['date_from'] or '—'} to {s['date_to'] or '—'}; "
+                f"languages: {'; '.join(s['languages']) or 'none'}; filters: "
+                f"{' | '.join(s['filters']) or 'none'}. Platform: {s['platform'] or '—'}. "
+                f"{dbi.note}"
             )
             if dbi.access == "api":
                 c = st.columns(2)
@@ -600,10 +602,23 @@ def _import_form(be: UIBackend, pid: str, sha: str, label: str, open_: bool) -> 
             "Date the search was run (YYYY-MM-DD)", date.today().isoformat(), key=f"imp_date_{sha}"
         )
         hits = c[2].number_input(
-            "Records shown by the interface (0 = not recorded)",
-            min_value=0,
-            value=0,
+            "Total records the interface reported for the whole search (not this file)",
+            min_value=1,
+            value=None,
             key=f"imp_hits_{sha}",
+        )
+        no_total = st.checkbox(
+            "The interface did not show a total (completeness must then be acknowledged)",
+            key=f"imp_nototal_{sha}",
+        )
+        confirmed = st.checkbox(
+            "I applied the protocol's date limits, language limits and filters (shown above) "
+            "in the vendor interface",
+            key=f"imp_restr_{sha}",
+        )
+        restr_note = st.text_input(
+            "How they were applied (optional, e.g. 'Embase Limits: Article, 2000-2025')",
+            key=f"imp_restr_note_{sha}",
         )
         columns = st.text_input(
             'CSV column overrides (JSON, e.g. {"title": "Study Title"})', key=f"imp_cols_{sha}"
@@ -623,9 +638,17 @@ def _import_form(be: UIBackend, pid: str, sha: str, label: str, open_: bool) -> 
                 )
                 if show(r, f"{r.data.get('entries') if r.ok else 0} entries read."):
                     st.json(r.data)
+            elif hits is None and not no_total:
+                st.error("Enter the total the interface reported, or tick that it showed none.")
             else:
-                params |= {"filename": upload.name, "searched_on": searched_on}
-                if hits:
+                params |= {
+                    "filename": upload.name,
+                    "searched_on": searched_on,
+                    "restrictions_confirmed": confirmed,
+                }
+                if restr_note.strip():
+                    params["restrictions_note"] = restr_note.strip()
+                if hits is not None and not no_total:
                     params["hits_reported"] = int(hits)
                 r = be.api.post(
                     f"/projects/{pid}/searches/strategies/{sha}/import",
@@ -635,6 +658,25 @@ def _import_form(be: UIBackend, pid: str, sha: str, label: str, open_: bool) -> 
                 )
                 if show(r, "File imported and preserved."):
                     _run_summary(r.data)
+    with st.form(f"zero_{sha}"):
+        st.markdown(f"**The {label} search ran but returned no records**")
+        zdate = st.text_input(
+            "Date the search was run (YYYY-MM-DD)", date.today().isoformat(), key=f"zero_date_{sha}"
+        )
+        znote = st.text_input(
+            "Attestation (e.g. 'run in Embase.com, 0 results')", key=f"zero_note_{sha}"
+        )
+        zconf = st.checkbox("The protocol's limits and filters were applied", key=f"zero_r_{sha}")
+        if (
+            st.form_submit_button("Record zero-result search (authenticated)", disabled=not open_)
+            and znote
+        ):
+            r = be.api.post(
+                f"/projects/{pid}/searches/strategies/{sha}/zero-results",
+                token=token(),
+                json={"searched_on": zdate, "note": znote, "restrictions_confirmed": zconf},
+            )
+            show(r, "Zero-result search recorded.")
 
 
 def _acknowledgements(be: UIBackend, pid: str, data: dict[str, Any]) -> None:
@@ -642,7 +684,8 @@ def _acknowledgements(be: UIBackend, pid: str, data: dict[str, Any]) -> None:
     shortfalls = [
         s
         for s in data.get("strategies", [])
-        if s["interface_reported"] is not None and s["interface_reported"] != s["imported_records"]
+        if s["reconciliation"] in ("mismatch", "unknown", "conflicting")
+        and not s["reconciliation_acknowledged"]
     ]
     if not (mismatched or shortfalls):
         return
@@ -653,7 +696,7 @@ def _acknowledgements(be: UIBackend, pid: str, data: dict[str, Any]) -> None:
             for r in mismatched
         }
         options |= {
-            f"imports for {s['database']} {s['strategy_sha256'][:12]}": (
+            f"imports for {s['database']} {s['strategy_sha256'][:12]} ({s['reconciliation']})": (
                 "strategy",
                 s["strategy_sha256"],
             )

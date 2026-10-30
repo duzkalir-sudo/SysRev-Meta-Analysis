@@ -145,6 +145,20 @@ def executable_query(strategy: SearchStrategy) -> ExecutableQuery:
     return ExecutableQuery(strategy.query, params, f"{OPENALEX_BASE}works")
 
 
+def protocol_restrictions(strategy: SearchStrategy) -> dict[str, Any]:
+    """The restrictions a protocol strategy defines besides its query (as written)."""
+    return {
+        "date_from": strategy.date_from.isoformat() if strategy.date_from else None,
+        "date_to": strategy.date_to.isoformat() if strategy.date_to else None,
+        "languages": list(strategy.languages),
+        "filters": list(strategy.filters),
+    }
+
+
+def _has_restrictions(r: dict[str, Any]) -> bool:
+    return bool(r["date_from"] or r["date_to"] or r["languages"] or r["filters"])
+
+
 class _ResponseCapture:
     """Collects raw response bodies (``api_key`` removed from the recorded URL)."""
 
@@ -260,6 +274,12 @@ class SearchService:
             query=plan.query,
             parameters=plan.parameters,
             endpoint=plan.endpoint,
+            protocol_restrictions=protocol_restrictions(strategy),
+            restrictions_applied=(
+                "applied_by_system"
+                if _has_restrictions(protocol_restrictions(strategy))
+                else "none_defined"
+            ),
         )
         errors: list[str] = []
         warnings: list[str] = []
@@ -334,6 +354,12 @@ class SearchService:
             query=plan.query,
             parameters=plan.parameters,
             endpoint=plan.endpoint,
+            protocol_restrictions=protocol_restrictions(strategy),
+            restrictions_applied=(
+                "applied_by_system"
+                if _has_restrictions(protocol_restrictions(strategy))
+                else "none_defined"
+            ),
         )
         try:
             if strategy.database == SourceDatabase.PUBMED:
@@ -486,7 +512,14 @@ class SearchService:
         hits_reported: int | None = None,
         column_map: dict[str, str] | None = None,
         note: str | None = None,
+        restrictions_confirmed: bool = False,
+        restrictions_note: str | None = None,
     ) -> SearchRun:
+        """Import one export file. ``hits_reported`` is the total the vendor interface showed
+        for the whole search (``None`` = not recorded; then completeness stays unverified
+        until a reviewer acknowledges it). ``restrictions_confirmed`` is the reviewer's
+        authenticated statement that the protocol's date/language limits and filters were
+        applied in the vendor interface."""
         self._require_identification_open()
         protocol, strategy = self._approved_strategy(sha)
         if searched_on > datetime.now(UTC).date():
@@ -516,7 +549,7 @@ class SearchService:
                         run_id,
                         file_sha,
                         searched_at,
-                        hits_reported or len(parsed.entries),
+                        hits_reported,
                         f"manual export from {label} ({fmt}): {filename}",
                     )
                 )
@@ -529,11 +562,6 @@ class SearchService:
             protocol_version=protocol.version,
             platform=strategy.platform,
             query=strategy.query,
-            parameters={
-                k: str(v)
-                for k, v in (("date_from", strategy.date_from), ("date_to", strategy.date_to))
-                if v
-            },
             endpoint=f"manual export ({label})",
             searched_on=searched_on,
             hits_reported=hits_reported,
@@ -542,7 +570,11 @@ class SearchService:
             import_format=fmt,
             column_map=parsed.column_map,
             encoding=parsed.encoding,
-            warnings=parsed.warnings[:200],
+            warnings=[
+                *self._import_warnings(strategy, records, hits_reported, restrictions_confirmed),
+                *parsed.warnings[:200],
+            ],
+            **self._restriction_fields(strategy, restrictions_confirmed, restrictions_note),
             files=[
                 SearchFileRef(
                     role="import_file",
@@ -573,7 +605,7 @@ class SearchService:
         run_id: str,
         file_sha: str,
         searched_at: datetime,
-        hits: int,
+        hits: int | None,
         endpoint: str,
     ) -> StudyRecord:
         assert e.title is not None
@@ -603,13 +635,107 @@ class SearchService:
             registry_ids=e.registry_ids,
         )
 
+    @staticmethod
+    def _restriction_fields(
+        strategy: SearchStrategy, confirmed: bool, note: str | None
+    ) -> dict[str, Any]:
+        restrictions = protocol_restrictions(strategy)
+        applied = (
+            "none_defined"
+            if not _has_restrictions(restrictions)
+            else "confirmed_by_reviewer"
+            if confirmed
+            else "not_confirmed"
+        )
+        return {
+            "protocol_restrictions": restrictions,
+            "restrictions_applied": applied,
+            "restrictions_note": note,
+        }
+
+    @staticmethod
+    def _import_warnings(
+        strategy: SearchStrategy, records: list[StudyRecord], hits: int | None, confirmed: bool
+    ) -> list[str]:
+        out = []
+        if hits is None:
+            out.append(
+                "the total reported by the vendor interface was not recorded: "
+                "completeness of this export cannot be verified"
+            )
+        if _has_restrictions(protocol_restrictions(strategy)) and not confirmed:
+            out.append(
+                "the protocol's restrictions (dates/languages/filters) were not "
+                "confirmed as applied in the vendor interface"
+            )
+        lo = strategy.date_from.year if strategy.date_from else None
+        hi = strategy.date_to.year if strategy.date_to else None
+        outside = sum(
+            1
+            for r in records
+            if r.publication_year is not None
+            and (
+                (lo is not None and r.publication_year < lo)
+                or (hi is not None and r.publication_year > hi)
+            )
+        )
+        if outside:
+            out.append(
+                f"{outside} imported record(s) have a publication year outside the "
+                "protocol date limits (the limit may not have been applied, or the "
+                "database limits on another date field)"
+            )
+        return out
+
+    def record_zero_results(
+        self,
+        sha: str,
+        *,
+        searched_on: date,
+        note: str,
+        reviewer: Reviewer,
+        restrictions_confirmed: bool = False,
+        restrictions_note: str | None = None,
+    ) -> SearchRun:
+        """A manual search that was run and returned no records (nothing to export).
+
+        Recorded as an import of zero records with an explicit vendor total of 0 and the
+        reviewer's authenticated attestation, so the database is reported as searched with
+        0 results rather than falsely as "not searched".
+        """
+        self._require_identification_open()
+        protocol, strategy = self._approved_strategy(sha)
+        if searched_on > datetime.now(UTC).date():
+            raise ImportFileError("the search date cannot be in the future")
+        label = info(strategy.database).label
+        run = SearchRun(
+            **self._base(reviewer, kind=SearchRunKind.IMPORT),
+            database=strategy.database,
+            strategy_sha256=sha,
+            protocol_version=protocol.version,
+            platform=strategy.platform,
+            query=strategy.query,
+            endpoint=f"manual search ({label}): zero results attested",
+            searched_on=searched_on,
+            hits_reported=0,
+            records_received=0,
+            records_saved=0,
+            note=note,
+            **self._restriction_fields(strategy, restrictions_confirmed, restrictions_note),
+        )
+        self.repo.add_search_run(self.project_id, run)
+        return run
+
     # ------------------------------------------------------------------ human declarations
     def record_not_searched(self, sha: str, *, reason: str, reviewer: Reviewer) -> SearchRun:
         self._require_identification_open()
         protocol, strategy = self._approved_strategy(sha)
-        runs = self.repo.load_search_runs(self.project_id)
-        if any(r.strategy_sha256 == sha and r.identifies_records for r in runs):
-            raise SearchError("records were already identified with this strategy")
+        from src.search.identification import strategy_state
+
+        if strategy_state(self.repo.load_search_runs(self.project_id), sha).status == "searched":
+            raise SearchError(
+                "this strategy was already searched; it cannot be declared not searched"
+            )
         run = SearchRun(
             **self._base(reviewer, kind=SearchRunKind.NOT_SEARCHED),
             database=strategy.database,
@@ -630,7 +756,9 @@ class SearchService:
         run_id: str | None = None,
         strategy_sha256: str | None = None,
     ) -> SearchRun:
-        """Acknowledge an execution's count mismatch, or a strategy's import shortfall."""
+        """Acknowledge an execution's count mismatch, or a strategy's unreconciled imports
+        (shortfall, unknown vendor total or conflicting totals). An import acknowledgement is
+        bound to the current counts and becomes invalid when further files are imported."""
         from src.search.identification import import_totals
 
         phase = self._phase()
@@ -651,8 +779,11 @@ class SearchService:
             )
         elif strategy_sha256 is not None:
             totals = import_totals(runs, strategy_sha256)
-            if not totals.mismatch:
-                raise SearchError("the imports of this strategy show no count discrepancy")
+            if not totals.needs_acknowledgement:
+                raise SearchError(
+                    "the imports of this strategy are reconciled with the vendor "
+                    "total (or there are none); nothing to acknowledge"
+                )
             last = [
                 r
                 for r in runs
@@ -664,7 +795,7 @@ class SearchService:
                 database=last.database,
                 strategy_sha256=strategy_sha256,
                 note=note,
-                summary={"records": totals.records, "reported": totals.reported},
+                summary=totals.ack_summary(),
             )
         else:
             raise SearchError("name the run or the strategy to acknowledge")
@@ -677,11 +808,11 @@ class SearchService:
         self._require_identification_open()
         if not any(r.identifies_records for r in self.repo.load_search_runs(self.project_id)):
             raise SearchError("no executed or imported search yet")
-        if any(c.is_resolved for c in self.repo.load_duplicate_candidates(self.project_id)):
-            raise SearchError(
-                "possible duplicates were already adjudicated by a reviewer; re-running the "
-                "deduplication would discard those decisions"
-            )
+        # Human adjudications survive re-preparation (e.g. after a further import): they are
+        # kept and re-applied, and the same pair is never proposed again.
+        resolved = [
+            c for c in self.repo.load_duplicate_candidates(self.project_id) if c.is_resolved
+        ]
         records = [
             r.model_copy(update={"duplicate_of": None})
             for r in self.repo.load_records(self.project_id)
@@ -693,7 +824,15 @@ class SearchService:
         result = dedup.deduplicate(records)
         self.repo.save_records(self.project_id, result.all_records)
         self.repo.delete_unresolved_duplicate_candidates(self.project_id)
-        for pd in result.possible_duplicates:
+        decided = {frozenset((c.record_id_a, c.record_id_b)) for c in resolved}
+        for c in resolved:
+            self.repo.reapply_duplicate_resolution(self.project_id, c)
+        proposed = [
+            pd
+            for pd in result.possible_duplicates
+            if frozenset((pd.record_id_a, pd.record_id_b)) not in decided
+        ]
+        for pd in proposed:
             self.repo.save_duplicate_candidate(self.project_id, pd.to_candidate())
         by_source = identification_by_source(self.repo, self.project_id)
         run = SearchRun(
@@ -701,9 +840,13 @@ class SearchService:
             records_saved=0,
             summary={
                 "records": len(records),
-                "unique": len(result.unique_records),
-                "duplicates_removed": result.duplicates_removed,
-                "possible_duplicates_for_review": len(result.possible_duplicates),
+                "unique": len(self.repo.load_records(self.project_id, unique_only=True)),
+                "duplicates_removed": sum(
+                    1 for r in self.repo.load_records(self.project_id) if r.duplicate_of
+                ),
+                "automatic_duplicates": result.duplicates_removed,
+                "human_decisions_reapplied": len(resolved),
+                "possible_duplicates_for_review": len(proposed),
                 "by_source": by_source,
                 "match_reasons": dict(sorted(result.match_reasons.items())),
                 "settings": {

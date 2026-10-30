@@ -68,7 +68,9 @@ class SearchProvenance(FrozenModel):
     query: NonEmptyStr
     endpoint: NonEmptyStr
     executed_at: AwareDatetime
-    total_hits_reported: int = Field(ge=0)
+    # Count the database reported for the whole search; ``None`` when unknown (a manual
+    # export without a recorded total). Never substituted by the number of records stored.
+    total_hits_reported: int | None = Field(ge=0)
     source_record_id: NonEmptyStr
     # Session 5: the search-log entry (execution or import) that produced the record, and
     # the SHA-256 of the imported file. ``None`` for records stored before Session 5.

@@ -226,16 +226,32 @@ raises the NCBI limit from 3 to 10 requests per second. Linux/macOS: the same co
      reviewer must acknowledge.
    * **Embase, Scopus, Web of Science, Cochrane CENTRAL, ClinicalTrials.gov**: run the
      strategy in the vendor interface, export all records (RIS recommended; BibTeX or CSV
-     also accepted), *Check file*, then *Import* with the date of the search and the number
-     of records the interface showed. The file is preserved with its SHA-256, each raw
-     entry is kept, a file cannot be imported twice, and a file with an untitled entry is
-     refused as a whole. Large exports may be imported as several files.
-   * A database that could not be searched is recorded as **not searched** with a reason;
-     the search summary then says so — it never lists it as searched.
+     also accepted), *Check file*, then *Import* with the date of the search and the
+     **total the interface reported for the whole search**. The file is preserved with its
+     SHA-256, each raw entry is kept, a file cannot be imported twice, and a file with an
+     untitled entry is refused as a whole. Large exports may be imported as several files;
+     the combined number of imported records is reconciled with that total.
+     * If the interface showed no total, tick that explicitly: the total is then recorded
+       as *unknown* (never replaced by the number imported), and screening stays blocked
+       until a reviewer acknowledges it with a reason. A shortfall (e.g. 100 of 150) or
+       conflicting totals need the same acknowledgement; an acknowledgement is bound to the
+       counts and becomes invalid when another file is imported.
+     * Tick that the protocol's date limits, language limits and filters were applied in
+       the vendor interface (optionally saying how). Otherwise the reports say the
+       restrictions were **not confirmed** as applied; imported records with publication
+       years outside the date limits are flagged.
+     * A search that ran but found nothing is recorded as a *zero-result search* (with an
+       attestation), so it is reported as searched with 0 records.
+   * A database that could not be searched is recorded as **not searched** with a reason.
+     Every declaration stays in the log; the *current* status is derived from the sequence
+     of events: a later successful execution or import supersedes the declaration, a later
+     declaration replaces an earlier one, and a failed attempt never counts as a search.
+     The strategy table, database lists, Markdown and CSV exports all use this status.
    * *Deduplicate and prepare for screening* runs the existing deterministic deduplicator
      (DOI/PMID/PMCID/OpenAlex ID, then near-identical titles with year and first-author
      checks). In this workflow a shared identifier on clearly different titles is **not**
-     merged but listed for a human decision, like other conflicting pairs.
+     merged but listed for a human decision, like other conflicting pairs. Re-running the
+     preparation (e.g. after another import) keeps and re-applies earlier human decisions.
    * PRISMA counts are derived from the stored records and decisions (*Recompute PRISMA*
      after screening decisions change); ClinicalTrials.gov records are counted in the
      PRISMA "registers" box. The PRISMA-S search summary can be downloaded as Markdown.

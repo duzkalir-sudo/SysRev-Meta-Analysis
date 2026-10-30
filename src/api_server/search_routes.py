@@ -48,6 +48,13 @@ class AcknowledgeBody(_Body):
     strategy_sha256: str | None = None
 
 
+class ZeroResultBody(_Body):
+    searched_on: date
+    note: str = Field(min_length=1)
+    restrictions_confirmed: bool = False
+    restrictions_note: str | None = None
+
+
 class DuplicateResolutionBody(_Body):
     resolution: Literal["distinct", "duplicate_keep_a", "duplicate_keep_b"]
     note: str | None = None
@@ -232,7 +239,12 @@ def build_search_router(store: DocumentStore) -> APIRouter:
         hits_reported: int | None = None,
         columns: str | None = None,
         note: str | None = None,
+        restrictions_confirmed: bool = False,
+        restrictions_note: str | None = None,
     ) -> dict[str, Any]:
+        """``hits_reported``: total the vendor interface showed for the whole search (omit if
+        unavailable — completeness then needs an acknowledgement). ``restrictions_confirmed``:
+        the reviewer confirms the protocol's limits/filters were applied in the interface."""
         data = await request.body()
         if len(data) > MAX_IMPORT_BYTES:
             raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "file too large")
@@ -243,6 +255,25 @@ def build_search_router(store: DocumentStore) -> APIRouter:
             lambda: svc.import_file(
                 sha, data, filename=filename, fmt=format, searched_on=searched_on,
                 reviewer=reviewer, hits_reported=hits_reported, column_map=mapping, note=note,
+                restrictions_confirmed=restrictions_confirmed,
+                restrictions_note=restrictions_note,
+            )
+        )  # fmt: skip
+        return run.model_dump(mode="json")
+
+    @router.post("/searches/strategies/{sha}/zero-results", status_code=status.HTTP_201_CREATED)
+    def zero_results(
+        project_id: str, sha: str, body: ZeroResultBody, request: Request, session: SessionDep,
+        reviewer: ReviewerDep,
+    ) -> dict[str, Any]:  # fmt: skip
+        """The reviewer attests that the manual search ran and returned no records."""
+        repo = Repository(session)
+        svc = service(request, repo, project_id)
+        run = _call(
+            lambda: svc.record_zero_results(
+                sha, searched_on=body.searched_on, note=body.note, reviewer=reviewer,
+                restrictions_confirmed=body.restrictions_confirmed,
+                restrictions_note=body.restrictions_note,
             )
         )  # fmt: skip
         return run.model_dump(mode="json")

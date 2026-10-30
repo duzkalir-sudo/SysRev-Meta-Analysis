@@ -500,6 +500,7 @@ def test_multi_database_identification_dedup_and_prisma(
         fmt="bibtex",
         searched_on=day,
         reviewer=human,
+        hits_reported=2,
     )
     service.import_file(
         sha["cochrane_central"],
@@ -508,6 +509,7 @@ def test_multi_database_identification_dedup_and_prisma(
         fmt="ris",
         searched_on=day,
         reviewer=human,
+        hits_reported=1,
     )
     ct = service.import_file(
         sha["clinicaltrials_gov"],
@@ -516,6 +518,7 @@ def test_multi_database_identification_dedup_and_prisma(
         fmt="csv",
         searched_on=day,
         reviewer=human,
+        hits_reported=2,
     )
     assert ct.column_map["title"] == "Study Title"
     service.record_not_searched(
@@ -571,7 +574,7 @@ def test_multi_database_identification_dedup_and_prisma(
     report = search_report(repo, PID)
     assert "Web of Science" not in report["databases_searched"]
     assert report["databases_not_searched"] == [
-        {"database": "Web of Science", "reason": "no institutional access"}
+        {"database": "Web of Science", "reasons": ["no institutional access"]}
     ]
     md = report_markdown(report)
     assert "Not searched: Web of Science — no institutional access" in md
@@ -582,8 +585,10 @@ def test_multi_database_identification_dedup_and_prisma(
     assert len(unique) == 7
     # Human adjudicates the ambiguous pair as distinct; PRISMA re-derived.
     service.resolve_duplicate(candidate.candidate_id, resolution="distinct", reviewer=human)
-    with pytest.raises(SearchError, match="already adjudicated"):
-        service.prepare_for_screening(reviewer=human)
+    again = service.prepare_for_screening(reviewer=human)  # the decision is kept, not re-asked
+    assert again.summary["human_decisions_reapplied"] == 1
+    assert again.summary["possible_duplicates_for_review"] == 0
+    assert [c.resolution for c in repo.load_duplicate_candidates(PID)] == ["distinct"]
     # Screening starts: no more searches or imports.
     repo.save_screening_decision(
         PID,

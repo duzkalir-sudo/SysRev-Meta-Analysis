@@ -67,6 +67,16 @@ class SearchRun(FrozenModel):
     records_saved: int = Field(default=0, ge=0)
     partitions: list[DatePartition] = Field(default_factory=list)
     import_format: Literal["ris", "bibtex", "csv"] | None = None
+    # Restrictions as defined in the protocol strategy (date limits, languages, separate
+    # filters), and whether they were actually applied: by the system (API execution), by
+    # the reviewer in the vendor interface (authenticated confirmation at import), or not
+    # confirmed. A protocol restriction is never reported as applied without one of these.
+    protocol_restrictions: dict[str, Any] = Field(default_factory=dict)
+    restrictions_applied: (
+        Literal["applied_by_system", "confirmed_by_reviewer", "not_confirmed", "none_defined"]
+        | None
+    ) = None
+    restrictions_note: str | None = None
     column_map: dict[str, str] = Field(default_factory=dict)
     encoding: str | None = None
     files: list[SearchFileRef] = Field(default_factory=list)
@@ -93,10 +103,23 @@ class SearchRun(FrozenModel):
         if self.status == SearchRunStatus.FAILED and self.records_saved:
             raise ValueError("a failed run cannot have saved records")
         if self.kind == SearchRunKind.IMPORT:
-            if self.searched_on is None or self.import_format is None:
-                raise ValueError("an import needs the search date and the file format")
-            if not any(f.role == "import_file" for f in self.files):
-                raise ValueError("an import must reference the preserved import file")
+            if self.searched_on is None:
+                raise ValueError("an import needs the date the search was run")
+            zero_result = self.records_saved == 0 and self.hits_reported == 0
+            if zero_result:
+                if not (self.note and self.note.strip()):
+                    raise ValueError("a zero-result search needs the reviewer's attestation")
+            elif self.import_format is None or not any(f.role == "import_file" for f in self.files):
+                raise ValueError("an import must reference the preserved file and its format")
+        if self.restrictions_applied == "applied_by_system" and self.kind not in (
+            SearchRunKind.PREVIEW,
+            SearchRunKind.EXECUTION,
+        ):
+            raise ValueError("only API runs can have restrictions applied by the system")
+        if self.restrictions_applied == "confirmed_by_reviewer" and (
+            self.kind != SearchRunKind.IMPORT or self.reviewer_id is None
+        ):
+            raise ValueError("only an authenticated import can confirm vendor-side restrictions")
         human_only = (
             SearchRunKind.EXECUTION, SearchRunKind.IMPORT, SearchRunKind.NOT_SEARCHED,
             SearchRunKind.ACKNOWLEDGEMENT, SearchRunKind.DEDUPLICATION,

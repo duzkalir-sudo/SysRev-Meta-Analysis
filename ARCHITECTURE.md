@@ -813,16 +813,40 @@ reviewer overrides). Only present fields are mapped; invalid identifiers are dro
 warning; an entry without a title refuses the whole file, so stored records always equal
 the entries in the file. The file is stored content-addressed with its SHA-256, each raw
 entry in `search_raw_records` (append-only), and the same file cannot be imported twice.
-The count the reviewer read in the interface is compared with the records imported across
-all files of a strategy; a shortfall needs an acknowledgement.
+Reconciliation (`identification.import_totals`): the vendor-reported total for the whole
+search (declared with any import of the strategy) is compared with the records imported
+across all its files: *matched*, *mismatch*, *unknown* (no total declared — never treated as
+a match and never replaced by the imported count; record provenance keeps
+`total_hits_reported = None`) or *conflicting* (different totals declared). All but
+*matched* block Stage 2 → Gate 1.5 and AI screening until an authenticated acknowledgement
+with a reason is recorded **after the last import** whose summary equals the current
+counts; any further import therefore invalidates it. A manual search with no results is an
+attested zero-record import with a declared total of 0.
+
+Restrictions: every API run and import stores the strategy's `protocol_restrictions`
+(date limits, languages, separate filters) and `restrictions_applied`: `applied_by_system`
+(API request), `confirmed_by_reviewer` (authenticated statement at import, with an optional
+note), `not_confirmed` or `none_defined`. The vendor query is stored exactly as in the
+protocol and never rewritten; for imports nothing is recorded as "sent". Imported records
+whose publication year lies outside the protocol date limits are counted as a warning.
+
+Current status (`identification.strategy_state`, `run_effects`): derived from the
+chronological log. A successful execution/import makes a strategy *searched* and supersedes
+earlier "not searched" declarations (which remain in the log, marked superseded); a later
+declaration replaces an earlier one; a failed attempt never counts as a search; declaring a
+searched strategy "not searched" is refused. The PRISMA-S report (strategy table, database
+lists, Markdown, CSV with `current_effect` and `strategy_status` columns) and the readiness
+checks use the same functions.
 
 **Preparation** (`SearchService.prepare_for_screening`): resets `duplicate_of`, runs the
 existing `Deduplicator` with `exact_match_title_floor = 60` (a shared DOI/PMID with
 token-sort title similarity < 60 becomes a `DuplicateCandidate` instead of a merge; an
 unvalidated engineering threshold), stores candidates for human adjudication
 (`POST /duplicates/{id}/resolve`), records per-source identified/duplicate/unique counts
-and saves the PRISMA snapshot. It is refused once screening decisions exist or a duplicate
-pair was adjudicated, as are new searches and imports (update searches are not supported).
+and saves the PRISMA snapshot. Human duplicate decisions are kept and re-applied when the
+preparation is re-run (e.g. after a further import), and the same pair is not proposed
+again. Preparation, searches and imports are refused once screening decisions exist
+(update searches are not supported).
 Records stay *records*: duplicates of one report are linked by `duplicate_of`; reports of
 one study and overlapping cohorts are linked later (§9.3, §8.4), never merged here.
 
