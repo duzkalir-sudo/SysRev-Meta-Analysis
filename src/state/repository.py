@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
@@ -76,6 +77,7 @@ from src.state.db import (
     FullTextItemORM,
     GateDecisionORM,
     LLMCallORM,
+    LLMCallOutcomeORM,
     ProjectAISettingsORM,
     ProjectORM,
     ProtocolORM,
@@ -1141,13 +1143,31 @@ class Repository:
         )
         return [LLMCallRecord.model_validate(r.payload) for r in rows]
 
-    def has_successful_call(self, project_id: str, call_key: str) -> bool:
+    def record_persisted_result(
+        self, project_id: str, records: Sequence[LLMCallRecord], result_ref: str
+    ) -> None:
+        """Link successful calls to the validated result they produced (after it was saved).
+
+        Only these links suppress a repeat of an identical request; a provider reply that
+        failed validation leaves no link, so the request can simply be retried.
+        """
+        for record in records:
+            if record.status != "ok" or record.project_id != project_id:
+                continue
+            self.session.add(
+                LLMCallOutcomeORM(
+                    project_id=project_id, call_id=record.call_id, call_key=record.call_key,
+                    result_ref=result_ref,
+                )
+            )  # fmt: skip
+        self.session.flush()
+
+    def has_persisted_result(self, project_id: str, call_key: str) -> bool:
         return (
             self.session.scalars(
-                select(LLMCallORM.id).where(
-                    LLMCallORM.project_id == project_id,
-                    LLMCallORM.call_key == call_key,
-                    LLMCallORM.status == "ok",
+                select(LLMCallOutcomeORM.seq).where(
+                    LLMCallOutcomeORM.project_id == project_id,
+                    LLMCallOutcomeORM.call_key == call_key,
                 )
             ).first()
             is not None

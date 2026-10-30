@@ -123,7 +123,7 @@ class AIWorkflow:
             effort=config.effort, capability=capability, sink=self.repo.record_llm_call,
             budget=budget,
             already_answered=(
-                (lambda key: self.repo.has_successful_call(self.project_id, key))
+                (lambda key: self.repo.has_persisted_result(self.project_id, key))
                 if dedupe else None
             ),
         )  # fmt: skip
@@ -254,12 +254,17 @@ class AIWorkflow:
             if record_id in existing and not force:
                 report.skipped.append(f"{record_id}: already has proposals from this model")
                 continue
+            before = len(provider.records)
             try:
                 doc = self.document(record_id)
                 proposals = extractor.propose(protocol, doc)
                 items = submit_proposals(
                     self.repo, self.project_id, record_id, doc, proposals,
                     proposed_by=ActorType.AGENT, proposer_identity=extractor.identity,
+                )  # fmt: skip
+                self.repo.record_persisted_result(
+                    self.project_id, provider.records[before:],
+                    f"extraction:{record_id}:{len(items)} item(s)",
                 )  # fmt: skip
                 self._commit()
                 report.done.append(f"{record_id}: {len(items)} proposal(s), pending human review")
@@ -306,6 +311,10 @@ class AIWorkflow:
                 call_id = provider.records[-1].call_id if len(provider.records) > before else None
                 verification = verification.model_copy(update={"call_id": call_id})
                 self.repo.save_ai_verification(self.project_id, verification)
+                self.repo.record_persisted_result(
+                    self.project_id, provider.records[before:],
+                    f"verification:{verification.verification_id}",
+                )  # fmt: skip
                 report.done.append(f"{item.item_id}: {verification.verdict} (advisory)")
             except LLMRunHaltError as exc:
                 report.halted = str(exc)
@@ -335,6 +344,9 @@ class AIWorkflow:
                 review_design=protocol.review_design, outcome_id=outcome_id,
             )  # fmt: skip
             self.repo.save_rob(self.project_id, assessment)
+            self.repo.record_persisted_result(
+                self.project_id, provider.records, f"risk_of_bias:{assessment.assessment_id}"
+            )
             report.done.append(f"{record_id}: draft {assessment.assessment_id} awaits approval")
         except LLMRunHaltError as exc:
             report.halted = str(exc)

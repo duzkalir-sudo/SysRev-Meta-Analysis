@@ -40,7 +40,8 @@ CallStatus = Literal["ok", "error", "blocked_budget", "skipped_duplicate"]
 
 
 class RedundantCallError(SysRevError):
-    """An identical request (same task, model, effort and prompt) already succeeded."""
+    """An identical request (same task, model, effort and prompt) already produced a
+    validated result that was persisted."""
 
 
 class LLMCallRecord(StrictModel):
@@ -74,13 +75,21 @@ class LLMCallRecord(StrictModel):
 
     @property
     def total_tokens(self) -> int:
-        return sum(
-            x or 0
-            for x in (
-                self.input_tokens, self.output_tokens, self.cache_read_tokens,
-                self.cache_write_tokens,
-            )
-        )  # fmt: skip
+        """Tokens processed by the call, without double counting.
+
+        The raw fields are kept exactly as reported; their meaning differs by provider:
+
+        * OpenAI Responses: ``input_tokens`` already *include* the cached tokens
+          (``cache_read_tokens``) and ``output_tokens`` include the reasoning tokens, so
+          the total is input + output.
+        * Anthropic Messages: ``input_tokens``, ``cache_read_input_tokens`` and
+          ``cache_creation_input_tokens`` are disjoint, so all three are added to output.
+        * Any other provider: input + output (cache fields are not assumed to be disjoint).
+        """
+        base = (self.input_tokens or 0) + (self.output_tokens or 0)
+        if self.provider == "anthropic":
+            return base + (self.cache_read_tokens or 0) + (self.cache_write_tokens or 0)
+        return base
 
 
 def call_key(task: str, provider: str, model: str, effort: str | None, request: LLMRequest) -> str:
@@ -146,8 +155,14 @@ class BudgetGuard:
 
 
 class AuditedProvider:
-    """Records every call of ``inner`` through ``sink``; optionally enforces the budget
-    guard and refuses to repeat an identical successful request."""
+    """Records every call of ``inner`` through ``sink`` (the billing/usage audit trail);
+    optionally enforces the budget guard.
+
+    ``already_answered(call_key)`` must return True only when a *validated workflow
+    result* of an identical request was persisted — not merely when the provider
+    answered. A reply that later failed JSON/schema validation or evidence grounding
+    therefore never blocks an ordinary retry.
+    """
 
     def __init__(
         self,
@@ -201,8 +216,8 @@ class AuditedProvider:
         if self._already_answered is not None and self._already_answered(key):
             self._record(request, key, status="skipped_duplicate")
             raise RedundantCallError(
-                f"an identical {self.task} request to {self.model_id} already succeeded; "
-                "not repeated (use 'force' to pay for a repeat)"
+                f"an identical {self.task} request to {self.model_id} already produced a "
+                "saved, validated result; not repeated (use 'force' to pay for a repeat)"
             )
         if self.budget is not None:
             try:

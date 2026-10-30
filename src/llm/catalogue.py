@@ -18,7 +18,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.llm.provider import LLMConfig, TokenUsage, UnsupportedConfigurationError
 
@@ -38,6 +38,15 @@ class Pricing(BaseModel):
     long_prompt_input: float | None = Field(default=None, ge=0)
     long_prompt_output: float | None = Field(default=None, ge=0)
 
+    @model_validator(mode="after")
+    def _long_prompt_complete(self) -> Pricing:
+        tier = (self.long_prompt_threshold_tokens, self.long_prompt_input, self.long_prompt_output)
+        if any(v is not None for v in tier) and any(v is None for v in tier):
+            raise ValueError(
+                "long-prompt pricing needs threshold, input and output prices together"
+            )
+        return self
+
 
 class ModelCapability(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -50,8 +59,28 @@ class ModelCapability(BaseModel):
     supports_temperature: bool = False
     max_output_tokens: int | None = Field(default=None, gt=0)
     pricing: Pricing | None = None
-    source: str
+    source: str = Field(min_length=1)
     verified: bool
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ModelCapability:
+        if len(set(self.efforts)) != len(self.efforts):
+            raise ValueError(f"{self.model_id}: duplicate effort values")
+        if (
+            self.provider_default_effort is not None
+            and self.efforts
+            and (self.provider_default_effort not in self.efforts)
+        ):
+            raise ValueError(f"{self.model_id}: default effort is not a listed effort")
+        unverified_label = self.source.startswith("UNVERIFIED")
+        if self.verified == unverified_label:
+            raise ValueError(
+                f"{self.model_id}: an unverified entry's source must start with "
+                "'UNVERIFIED', and a verified entry's source must not"
+            )
+        if not self.verified and "UNVERIFIED" not in self.display_name:
+            raise ValueError(f"{self.model_id}: unverified entries must say so in their name")
+        return self
 
 
 class ModelCatalogue:
@@ -66,6 +95,9 @@ class ModelCatalogue:
         replacing or adding to it."""
         raw = resources.files("src.llm").joinpath("model_catalogue.json").read_text("utf-8")
         models = [ModelCapability.model_validate(m) for m in json.loads(raw)["models"]]
+        keys = [(m.provider, m.model_id) for m in models]
+        if len(set(keys)) != len(keys):
+            raise ValueError("the built-in model catalogue lists a model more than once")
         if override_dir is not None and (override_dir / OVERRIDE_FILENAME).is_file():
             extra = json.loads((override_dir / OVERRIDE_FILENAME).read_text("utf-8"))
             models += [ModelCapability.model_validate(m) for m in extra.get("models", [])]

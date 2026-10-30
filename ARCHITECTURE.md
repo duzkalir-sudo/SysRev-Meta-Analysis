@@ -729,11 +729,18 @@ sent) and output limit for `screening_reviewer_1`, `screening_reviewer_2`, `extr
 and duplicate-skipped calls) with task, requested and served model, effort sent and
 effective, reported tokens (input, output, reasoning, cache read/write), list-price cost
 estimate and its basis, provider request id, attempts, latency and SHA-256 of prompt and
-reply. Prompts, replies and keys are not stored.
+reply. Prompts, replies and keys are not stored. Raw token fields are kept as reported;
+`total_tokens` (used for project totals and token thresholds) follows each provider's
+semantics: OpenAI `input_tokens` already include cached tokens and `output_tokens`
+include reasoning tokens (total = input + output); Anthropic input, cache-read and
+cache-creation tokens are disjoint (total = all three + output).
 
 **Cost controls** (issues #3/#4, minimal scope): bounded retries; resumable runs (existing
 decisions are skipped); identical successful requests (same task, model, effort, prompt)
-are not repeated unless forced; the two screening passes never share a cache key; a
+are not repeated unless forced — but only once their *validated* result was persisted
+(`llm_call_outcomes` links the call to the saved extraction items, verification or RoB
+draft); a reply that failed JSON/schema validation or grounding is billed and logged but
+never blocks an ordinary retry; the two screening passes never share a cache key; a
 local stop threshold refuses to *start* calls once recorded estimated spend or tokens
 reach it. This is not a hard spending cap (estimates can differ from invoices; a call in
 flight completes); a cost threshold with an unpriced model is refused. No batching,

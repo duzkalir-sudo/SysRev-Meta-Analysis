@@ -398,3 +398,62 @@ def test_adapters_plug_into_the_existing_provider_registry(
     assert provider.complete(REQ).provider == "anthropic"
     with pytest.raises(UnsupportedConfigurationError):
         registry.build(cfg.model_copy(update={"effort": "extreme"}))
+
+
+# --------------------------------------------------------------------------- catalogue validation
+
+
+def _entry(**kw: Any) -> dict[str, Any]:
+    return {"provider": "openai", "model_id": "m-1", "display_name": "M", "efforts": ["low"],
+            "provider_default_effort": "low", "source": "Official docs (2026-10-30)",
+            "verified": True} | kw  # fmt: skip
+
+
+def test_builtin_catalogue_is_internally_consistent() -> None:
+    models = CAT.models()
+    assert len({(m.provider, m.model_id) for m in models}) == len(models)
+    for m in models:
+        assert m.provider_default_effort is None or m.provider_default_effort in m.efforts
+        assert m.verified != m.source.startswith("UNVERIFIED")
+        if m.pricing is not None:
+            assert m.pricing.input > 0 and m.pricing.output > 0
+    # nothing from OpenAI is claimed as verified until checked against its documentation
+    assert all(not m.verified and m.pricing is None for m in CAT.models("openai"))
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"provider_default_effort": "high"}, "default effort"),
+        ({"efforts": ["low", "low"]}, "duplicate effort"),
+        ({"verified": False}, "UNVERIFIED"),
+        ({"source": "UNVERIFIED guess"}, "UNVERIFIED"),
+        ({"verified": False, "source": "UNVERIFIED: x"}, "must say so"),
+        ({"pricing": {"input": 1, "output": 2, "long_prompt_threshold_tokens": 1000}},
+         "long-prompt"),
+        ({"provider": "mistral"}, "provider"),
+    ],
+)  # fmt: skip
+def test_invalid_catalogue_entries_are_rejected(override: dict[str, Any], message: str) -> None:
+    from pydantic import ValidationError
+
+    from src.llm.catalogue import ModelCapability
+
+    with pytest.raises(ValidationError, match=message):
+        ModelCapability.model_validate(_entry(**override))
+
+
+def test_local_override_adds_and_replaces_entries(tmp_path: Any) -> None:
+    (tmp_path / "model_catalogue.json").write_text(json.dumps({"models": [
+        _entry(model_id="gpt-local", efforts=["none", "low"], provider_default_effort="none",
+               pricing={"input": 1.0, "output": 2.0}),
+        _entry(model_id="gpt-5.6", display_name="GPT-5.6", efforts=["low"],
+               provider_default_effort="low"),
+    ]}), encoding="utf-8")  # fmt: skip
+    cat = ModelCatalogue.load(tmp_path)
+    assert cat.get("openai", "gpt-local").pricing is not None
+    assert cat.get("openai", "gpt-5.6").efforts == ("low",)
+    cfg = LLMConfig(provider="openai", model_id="gpt-5.6", label="x", temperature=None,
+                    effort="high")  # fmt: skip
+    with pytest.raises(UnsupportedConfigurationError, match="supported values: low"):
+        cat.validate(cfg)  # never adjusted to another effort

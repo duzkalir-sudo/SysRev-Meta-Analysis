@@ -459,6 +459,20 @@ class LLMCallORM(Base):
     created_at: Mapped[datetime] = mapped_column(default=_now)
 
 
+class LLMCallOutcomeORM(Base):
+    """Marks that a call's reply became a validated, persisted workflow result
+    (append-only). Billing rows in ``llm_calls`` are written regardless of outcome."""
+
+    __tablename__ = "llm_call_outcomes"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    call_id: Mapped[str] = mapped_column(ForeignKey("llm_calls.id"), unique=True)
+    call_key: Mapped[str] = mapped_column(String(64), index=True)
+    result_ref: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
 class AIVerificationORM(Base):
     """Advisory second-model checks of extracted values (append-only; never approvals)."""
 
@@ -482,6 +496,7 @@ APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     StatsOutputORM,
     ProjectAISettingsORM,
     LLMCallORM,
+    LLMCallOutcomeORM,
     AIVerificationORM,
 )
 

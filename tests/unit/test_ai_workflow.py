@@ -386,3 +386,74 @@ def test_settings_validation_and_no_secret_fields() -> None:
     with pytest.raises(ValueError, match="api_key"):
         TaskModelSettings(provider="anthropic", model_id="m", api_key="x")  # type: ignore[call-arg]
     assert "key" not in json.dumps(settings().model_dump(mode="json")).lower()
+
+
+# --------------------------------------------------------------------------- review fixes (PR #8)
+
+
+def _record(provider: str, **tokens: int) -> LLMCallRecord:
+    return LLMCallRecord(project_id=PID, task="t", label="t", provider=provider,
+                         requested_model="m", status="ok", call_key="k", request_sha256="s",
+                         **tokens)  # fmt: skip
+
+
+def test_openai_cached_tokens_are_not_double_counted(session: Session) -> None:
+    rec = _record("openai", input_tokens=2000, output_tokens=800, cache_read_tokens=500,
+                  reasoning_tokens=600)  # fmt: skip
+    assert rec.total_tokens == 2800  # cached ⊂ input, reasoning ⊂ output
+    assert (rec.input_tokens, rec.cache_read_tokens, rec.reasoning_tokens) == (2000, 500, 600)
+    repo = Repository(session)
+    repo.create_project(PID, "x")
+    repo.record_llm_call(rec)
+    assert repo.llm_usage_totals(PID)["tokens"] == 2800
+    assert session.scalars(select(LLMCallORM.total_tokens)).one() == 2800
+    guard = BudgetGuard(spent_usd=0, tokens=0, stop_tokens=3000)
+    guard.add(rec)
+    guard.check()  # 2800 < 3000: the old 3300 count would have paused the run
+
+
+def test_anthropic_cache_categories_are_disjoint_and_summed() -> None:
+    rec = _record("anthropic", input_tokens=1000, output_tokens=500, cache_read_tokens=2000,
+                  cache_write_tokens=100)  # fmt: skip
+    assert rec.total_tokens == 3600
+    assert _record("scripted", input_tokens=10, output_tokens=5,
+                   cache_read_tokens=7).total_tokens == 15  # fmt: skip
+
+
+def test_malformed_extraction_reply_does_not_block_an_ordinary_retry(
+    session: Session, tmp_path: Path
+) -> None:
+    repo, store = stage4(session, tmp_path)
+    replies: list[Any] = ['{"values": [', EXTRACTION_REPLY]  # truncated JSON, then valid
+    wf = AIWorkflow(repo, PID, catalogue=CAT, credentials=CREDS(), store=store,
+                    provider_builder=scripted_builder(lambda _r: replies.pop(0)))  # fmt: skip
+    first = wf.run_extraction(["r1"])
+    assert first.failed and not first.done and repo.load_extraction_items(PID) == []
+    [call] = repo.load_llm_calls(PID)
+    assert call.status == "ok"  # the provider answered and billed: kept in the audit trail
+    assert not repo.has_persisted_result(PID, call.call_key)
+
+    second = wf.run_extraction(["r1"])  # no force needed
+    assert second.done == ["r1: 1 proposal(s), pending human review"] and not second.skipped
+    [item] = repo.load_extraction_items(PID)
+    assert item.review_status == ReviewStatus.PENDING  # still needs the human
+    calls = repo.load_llm_calls(PID)
+    assert [c.status for c in calls] == ["ok", "ok"] and calls[0].call_key == calls[1].call_key
+    assert repo.has_persisted_result(PID, calls[1].call_key)
+
+    third = wf.run_extraction(["r1"])  # a validated result exists: no call, no duplicate
+    assert third.skipped and not third.done
+    assert len(repo.load_extraction_items(PID)) == 1 and len(repo.load_llm_calls(PID)) == 2
+
+
+def test_identical_request_with_persisted_result_is_not_repeated(
+    session: Session, tmp_path: Path
+) -> None:
+    repo, store = stage4(session, tmp_path)
+    responses = [EXTRACTION_REPLY, EXTRACTION_REPLY]
+    wf = AIWorkflow(repo, PID, catalogue=CAT, credentials=CREDS(), store=store,
+                    provider_builder=scripted_builder(lambda _r: responses.pop(0)))  # fmt: skip
+    assert wf.run_extraction(["r1"]).done
+    again = wf.run_extraction(["r1"])  # validated result saved: no second paid call
+    assert repo.has_persisted_result(PID, repo.load_llm_calls(PID)[0].call_key)
+    assert again.skipped and len(responses) == 1
