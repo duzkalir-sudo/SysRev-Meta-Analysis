@@ -38,7 +38,7 @@ NOT_CONFIGURED = "— choose a model —"
 PAGES = (
     "Projects", "Protocol", "Searches & import", "Pipeline status", "AI models & keys",
     "Run AI steps", "Screening", "Full text & extraction", "Risk of bias", "Statistics",
-    "Usage & costs",
+    "Manuscript", "Usage & costs",
 )  # fmt: skip
 
 
@@ -1072,6 +1072,185 @@ def page_stats(be: UIBackend) -> None:
                     unsafe_allow_html=True)  # fmt: skip
 
 
+SECTIONS = ("title", "abstract", "introduction", "methods", "results", "discussion",
+            "limitations", "conclusions", "tables", "figures", "supplementary")  # fmt: skip
+
+
+def page_manuscript(be: UIBackend) -> None:
+    pid = require_project()
+    st.header("Manuscript (Stage 6)")
+    st.caption(
+        "Numbers and citations are inserted from the approved evidence package as {{key}} and "
+        "[@ref] markers. The Auditor checks the stored manuscript deterministically; only an "
+        "authenticated human can acknowledge review items and sign off."
+    )
+    status = be.api.get(f"/projects/{pid}/manuscript/status")
+    if not status.ok:
+        st.error(status.error)
+        return
+    data = status.data
+    c = st.columns(3)
+    c[0].metric("Phase", data["phase"])
+    c[1].metric("Latest version", data["latest_version"] or "none")
+    audit = data.get("latest_audit") or {}
+    c[2].metric("Latest audit", "passed" if audit.get("passed") else
+                ("failed" if audit else "none"))  # fmt: skip
+    for p in data.get("evidence_problems", []):
+        st.error(p)
+    if data["latest_version"] and not data.get("evidence_current_for_latest_version", True):
+        st.warning("The evidence changed since the latest version was rendered: refresh it.")
+    with st.expander("Why the manuscript cannot be completed yet", expanded=False):
+        st.write(data.get("completion_problems") or ["nothing — ready"])
+
+    with st.form("ms_draft"):
+        st.subheader("Deterministic draft (no AI)")
+        spelling = st.selectbox("Spelling", ["british", "american"])
+        journal = st.text_input("Target journal (optional)")
+        source = st.text_input("Source of the journal requirements (URL/document; required "
+                               "for any limit)")  # fmt: skip
+        words = st.number_input("Abstract word limit (0 = not specified)", min_value=0, value=0)
+        if st.form_submit_button("Create draft from the evidence package (authenticated)"):
+            jr: dict[str, Any] = {"name": journal or None}
+            if words:
+                jr |= {"abstract_word_limit": int(words), "requirements_source": source or None,
+                       "entered_by": "reviewer (via UI)"}  # fmt: skip
+            show(be.api.post(f"/projects/{pid}/manuscript/draft", token=token(),
+                             json={"style": {"spelling": spelling}, "journal": jr}),
+                 "Draft saved as a new version.")  # fmt: skip
+    versions = be.api.get(f"/projects/{pid}/manuscript/versions").data or []
+    if not versions:
+        return
+    numbers = [v["version"] for v in versions]
+    chosen = st.selectbox("Version", numbers[::-1])
+    v = be.api.get(f"/projects/{pid}/manuscript/versions/{chosen}").data
+    tabs = st.tabs(["Read", "Edit", "Evidence", "References", "Audit", "Compare", "AI drafting",
+                    "Export & sign-off"])  # fmt: skip
+    with tabs[0]:
+        st.caption(f"Version {v['version']} · {v['change_summary']} · by {v['created_by']} "
+                   f"({v['actor_type']}) · sha256 {v['content_sha256'][:16]}…")  # fmt: skip
+        st.markdown(v["rendered_markdown"])
+    with tabs[1], st.form("ms_edit"):
+        changes = {}
+        for sec in v["sections"]:
+            new = st.text_area(sec["heading"], sec["source"], key=f"src_{chosen}_"
+                               f"{sec['section_id']}", height=160)  # fmt: skip
+            if new != sec["source"]:
+                changes[sec["section_id"]] = new
+        summary = st.text_input("Summary of the change")
+        if st.form_submit_button("Save as new version (authenticated)") and changes:
+            show(be.api.post(f"/projects/{pid}/manuscript/versions", token=token(),
+                             json={"changes": changes, "summary": summary or "manual edit"}),
+                 "Saved; re-run the audit.")  # fmt: skip
+    if st.button("Refresh values to the current evidence (new version)"):
+        show(be.api.post(f"/projects/{pid}/manuscript/rerender", token=token()))
+    with tabs[2]:
+        ev = be.api.get(f"/projects/{pid}/manuscript/evidence")
+        if ev.ok:
+            st.dataframe([{k: f[k] for k in ("key", "text", "description", "source")}
+                          for f in ev.data["facts"]])  # fmt: skip
+            st.json(ev.data["fingerprint"])
+    with tabs[3]:
+        ev = be.api.get(f"/projects/{pid}/manuscript/evidence")
+        st.dataframe(ev.data["references"] if ev.ok else [])
+        with st.form("ms_ref"):
+            pmid = st.text_input("Import by PMID (live PubMed lookup)")
+            doi = st.text_input("or by DOI (live Crossref lookup)")
+            if st.form_submit_button("Import (authenticated)") and (pmid or doi):
+                show(be.api.post(f"/projects/{pid}/manuscript/references", token=token(),
+                                 json={"pmid": pmid or None, "doi": doi or None}))  # fmt: skip
+        if st.button("Verify all references live (PubMed/Crossref)"):
+            show(be.api.post(f"/projects/{pid}/manuscript/references/verify", token=token()))
+        with st.form("ms_excerpt"):
+            key = st.text_input("Reference key")
+            text = st.text_area("Supporting passage, copied from the source")
+            loc = st.text_input("Location (page/section)")
+            if st.form_submit_button("Record excerpt (authenticated)") and key:
+                show(be.api.post(f"/projects/{pid}/manuscript/references/{key}/excerpts",
+                                 token=token(), json={"text": text, "location": loc}))  # fmt: skip
+    with tabs[4]:
+        if st.button("Run the deterministic audit on the latest version"):
+            show(be.api.post(f"/projects/{pid}/manuscript/audit", token=token()), "Audit saved.")
+        reports = be.api.get(f"/projects/{pid}/manuscript/audits").data or []
+        if reports:
+            r = be.api.get(f"/projects/{pid}/manuscript/audits/{reports[-1]['report_id']}").data
+            st.write(f"Version {r['manuscript_version']}: complete={r['complete']}, "
+                     f"passed={r['passed']}, blocking={r['failures']}, "
+                     f"requiring human review={r['requires_human_review']}")  # fmt: skip
+            acked = {a["finding_id"] for a in r["acknowledgements"]}
+            open_ = [f for f in r["findings"] if f["status"] != "verified"
+                     and f["finding_id"] not in acked]  # fmt: skip
+            st.dataframe([{k: f[k] for k in ("status", "scope", "location", "message",
+                                             "excerpt", "source_key", "action")}
+                          for f in open_])  # fmt: skip
+            for adv in r["advisory_claim_reviews"]:
+                st.info(f"Advisory model review (not a human assessment): {adv['verdict']} — "
+                        f"{adv['rationale']}")  # fmt: skip
+            reviewable = [f["finding_id"] for f in open_ if f["status"] == "requires_human_review"]
+            with st.form("ms_ack"):
+                fid = st.selectbox("Finding requiring human review", reviewable or [""])
+                decision = st.radio("Assessment", ["confirmed_supported",
+                                                   "accepted_as_author_statement"])  # fmt: skip
+                note = st.text_area("Your reasoning (required)")
+                if st.form_submit_button("Acknowledge (authenticated)") and fid:
+                    show(be.api.post(f"/projects/{pid}/manuscript/audits/{r['report_id']}/"
+                                     f"findings/{fid}/acknowledge", token=token(),
+                                     json={"decision": decision, "note": note}))  # fmt: skip
+    with tabs[5]:
+        if len(numbers) > 1:
+            a = st.selectbox("From", numbers, index=len(numbers) - 2)
+            b = st.selectbox("To", numbers, index=len(numbers) - 1)
+            d = be.api.get(f"/projects/{pid}/manuscript/diff", params={"a": a, "b": b})
+            st.code(d.data["diff"] if d.ok else d.error, language="diff")
+    with tabs[6]:
+        st.caption("Paid API calls. The model writes prose only: every number and citation must "
+                   "be a marker, otherwise the reply is discarded. The result is a new, "
+                   "unaudited version.")  # fmt: skip
+        sections = st.multiselect("Sections", SECTIONS, default=["introduction", "discussion"])
+        instructions = st.text_area("Instructions for the model (optional)")
+        confirm = st.checkbox("I authorise these paid API calls.")
+        if st.button("Draft with the configured model", disabled=not confirm or not sections):
+            with be.repo() as repo:
+                _report(be.workflow(repo, pid, credentials()).run_manuscript_drafting(
+                    sections, instructions=instructions or None))  # fmt: skip
+        if st.button("Advisory claim review of cited excerpts", disabled=not confirm):
+            with be.repo() as repo:
+                _report(be.workflow(repo, pid, credentials()).run_claim_review())
+    with tabs[7]:
+        from src.manuscript.export import (
+            manuscript_docx,
+            manuscript_markdown,
+            provenance_markdown,
+        )
+
+        with be.repo() as repo:
+            stored = repo.get_manuscript_version(pid, int(chosen))
+        st.download_button(
+            "Download Markdown", manuscript_markdown(stored), file_name=f"manuscript_v{chosen}.md"
+        )
+        try:
+            st.download_button(
+                "Download Word (.docx)",
+                manuscript_docx(stored),
+                file_name=f"manuscript_v{chosen}.docx",
+            )
+        except RuntimeError as exc:
+            st.caption(str(exc))
+        st.download_button(
+            "Download provenance note",
+            provenance_markdown(stored),
+            file_name=f"manuscript_v{chosen}_provenance.md",
+        )
+        reports = be.api.get(f"/projects/{pid}/manuscript/audits").data or []
+        if reports:
+            res = be.api.get(f"/projects/{pid}/manuscript/audits/{reports[-1]['report_id']}/export")
+            st.download_button("Download audit report", res.data or "", file_name="audit.md")
+        with st.form("ms_approve"):
+            statement = st.text_area("Sign-off statement")
+            if st.form_submit_button("Sign off the latest version (authenticated human)"):
+                show(be.api.post(f"/projects/{pid}/manuscript/approve", token=token(),
+                                 json={"statement": statement}), "Signed off.")  # fmt: skip
+
+
 def page_usage(be: UIBackend) -> None:
     pid = require_project()
     st.header("API usage and estimated costs")
@@ -1117,7 +1296,8 @@ def main() -> None:
         "Searches & import": page_searches, "Pipeline status": page_pipeline,
         "AI models & keys": page_models, "Run AI steps": page_run,
         "Screening": page_screening, "Full text & extraction": page_extraction,
-        "Risk of bias": page_rob, "Statistics": page_stats, "Usage & costs": page_usage,
+        "Risk of bias": page_rob, "Statistics": page_stats, "Manuscript": page_manuscript,
+        "Usage & costs": page_usage,
     }  # fmt: skip
     handlers[str(page)](be)
 

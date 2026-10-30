@@ -692,11 +692,17 @@ def _role_of(literal: str, f: FoundNumber) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _same(dn: DisplayNumber, value: float) -> bool:
+    """Numbers inside descriptive text (versions, criteria) match only exactly; displayed
+    results match within their rounding tolerance."""
+    if dn.role == "text":
+        return dn.value == value
+    return dn.relation == "eq" and dn.accepts(value)
+
+
 def _matching_keys(a: _Audit, value: float, facts: list[Fact] | None = None) -> list[str]:
     pool = facts if facts is not None else list(a.package.facts.values())
-    return [
-        f.key for f in pool if any(dn.relation == "eq" and dn.accepts(value) for dn in f.numbers)
-    ]
+    return [f.key for f in pool if any(_same(dn, value) for dn in f.numbers)]
 
 
 def _literal_numbers(a: _Audit, s: Sentence) -> None:
