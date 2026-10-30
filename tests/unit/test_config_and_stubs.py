@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from src.core.config import Settings, get_settings
-from src.stats_engine.contracts import NotYetImplementedEngine
 
 
 def test_settings_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,8 +30,3 @@ def test_settings_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_get_settings_is_cached() -> None:
     get_settings.cache_clear()
     assert get_settings() is get_settings()
-
-
-def test_stats_engine_stub_refuses_to_compute() -> None:
-    with pytest.raises(NotImplementedError):
-        NotYetImplementedEngine().pool([], outcome_id="x", method="reml")

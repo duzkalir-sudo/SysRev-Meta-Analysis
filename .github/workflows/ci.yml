@@ -16,8 +16,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
-      - run: ruff check src tests
-      - run: ruff format --check src tests
+      - run: pip install -e ".[dev,stats]"
+      - run: ruff check src tests validation
+      - run: ruff format --check src tests validation
       - run: mypy
       - run: pytest --cov=src --cov-report=term-missing
+
+  # Independent numerical validation: regenerate the metafor/lme4 reference values with R
+  # and compare them with the Python engine (tests/unit/test_stats_metafor_reference.py).
+  r-validation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install R, metafor, lme4 and jsonlite (Ubuntu packages)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base-core r-cran-metafor r-cran-lme4 r-cran-jsonlite
+          Rscript -e 'for (p in c("metafor","lme4","jsonlite")) cat(p, as.character(packageVersion(p)), "\n")'
+      - run: pip install -e ".[dev]"
+      - name: Regenerate references with R and compare
+        run: |
+          Rscript validation/r/metafor_reference.R validation/r/synthetic_cases.json /tmp/metafor_reference_ci.json
+          python -m validation.compare_metafor /tmp/metafor_reference_ci.json
+          pytest -v tests/unit/test_stats_metafor_reference.py -k "live_r or matches_metafor" -rs

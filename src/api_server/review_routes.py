@@ -1,4 +1,4 @@
-"""Stage 2-4 human-review endpoints (Session 2).
+"""Stage 2-5 human-review endpoints (Sessions 2-3).
 
 Every state-changing endpoint requires ``Authorization: Bearer <reviewer token>``; the
 acting human is taken from the token, never from the request body. Read endpoints return
@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from src.api_server.app import ReviewerDep, SessionDep  # app.py imports this module lazily
 from src.core.enums import ScreeningStage, ScreeningVerdict
 from src.core.exceptions import SysRevError
+from src.core.schemas.base import utc_now
+from src.core.schemas.stats import AnalysisPlan, AnalysisSpec
 from src.extraction import (
     ProposedValue,
     accept_item,
@@ -109,6 +111,11 @@ class RoBApprovalBody(_Body):
     domain_judgements: dict[str, tuple[str, str]] | None = None
     nos_stars: dict[str, int] | None = None
     note: str | None = None
+
+
+class AnalysisPlanBody(_Body):
+    analyses: list[AnalysisSpec] = Field(min_length=1)
+    rationale: str | None = None
 
 
 def _call(fn: Callable[[], T]) -> T:
@@ -358,5 +365,44 @@ def build_review_router(store: DocumentStore) -> APIRouter:
             )
         )  # fmt: skip
         return approved.model_dump(mode="json")
+
+    # ------------------------------------------------------------------ Stage 5 statistics
+    @router.post("/stats/plan", status_code=status.HTTP_201_CREATED)
+    def approve_plan(project_id: str, body: AnalysisPlanBody, session: SessionDep,
+                     reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
+        """The authenticated reviewer approves an analysis plan (a new append-only version)."""
+        repo = Repository(session)
+        previous = repo.latest_analysis_plan(project_id, approved_only=False)
+        plan = _call(
+            lambda: AnalysisPlan(
+                version=1 if previous is None else previous.version + 1,
+                analyses=body.analyses, rationale=body.rationale,
+                drafted_by=reviewer.display_name, status="approved",
+                approved_by=reviewer.display_name, approved_reviewer_id=reviewer.id,
+                approved_at=utc_now(),
+            )
+        )  # fmt: skip
+        _call(lambda: repo.save_analysis_plan(project_id, plan))
+        return plan.model_dump(mode="json")
+
+    @router.get("/stats/plan")
+    def get_plan(project_id: str, session: SessionDep) -> dict[str, Any]:
+        plan = _call(lambda: Repository(session).latest_analysis_plan(project_id))
+        if plan is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no approved analysis plan")
+        return plan.model_dump(mode="json")
+
+    @router.get("/stats/output")
+    def get_stats(project_id: str, session: SessionDep) -> dict[str, Any]:
+        """The current statistics artifact and any reason it is not a valid basis for Stage 6."""
+        repo = Repository(session)
+        output = _call(lambda: repo.current_stats_output(project_id))
+        if output is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no statistics artifact recorded")
+        return {
+            "sha256": output.sha256(),
+            "problems": repo.stats_output_problems(project_id),
+            "stats_output": output.model_dump(mode="json"),
+        }
 
     return router

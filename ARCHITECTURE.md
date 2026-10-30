@@ -12,7 +12,7 @@ implemented today and what is not.
 | # | Guardrail | Where it is enforced |
 |---|-----------|----------------------|
 | G1 | **Zero fabrication of literature.** Bibliographic records come only from deterministic API clients (PubMed E-utilities, Europe PMC, OpenAlex, Crossref) or user-uploaded PDFs. An LLM never writes a citation, identifier or study datum from its weights. | `src/apis/*` build `StudyRecord`s only from fields present in API responses. Invalid identifiers are **dropped, never "repaired"**. Each record carries a `SearchProvenance` (database, query, endpoint, timestamp, reported hit count). |
-| G2 | **Zero LLM arithmetic.** Effect sizes, pooled estimates, heterogeneity, bias tests and Median/IQR→Mean/SD conversions are computed by deterministic code. | `ExtractedValue` rejects any value that is not literally the number printed in its `verbatim_quote` (§4.3). Derived numbers can only originate from `src/stats_engine` (planned). The Auditor cross-checks manuscript numbers against `stats_output.json`. |
+| G2 | **Zero LLM arithmetic.** Effect sizes, pooled estimates, heterogeneity, bias tests and Median/IQR→Mean/SD conversions are computed by deterministic code. | `ExtractedValue` rejects any value that is not literally the number printed in its `verbatim_quote` (§4.3). Derived numbers can only originate from `src/stats_engine` (§9.5), run from a human-approved analysis plan. The Auditor cross-checks manuscript numbers against `stats_output.json`. |
 | G3 | **Humans own every gate.** The pipeline cannot pass a HITL gate without a recorded, authenticated human decision. | `PipelineStateMachine` refuses gate exits unless `actor_type == HUMAN` and a matching `GateDecision` is supplied (§3). The HTTP gate endpoint requires an enrolled reviewer's bearer token, and the repository refuses to persist a gate decision without an active enrolled reviewer (§6). |
 | G4 | **Append-only audit trail.** | `state_transitions`, `gate_decisions` and `source_evidence` rows raise on ORM update/delete (§5). |
 
@@ -33,7 +33,8 @@ src/
                    content-addressed storage, uploads + identity matching, Gate 2 manifest
   pdf_extractor/   pdfplumber/pypdf parsing (pages, blocks, tables, labels) + evidence grounding
   extraction/      Stage 4: proposals → verification → Master Extraction Table; RoB drafts
-  stats_engine/    Stage 5 deterministic statistics          (interface only — not implemented)
+  stats_engine/    Stage 5 deterministic statistics (§9.5), validated against R metafor
+validation/        R reference script, metafor comparison, VALIDATION_REPORT.md
   auditor/         Stage 6 Auditor Agent                     (contract only — not implemented)
   api_server/      FastAPI app: project state, guards, gate decisions, Stage 2-4 review routes
   ui/              Reviewer UI                               (placeholder)
@@ -121,7 +122,7 @@ even if no `ScreeningConflict` row was ever saved.
 | Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, `UNOBTAINABLE` with a reason, or structured-text-only **with a human acknowledgement that no usable PDF is available**; **every linked PDF has a positive identity check** (`CONFIRMED` by the deterministic matcher or `HUMAN_CONFIRMED`; a missing check counts as unconfirmed) |
 | Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); **every full-text outcome resting only on automated passes is confirmed by an authenticated human**; ≥1 report included; every included report has ≥1 extracted arm, belongs to a study (§9.3) that has one, or is recorded as qualitative-only by a human; **no included report lacking data is XML-only or without a confirmed PDF**; no arm belongs to a non-included report; 0 values without `SourceEvidence` |
 | Gate 3 → Stage 5 | As above, plus every arm approved by a human; **0 master-table items awaiting review; every included study has a human-approved risk-of-bias assessment; no outcome receives arm data from two reports of the same cohort without a documented human resolution (§9.3)**; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
-| Stage 5 → Stage 6 | `stats_output.json` produced (hash recorded) |
+| Stage 5 → Stage 6 | **A verified `stats_output.json`**: stored (append-only) with a matching SHA-256, schema- and results-hash-valid, computed from the *latest* human-approved analysis plan and from the *current* approved extraction data (input hash recomputed; any later change blocks Stage 6 until Stage 5 is re-run) (§9.5) |
 | Stage 6 → Audit | Manuscript draft exists |
 | Audit → COMPLETED | Latest `AuditReport.passed is True` |
 | Audit → Stage 6 | Latest `AuditReport.passed is False` |
@@ -573,6 +574,70 @@ draft can never carry an overall judgement; approval requires an enrolled review
 name, time) and an overall judgement no milder than the worst domain. GRADE is out of
 scope until Session 4.
 
+### 9.5 Stage 5 — deterministic meta-analysis (`src/stats_engine`) — Session 3
+
+**Inputs.** `Repository.load_stage5_inputs()` gathers the protocol outcomes, the extracted
+arms, report → study links, cohort labels (study links plus human-resolved overlap
+warnings), recorded unavailability and `CohortContributionDecision`s, and the
+first-author/year labels; its canonical SHA-256 is the *input hash*. `run_stage5()` refuses
+to run outside Stage 5, without an approved plan, or with arms for reports not included at
+full text; `run_plan()` refuses any arm not approved by a human.
+
+**Analysis plan** (`AnalysisPlan` / `AnalysisSpec`, `src/core/schemas/stats.py`). Approved
+by an enrolled reviewer (`POST /projects/{id}/stats/plan`, bearer token; the persistence
+layer re-checks the reviewer and that each spec's measure is admissible for the outcome and
+its timepoints are pre-specified in the protocol). Per analysis: outcome, measure, one or
+more **structured timepoints** (several only with a written justification), primary model,
+τ² estimator (REML default, DL), random-effects CI (HKSJ default, ad hoc HKSJ, Wald),
+common-effect method (MH default for RR/OR), proportion method (GLMM default), for
+KM/cumulative incidence the **declared CI scale** of the authors' intervals, whether KM and
+actuarial estimates may be combined (default no; needs a reason), explicit arm selections
+for multi-arm reports, confidence level and display decimals. Plans are append-only.
+
+**Input integrity** (`inputs.py`). Per analysis and report: human-recorded unavailability
+→ excluded with the human's reason; estimators never substituted (crude counts for
+PROPORTION/RR/OR; KAPLAN_MEIER (+ACTUARIAL if allowed) for KM; CUMULATIVE_INCIDENCE
+only for cumulative incidence; raw summaries for MD/SMD); the arm's structured follow-up
+must equal a plan timepoint exactly (no unit conversion; "24 months" ≠ "2 years"); exactly
+one arm per role unless the plan selects one; several reports of one cohort only if a
+human documented non-overlapping participants for that outcome — otherwise all are
+excluded as `overlapping_cohort`. Every exclusion is listed with a reason code.
+
+**Methods** (each validated against metafor; see `validation/VALIDATION_REPORT.md`).
+
+| Measure | Study level | Common effect | Random effects |
+|---|---|---|---|
+| Crude proportion | logit; Clopper-Pearson CI for display | binomial ML | **binomial-normal GLMM** (ML, 7-node adaptive Gauss-Hermite; Stijnen et al. 2010), no continuity correction; sensitivity: logit IV with 0.5 added only to 0 %/100 % studies |
+| KM / cumulative incidence at *t* | SE = \|g(U) − g(L)\| / (2z) on the declared scale g; the CI must be symmetric on that scale within the rounding of the printed numbers, else not pooled | IV | IV on the declared scale |
+| RR, OR | log; double-zero/double-all-event studies excluded; 0.5 added to all cells of single-zero studies (IV only) | **Mantel-Haenszel** (RBG / Greenland-Robins variance) | IV |
+| MD, SMD | m₁ − m₂; Hedges' g with exact J | IV | IV |
+
+Random effects: REML (global maximum of the restricted likelihood, Brent root finding) or
+DL; CIs by HKSJ t(k−1) (IntHout et al., *BMC Med Res Methodol* 2014;14:25), ad hoc HKSJ
+(never narrower than Wald) or Wald. Heterogeneity: Q, I² (Q-based), model I² = τ²/(τ²+s²),
+H², τ² and I² Q-profile CIs. Prediction interval t(k−2) only for k ≥ 3. With k = 1 the
+study's own estimate is reported (`single_study`) and no pooled, heterogeneity or
+prediction statistic is computed. All-zero (or all-event) proportion data are
+`descriptive_only`. HR, RD, IRR, incidence rates, means, medians and median survival are
+`unsupported`: in particular **no HR is ever derived from survival percentages**, and SDs,
+event counts or timepoints are never derived or converted.
+
+**Output** (`StatsOutput`, schema 1.0.0). Per analysis: status and reason, included
+studies (inputs used, yᵢ, vᵢ, CIs on both scales, weights, continuity-correction flags),
+excluded studies with reason codes, common/random/sensitivity results, heterogeneity,
+settings, methods, warnings and limitations; globally: engine/Python/numpy/scipy/platform
+versions, numeric-precision statement, plan SHA-256, input SHA-256 and a results
+fingerprint that the schema re-verifies on load (tampering fails validation). Floats are
+stored at full binary64 precision. `write_artifacts()` writes `stats_output.json`
+(canonical JSON, exactly the hashed bytes), `report.md`, per-analysis Markdown/CSV tables,
+deterministic SVG forest plots and a `manifest.json` of file hashes. `flatten()` gives the
+Auditor `"<analysis>.<model>.<field>"` keys.
+
+**Pipeline integration.** `record_stats_output()` (Stage 5 only) stores the canonical JSON
+in the append-only `stats_outputs` table and sets the project hash. The Stage 5 → 6 guard
+re-verifies the stored artifact (§3.2), so setting a hash by hand, editing the stored JSON,
+approving a new plan or changing approved data after the run all block Stage 6.
+
 ---
 
 ## 10. Implementation status
@@ -596,22 +661,17 @@ scope until Session 4.
 | LLM extraction proposals / RoB drafts | Implemented and tested with scripted replies; real-model quality unvalidated |
 | JATS XML parsing for evidence; OCR; supplementary-file retrieval | Not implemented (XML is stored with provenance only; image-only pages are flagged) |
 | PICO structuring / manuscript drafting agents | Not implemented |
-| Statistics engine (`stats_engine`) | Interface only — raises `NotImplementedError` |
-| Plotting, PRISMA diagram rendering, GRADE SoF | Not implemented |
+| Statistics engine (`stats_engine`, Session 3) | Implemented for crude proportions (GLMM + logit IV), KM / cumulative incidence at time *t* (from reported CIs), RR, OR (IV, MH), MD, SMD; validated against metafor 4.4-0 / lme4 (1,475 comparisons; `validation/VALIDATION_REPORT.md`). HR, RD, IRR, rates, means, medians: reported as unsupported |
+| Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
+| PRISMA diagram rendering, GRADE SoF | Not implemented |
 | Auditor | Contract (`AuditReport`) only |
 | UI | Placeholder |
 
-### Planned statistical methods (Stage 5) and their references
-Inverse-variance fixed effect; Mantel-Haenszel; DerSimonian-Laird random effects
-(DerSimonian & Laird, *Control Clin Trials* 1986;7:177-188); REML; Hartung-Knapp
-adjustment (Hartung & Knapp, *Stat Med* 2001;20:3875-3889); Cochran's Q, I² and τ²
-(Higgins & Thompson, *Stat Med* 2002;21:1539-1558); Egger's test (Egger et al., *BMJ*
-1997;315:629-634); Begg's test (Begg & Mazumdar, *Biometrics* 1994;50:1088-1101);
-trim-and-fill (Duval & Tweedie, *Biometrics* 2000;56:455-463); leave-one-out;
-meta-regression; Median/IQR/range → mean/SD (Wan et al., *BMC Med Res Methodol*
-2014;14:135; Luo et al., *Stat Methods Med Res* 2018;27:1785-1805). Optional
-cross-validation against R `metafor` (Viechtbauer, *J Stat Softw* 2010;36(3):1-48).
-Each method must be validated against published worked examples before use.
+### Statistical methods not yet implemented
+Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;
+leave-one-out; network meta-analysis; Bayesian models; median/IQR/range → mean/SD
+(Wan et al. 2014; Luo et al. 2018); reconstruction of individual participant data from
+Kaplan-Meier curves. Each must be validated against a reference implementation before use.
 
 ---
 

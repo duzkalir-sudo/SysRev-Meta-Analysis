@@ -1,8 +1,8 @@
 """End-to-end flow across Stages 1-6 with mocked literature APIs and a real SQLite database.
 
-Stage 4-6 *content* (PDF extraction, statistics, manuscript drafting, auditing)
-is not implemented yet; those steps are simulated with hand-built, schema-valid
-objects so the state machine, guards and persistence are exercised end to end.
+Stage 5 runs the real statistics engine. Stage 6 content (manuscript drafting, auditing)
+is not implemented yet; those steps are simulated with hand-built, schema-valid objects
+so the state machine, guards and persistence are exercised end to end.
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ from src.apis.pubmed import EUTILS_BASE, PubMedClient
 from src.apis.rate_limit import AsyncRateLimiter
 from src.core.enums import (
     ActorType,
+    ArmRole,
     CheckStatus,
+    EffectMeasure,
     FullTextStatus,
     GateId,
     GateVerdict,
@@ -35,15 +37,17 @@ from src.core.enums import (
     SourceDatabase,
     UploadMatchStatus,
 )
-from src.core.exceptions import GuardViolationError
+from src.core.exceptions import GuardViolationError, StatisticsInputError
 from src.core.schemas import (
     AuditReport,
     CitationCheck,
+    ExtractedValue,
     FullTextItem,
     GateDecision,
     NumericClaimCheck,
     ScreeningDecision,
 )
+from src.core.schemas.stats import AnalysisPlan, AnalysisSpec
 from src.extraction import record_unavailability
 from src.screening import (
     CohortOverlapDetector,
@@ -55,7 +59,8 @@ from src.screening import (
 )
 from src.screening.llm_screening import adjudicate
 from src.state.repository import Repository
-from tests.conftest import NOW, approved_rob, make_arm, make_protocol
+from src.stats_engine.stage5 import run_stage5
+from tests.conftest import NOW, approved_rob, make_arm, make_evidence, make_protocol
 from tests.unit.test_api_clients import EPMC_RESULT, OPENALEX_WORK, esearch_json
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -94,7 +99,7 @@ def decide(repo: Repository, decision: GateDecision) -> None:
 
 @respx.mock
 async def test_full_pipeline(
-    session: Session, no_wait_limiter: AsyncRateLimiter, no_sleep: Sleep
+    session: Session, no_wait_limiter: AsyncRateLimiter, no_sleep: Sleep, tmp_path: Path
 ) -> None:
     repo = Repository(session)
     repo.create_project(PID, "Synthetic review of drug X")
@@ -324,6 +329,15 @@ async def test_full_pipeline(
         advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     arm = make_arm(main_id)
     repo.save_extracted_arm(PID, arm)
+    ctrl_ev = make_evidence("Placebo (n=118): mean 13·0 (SD 3·4); 115 analysed")
+    control_arm = make_arm(
+        main_id, arm_label="Placebo", arm_role=ArmRole.CONTROL,
+        n_randomized=ExtractedValue(value=118, reported_text="118", evidence=ctrl_ev),
+        n_analyzed=ExtractedValue(value=115, reported_text="115", evidence=ctrl_ev),
+        mean=ExtractedValue(value=13.0, reported_text="13·0", evidence=ctrl_ev),
+        sd=ExtractedValue(value=3.4, reported_text="3·4", evidence=ctrl_ev),
+    )  # fmt: skip
+    repo.save_extracted_arm(PID, control_arm)
     with pytest.raises(GuardViolationError, match="1 included report"):
         advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     follow_arm = make_arm(follow_id)
@@ -332,6 +346,7 @@ async def test_full_pipeline(
     with pytest.raises(GuardViolationError, match="not approved by a human"):
         decide(repo, gate(GateId.GATE_3))
     repo.approve_extracted_arm(arm.arm_id, reviewer_id=REVIEWER["id"])
+    repo.approve_extracted_arm(control_arm.arm_id, reviewer_id=REVIEWER["id"])
     repo.approve_extracted_arm(follow_arm.arm_id, reviewer_id=REVIEWER["id"])
     with pytest.raises(GuardViolationError, match="risk-of-bias"):
         decide(repo, gate(GateId.GATE_3))
@@ -363,7 +378,30 @@ async def test_full_pipeline(
     with pytest.raises(GuardViolationError, match="stats_output"):
         advance(repo, Phase.STAGE6_MANUSCRIPT)
     project = repo.get_project(PID)
-    project.stats_output_sha256 = "1" * 64
+    project.stats_output_sha256 = "1" * 64  # a hash without a verified artifact is refused
+    with pytest.raises(GuardViolationError, match="no stored artifact"):
+        advance(repo, Phase.STAGE6_MANUSCRIPT)
+    project.stats_output_sha256 = None
+    with pytest.raises(StatisticsInputError, match="analysis plan"):
+        run_stage5(repo, PID, output_dir=tmp_path / "stats")
+    repo.save_analysis_plan(
+        PID,
+        AnalysisPlan(
+            analyses=[AnalysisSpec(analysis_id="hba1c_md", outcome_id="hba1c",
+                                   effect_measure=EffectMeasure.MD)],
+            drafted_by="Dr Human Reviewer", status="approved", approved_by="Dr Human Reviewer",
+            approved_reviewer_id=REVIEWER["id"], approved_at=NOW,
+        ),
+    )  # fmt: skip
+    stage5 = run_stage5(repo, PID, output_dir=tmp_path / "stats", generated_at=NOW)
+    md = stage5.output.analyses[0]
+    # one study: its own MD is reported, nothing is "pooled" and no heterogeneity is computed
+    assert (md.status, md.k, md.heterogeneity) == ("single_study", 1, None)
+    assert md.studies[0].estimate_natural == pytest.approx(-0.5)
+    assert [e.reason_code for e in md.excluded] == ["recorded_unavailable"]
+    assert (tmp_path / "stats" / "stats_output.json").read_text() == (
+        stage5.output.to_canonical_json()
+    )
     advance(repo, Phase.STAGE6_MANUSCRIPT)
     project.manuscript_version = 1
     advance(repo, Phase.STAGE6_AUDIT)
@@ -372,7 +410,7 @@ async def test_full_pipeline(
         return AuditReport(
             project_id=PID,
             manuscript_version=version,
-            stats_output_sha256="1" * 64,
+            stats_output_sha256=stage5.sha256,
             generated_at=NOW.replace(minute=version),
             numeric_checks=[
                 NumericClaimCheck(

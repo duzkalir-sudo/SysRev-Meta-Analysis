@@ -6,6 +6,7 @@ hand-edited rows fail loudly instead of propagating into the analysis.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 from sqlalchemy import Select, func, select
@@ -47,6 +48,7 @@ from src.core.schemas.master import (
     QuantitativeUnavailability,
     StudyReportLink,
 )
+from src.core.schemas.stats import AnalysisPlan, StatsOutput
 from src.core.security import (
     format_token,
     generate_secret,
@@ -57,6 +59,7 @@ from src.core.security import (
 )
 from src.screening.agreement import screening_status
 from src.state.db import (
+    AnalysisPlanORM,
     AuditReportORM,
     CohortContributionDecisionORM,
     CohortOverlapWarningORM,
@@ -77,10 +80,12 @@ from src.state.db import (
     ScreeningDecisionORM,
     SourceEvidenceORM,
     StateTransitionORM,
+    StatsOutputORM,
     StudyRecordORM,
     StudyReportLinkORM,
 )
 from src.state.machine import GuardContext, PipelineStateMachine
+from src.stats_engine.inputs import AnalysisInputs
 
 
 class NotFoundError(SysRevError, LookupError):
@@ -1079,6 +1084,161 @@ class Repository:
         ).all()
         return [QuantitativeUnavailability.model_validate(r.payload) for r in rows]
 
+    # ------------------------------------------------------------------ Stage 5 statistics
+    def save_analysis_plan(self, project_id: str, plan: AnalysisPlan) -> None:
+        """Append a plan version. Approval must come from an active enrolled reviewer, and an
+        approved plan must be consistent with the protocol's outcomes."""
+        self.get_project(project_id)
+        if plan.status == "approved":
+            reviewer = self.require_active_reviewer(plan.approved_reviewer_id)
+            if plan.approved_by != reviewer.display_name:
+                raise SysRevError("approved_by does not match the enrolled reviewer")
+            protocol = self.latest_protocol(project_id)
+            if protocol is None:
+                raise SysRevError("no protocol: an analysis plan needs protocol outcomes")
+            outcomes = {o.outcome_id: o for o in protocol.outcomes}
+            problems: list[str] = []
+            for spec in plan.analyses:
+                outcome = outcomes.get(spec.outcome_id)
+                if outcome is None:
+                    problems.append(f"{spec.analysis_id}: unknown outcome {spec.outcome_id}")
+                else:
+                    problems.extend(
+                        f"{spec.analysis_id}: {p}" for p in spec.check_against_outcome(outcome)
+                    )
+            if problems:
+                raise SysRevError("analysis plan contradicts the protocol: " + "; ".join(problems))
+        exists = self.session.scalars(
+            select(AnalysisPlanORM).where(
+                AnalysisPlanORM.project_id == project_id,
+                AnalysisPlanORM.id == plan.plan_id,
+                AnalysisPlanORM.version == plan.version,
+                AnalysisPlanORM.status == plan.status,
+            )
+        ).first()
+        if exists is not None:
+            raise SysRevError("this plan version is already stored; plans are append-only")
+        self.session.add(
+            AnalysisPlanORM(
+                id=plan.plan_id, project_id=project_id, version=plan.version,
+                status=plan.status, approved_reviewer_id=plan.approved_reviewer_id,
+                sha256=plan.sha256(), payload=plan.model_dump(mode="json"),
+            )
+        )  # fmt: skip
+        self.session.flush()
+
+    def latest_analysis_plan(
+        self, project_id: str, *, approved_only: bool = True
+    ) -> AnalysisPlan | None:
+        stmt = select(AnalysisPlanORM).where(AnalysisPlanORM.project_id == project_id)
+        if approved_only:
+            stmt = stmt.where(AnalysisPlanORM.status == "approved")
+        row = self.session.scalars(stmt.order_by(AnalysisPlanORM.seq.desc()).limit(1)).first()
+        if row is None:
+            return None
+        plan = AnalysisPlan.model_validate(row.payload)
+        if plan.sha256() != row.sha256:
+            raise SysRevError(f"stored analysis plan {plan.plan_id} fails its integrity hash")
+        return plan
+
+    def load_stage5_inputs(self, project_id: str) -> AnalysisInputs:
+        """Every persisted fact the statistics engine may read (all human-reviewed)."""
+        protocol = self.latest_protocol(project_id)
+        arms = self.load_extracted_arms(project_id)
+        record_ids = {a.record_id for a in arms}
+        labels: dict[str, str] = {}
+        for rid in sorted(record_ids):
+            rec = self.get_record(project_id, rid)
+            author = rec.authors[0].last_name if rec.authors and rec.authors[0].last_name else None
+            year = rec.publication_year
+            labels[rid] = " ".join(str(x) for x in (author or rid[:12], year) if x)
+        return AnalysisInputs(
+            outcomes={} if protocol is None else {o.outcome_id: o for o in protocol.outcomes},
+            arms=arms,
+            study_of=self.study_ids(project_id, record_ids),
+            cohort_of=self.cohort_ids(project_id, record_ids),
+            labels=labels,
+            unavailability=self.load_unavailability(project_id),
+            contributions=self.load_contribution_decisions(project_id),
+        )
+
+    def record_stats_output(self, project_id: str, output: StatsOutput) -> str:
+        """Store a ``stats_output.json`` and make it the project's statistics artifact.
+
+        Refused unless the project is in Stage 5 and the artifact verifies against the
+        current approved plan and the current approved extraction data.
+        """
+        project = self.get_project(project_id)
+        if project.phase != Phase.STAGE5_META_ANALYSIS.value:
+            raise SysRevError(f"statistics can only be recorded in Stage 5 (phase={project.phase})")
+        content = output.to_canonical_json()
+        problems = self._verify_stats(project_id, output, content)
+        if problems:
+            raise SysRevError("statistics artifact rejected: " + "; ".join(problems))
+        sha = output.sha256()
+        self.session.add(
+            StatsOutputORM(
+                id=output.output_id, project_id=project_id, plan_id=output.plan_id,
+                plan_sha256=output.plan_sha256, input_sha256=output.input_sha256, sha256=sha,
+                content=content,
+            )
+        )  # fmt: skip
+        project.stats_output_sha256 = sha
+        self.session.flush()
+        return sha
+
+    def current_stats_output(self, project_id: str) -> StatsOutput | None:
+        project = self.get_project(project_id)
+        if project.stats_output_sha256 is None:
+            return None
+        row = self._stats_row(project_id, project.stats_output_sha256)
+        return None if row is None else StatsOutput.model_validate_json(row.content)
+
+    def _stats_row(self, project_id: str, sha: str) -> StatsOutputORM | None:
+        return self.session.scalars(
+            select(StatsOutputORM)
+            .where(StatsOutputORM.project_id == project_id, StatsOutputORM.sha256 == sha)
+            .order_by(StatsOutputORM.seq.desc())
+            .limit(1)
+        ).first()
+
+    def stats_output_problems(self, project_id: str) -> list[str]:
+        """Why the project's statistics artifact is not a valid basis for Stage 6."""
+        project = self.get_project(project_id)
+        if project.stats_output_sha256 is None:
+            return []
+        row = self._stats_row(project_id, project.stats_output_sha256)
+        if row is None:
+            return ["the recorded stats_output.json hash has no stored artifact"]
+        if hashlib.sha256(row.content.encode("utf-8")).hexdigest() != row.sha256:
+            return ["stored stats_output.json content does not match its SHA-256"]
+        try:
+            output = StatsOutput.model_validate_json(row.content)
+        except ValueError as exc:
+            return [f"stored stats_output.json fails validation: {exc}"]
+        return self._verify_stats(project_id, output, row.content)
+
+    def _verify_stats(self, project_id: str, output: StatsOutput, content: str) -> list[str]:
+        problems: list[str] = []
+        if output.to_canonical_json() != content:
+            problems.append("stats_output.json is not in canonical form")
+        if output.project_id != project_id:
+            problems.append("stats_output.json belongs to another project")
+        plan = self.latest_analysis_plan(project_id)
+        if plan is None:
+            problems.append("no approved analysis plan")
+        else:
+            if (output.plan_id, output.plan_sha256) != (plan.plan_id, plan.sha256()):
+                problems.append("computed from a plan that is not the latest approved plan")
+            if [a.analysis_id for a in output.analyses] != [a.analysis_id for a in plan.analyses]:
+                problems.append("analyses do not match the approved plan")
+        if output.input_sha256 != self.load_stage5_inputs(project_id).sha256():
+            problems.append(
+                "approved extraction data changed after the statistics were computed; re-run "
+                "Stage 5"
+            )
+        return problems
+
     # ------------------------------------------------------------------ audit
     def save_audit_report(self, report: AuditReport) -> None:
         self.session.add(
@@ -1273,6 +1433,7 @@ class Repository:
             included_studies_without_approved_rob=len(studies_without_rob),
             unresolved_double_counting=len(self.double_counting_conflicts(project_id)),
             stats_output_present=project.stats_output_sha256 is not None,
+            stats_output_problems=tuple(self.stats_output_problems(project_id)),
             manuscript_present=project.manuscript_version is not None,
             audit_passed=None if audit is None else audit.passed,
         )

@@ -14,18 +14,19 @@ reviews and meta-analyses.
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the state machine, data contracts,
 algorithms, verification workflow and the current implementation status.
 
-**Implemented:** Stages 1–4 — protocol contracts, search clients, deduplication, PRISMA
+**Implemented:** Stages 1–5 — protocol contracts, search clients, deduplication, PRISMA
 tracking, two automated (LLM) screening passes with human adjudication, open-access
 full-text retrieval and the missing-PDF manifest, PDF parsing, source-grounded
-extraction into a human-reviewed Master Extraction Table, and risk-of-bias drafts that
-only a human can approve. **Not implemented yet:** the statistics engine, plots, GRADE,
-manuscript writer, Auditor and a graphical UI.
+extraction into a human-reviewed Master Extraction Table, risk-of-bias drafts that
+only a human can approve, and (Session 3) a deterministic meta-analysis engine validated
+against R `metafor` with forest plots and a hashed `stats_output.json`. **Not implemented
+yet:** GRADE, manuscript writer, Auditor and a graphical UI.
 
 ## Quick start
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,stats]"      # "stats" adds matplotlib for forest plots
 cp .env.example .env    # set SYSREV_NCBI_EMAIL, SYSREV_UNPAYWALL_EMAIL, ...
 pytest
 python -m src.api_server.reviewer_cli enroll "Dr Jane Doe"   # human only; token shown once
@@ -77,3 +78,30 @@ curl "http://127.0.0.1:8000/projects/$PID/extraction/export?format=csv"
 Two automated screening passes are **not** two human reviewers; the generated methods
 text says so (`src.screening.reporting`). LLM output is always a proposal that is
 checked against the source text or parsed PDF page before a human can accept it.
+
+## Stage 5 in practice (Session 3)
+
+A reviewer approves an analysis plan (authenticated; one entry per analysis):
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  http://127.0.0.1:8000/projects/$PID/stats/plan -d '{"analyses": [
+    {"analysis_id": "control_5y", "outcome_id": "local_control", "effect_measure": "KM_PROBABILITY",
+     "timepoints": [{"kind": "fixed", "value": 5, "unit": "years"}], "reported_ci_scale": "log_log"},
+    {"analysis_id": "necrosis", "outcome_id": "radionecrosis", "effect_measure": "PROPORTION",
+     "timepoints": [{"kind": "last_follow_up"}]}]}'
+```
+
+Then, in Stage 5, run the engine from Python and advance to Stage 6:
+
+```python
+from pathlib import Path
+from src.stats_engine.stage5 import run_stage5
+artifacts = run_stage5(repo, project_id, output_dir=Path("output/stats"))
+# output/stats/stats_output.json, report.md, tables/*.md|csv, plots/*.svg, manifest.json
+```
+
+Every analysis ends with an explicit status (`pooled`, `single_study`, `descriptive_only`,
+`not_estimable`, `unsupported`, `no_data`) and lists excluded studies with reasons. Methods,
+defaults and limitations: ARCHITECTURE.md §9.5. Numerical validation against R metafor:
+[validation/VALIDATION_REPORT.md](validation/VALIDATION_REPORT.md).

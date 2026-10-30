@@ -394,11 +394,47 @@ class AuditReportORM(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class AnalysisPlanORM(Base):
+    """Stage 5 analysis plans. Versions are append-only; approval is a new version."""
+
+    __tablename__ = "analysis_plans"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16))
+    approved_reviewer_id: Mapped[str | None] = mapped_column(
+        ForeignKey("reviewers.id"), nullable=True
+    )
+    sha256: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class StatsOutputORM(Base):
+    """Every ``stats_output.json`` produced by the engine (append-only)."""
+
+    __tablename__ = "stats_outputs"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    plan_id: Mapped[str] = mapped_column(String(64))
+    plan_sha256: Mapped[str] = mapped_column(String(64))
+    input_sha256: Mapped[str] = mapped_column(String(64))
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    content: Mapped[str] = mapped_column(Text, doc="canonical JSON exactly as hashed")
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
 APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     StateTransitionORM,
     GateDecisionORM,
     SourceEvidenceORM,
     ExtractionReviewEventORM,
+    AnalysisPlanORM,
+    StatsOutputORM,
 )
 
 

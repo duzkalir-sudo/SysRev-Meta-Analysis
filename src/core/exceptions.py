@@ -42,3 +42,7 @@ class SearchResultTooLargeError(APIClientError):
     PubMed ESearch cannot page beyond the first 10,000 records; the search must
     be partitioned (e.g. by publication date) rather than silently truncated.
     """
+
+
+class StatisticsInputError(SysRevError):
+    """Stage 5 refuses its inputs (e.g. unapproved data, a plan that contradicts the protocol)."""

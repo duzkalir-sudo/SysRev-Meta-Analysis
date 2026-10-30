@@ -15,6 +15,7 @@ dependencies = [
     "httpx>=0.27,<1",
     "rapidfuzz>=3.9,<4",
     "numpy>=1.26",
+    "scipy>=1.13",
     "lxml>=5.2",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
@@ -24,10 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 stats = [
-    "scipy>=1.13",
-    "statsmodels>=0.14",
-    "matplotlib>=3.9",
-    "seaborn>=0.13",
+    "matplotlib>=3.9",  # forest plots (src.stats_engine.report)
 ]
 r = ["rpy2>=3.5"]
 ui = ["streamlit>=1.36"]
@@ -80,7 +78,7 @@ packages = ["src"]
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["rapidfuzz.*"]
+module = ["rapidfuzz.*", "scipy.*"]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]

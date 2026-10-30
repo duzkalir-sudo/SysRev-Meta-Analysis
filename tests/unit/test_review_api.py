@@ -180,3 +180,22 @@ def test_upload_manifest_extraction_review_and_export(c: TestClient) -> None:
     row = next(csv.DictReader(io.StringIO(export.text)))
     assert row["page"] == "2" and row["verification_status"] == "verified"
     assert c.get(f"/projects/{PID}/extraction/export").json()[0]["reported_text"] == "62.1"
+
+
+def test_analysis_plan_approval_is_authenticated(c: TestClient) -> None:
+    base = f"/projects/{PID}/stats"
+    body = {"analyses": [{"analysis_id": "md", "outcome_id": "hba1c", "effect_measure": "MD"}]}
+    assert c.post(f"{base}/plan", json=body).status_code == 401
+    assert c.get(f"{base}/plan").status_code == 404
+    tok = token(c)
+    impersonation = body | {"approved_by": "Someone Else"}
+    assert c.post(f"{base}/plan", json=impersonation, headers=auth(tok)).status_code == 422
+    wrong = {"analyses": [{"analysis_id": "rr", "outcome_id": "hba1c", "effect_measure": "RR"}]}
+    r = c.post(f"{base}/plan", json=wrong, headers=auth(tok))
+    assert r.status_code == 409 and "not admissible" in r.json()["detail"]
+    r = c.post(f"{base}/plan", json=body, headers=auth(tok))
+    assert r.status_code == 201 and r.json()["approved_by"] == "Dr API"
+    again = c.post(f"{base}/plan", json=body, headers=auth(tok))
+    assert again.status_code == 201 and again.json()["version"] == 2
+    assert c.get(f"{base}/plan").json()["version"] == 2
+    assert c.get(f"{base}/output").status_code == 404
