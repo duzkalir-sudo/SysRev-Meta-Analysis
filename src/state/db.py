@@ -306,6 +306,73 @@ class StateTransitionORM(Base):
     project: Mapped[ProjectORM] = relationship(back_populates="transitions")
 
 
+class FullTextDocumentORM(Base):
+    """A stored full-text file (PDF or structured XML) linked to one report."""
+
+    __tablename__ = "fulltext_documents"
+    __table_args__ = (UniqueConstraint("project_id", "record_id", "sha256"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    record_id: Mapped[str] = mapped_column(ForeignKey("study_records.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(8))
+    filename: Mapped[str] = mapped_column(Text)
+    original_filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    source_kind: Mapped[str] = mapped_column(String(16))
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recorded_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class ExtractionItemORM(Base):
+    __tablename__ = "extraction_items"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    record_id: Mapped[str] = mapped_column(ForeignKey("study_records.id"), index=True)
+    review_status: Mapped[str] = mapped_column(String(16), index=True)
+    data_status: Mapped[str] = mapped_column(String(16))
+    verification_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class ExtractionReviewEventORM(Base):
+    __tablename__ = "extraction_review_events"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    item_id: Mapped[str] = mapped_column(String(64), index=True)
+    action: Mapped[str] = mapped_column(String(16))
+    actor: Mapped[str] = mapped_column(Text)
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("reviewers.id"), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column()
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class StudyReportLinkORM(Base):
+    __tablename__ = "study_report_links"
+    __table_args__ = (UniqueConstraint("project_id", "record_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    record_id: Mapped[str] = mapped_column(ForeignKey("study_records.id"))
+    study_id: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class QuantitativeUnavailabilityORM(Base):
+    __tablename__ = "quantitative_unavailability"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    record_id: Mapped[str] = mapped_column(ForeignKey("study_records.id"), index=True)
+    outcome_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 class AuditReportORM(Base):
     __tablename__ = "audit_reports"
 
@@ -321,6 +388,7 @@ APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     StateTransitionORM,
     GateDecisionORM,
     SourceEvidenceORM,
+    ExtractionReviewEventORM,
 )
 
 

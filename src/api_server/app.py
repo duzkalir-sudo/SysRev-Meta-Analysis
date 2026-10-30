@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -82,7 +83,11 @@ def require_reviewer(request: Request, session: SessionDep) -> ReviewerORM:
 ReviewerDep = Annotated[ReviewerORM, Depends(require_reviewer)]
 
 
-def create_app(database_url: str = "sqlite:///:memory:") -> FastAPI:
+def create_app(database_url: str = "sqlite:///:memory:", data_dir: Path | None = None) -> FastAPI:
+    from src.api_server.review_routes import build_review_router
+    from src.core.config import get_settings
+    from src.fulltext.storage import DocumentStore
+
     engine = make_engine(database_url)
     init_db(engine)
     factory: sessionmaker[Session] = make_session_factory(engine)
@@ -94,6 +99,9 @@ def create_app(database_url: str = "sqlite:///:memory:") -> FastAPI:
 
     app = FastAPI(title="SysRev Meta-Analysis Agent", version=__version__, lifespan=lifespan)
     app.state.session_factory = factory
+    store = DocumentStore((data_dir or get_settings().data_dir) / "fulltext")
+    app.state.document_store = store
+    app.include_router(build_review_router(store))
 
     def _view(repo: Repository, project_id: str) -> ProjectView:
         project = repo.get_project(project_id)

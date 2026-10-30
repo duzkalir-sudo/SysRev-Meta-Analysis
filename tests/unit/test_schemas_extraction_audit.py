@@ -137,8 +137,8 @@ def _rob2(judgements: list[str], overall: str | None) -> RiskOfBiasAssessment:
             for d, j in zip(ROB2_DOMAINS, judgements, strict=True)
         ],
         overall=overall,
-        assessor="rob-agent",
-        assessed_by=ActorType.AGENT,
+        assessor="Dr Reviewer",
+        assessed_by=ActorType.HUMAN,
     )
 
 

@@ -23,7 +23,7 @@ from src.screening.deduplication import deduplicate
 from src.screening.prisma import PRISMATracker
 from src.state.machine import PipelineStateMachine
 from src.state.repository import NotFoundError, Repository
-from tests.conftest import make_arm, make_protocol, make_record
+from tests.conftest import approved_rob, make_arm, make_protocol, make_record
 
 INC, EXC, UNC = ScreeningVerdict.INCLUDE, ScreeningVerdict.EXCLUDE, ScreeningVerdict.UNCERTAIN
 TA, FT = ScreeningStage.TITLE_ABSTRACT, ScreeningStage.FULL_TEXT
@@ -36,7 +36,11 @@ def repo(session: Session) -> Repository:
     r = Repository(session)
     r.create_project(PID, "Synthetic review")
     r.save_protocol(PID, make_protocol())
+    HUMAN["id"], _ = r.enroll_reviewer("Dr Human")
     return r
+
+
+HUMAN: dict[str, str] = {}
 
 
 def decide(
@@ -53,6 +57,7 @@ def decide(
             reviewer=reviewer,
             reviewer_identity="Dr Human" if reviewer == ADJ else f"agent-{reviewer.value}",
             is_human=reviewer == ADJ,
+            reviewer_id=HUMAN["id"] if reviewer == ADJ else None,
             stage=stage,
             verdict=verdict,
             exclusion_reason="not eligible" if verdict == EXC else None,
@@ -268,11 +273,14 @@ def test_complete_stage4_and_prisma_reaches_stage5(repo: Repository) -> None:
     decide(repo, "a", R2, INC, FT)
     arm = make_arm("a")
     repo.save_extracted_arm(PID, arm)
+    assert any("await confirmation" in x for x in violations(repo, *S4_TO_G3))
+    decide(repo, "a", ADJ, INC, FT)  # a human confirms automated full-text eligibility
     assert violations(repo, *S4_TO_G3) == []
     v = violations(repo, *G3_TO_S5)
     assert any("not approved by a human" in x for x in v)
     assert any("reports_assessed is 0 but persisted records imply 1" in x for x in v)
-    repo.approve_extracted_arm(arm.arm_id, "Dr Human")
+    repo.approve_extracted_arm(arm.arm_id, reviewer_id=HUMAN["id"])
+    repo.save_rob(PID, approved_rob("a", HUMAN["id"], "Dr Human"))
     t = PRISMATracker()
     t.record_identified(SourceDatabase.PUBMED, 2)
     t.record_title_abstract_decision("a", include=True)

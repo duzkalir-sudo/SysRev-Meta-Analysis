@@ -52,7 +52,7 @@ from src.screening import (
     final_verdicts,
 )
 from src.state.repository import Repository
-from tests.conftest import NOW, make_arm, make_protocol
+from tests.conftest import NOW, approved_rob, make_arm, make_protocol
 from tests.unit.test_api_clients import EPMC_RESULT, OPENALEX_WORK, esearch_json
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -313,6 +313,18 @@ async def test_full_pipeline(
                     rationale="eligible on full text",
                 ),
             )  # fmt: skip
+    with pytest.raises(GuardViolationError, match="await confirmation by an authenticated"):
+        advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
+    for rid in (main_id, follow_id):  # Session 2: a human owns full-text eligibility
+        repo.save_screening_decision(
+            PID,
+            ScreeningDecision(
+                record_id=rid, reviewer=ReviewerRole.ADJUDICATOR, is_human=True,
+                reviewer_identity="Dr Human Reviewer", reviewer_id=REVIEWER["id"],
+                stage=ScreeningStage.FULL_TEXT, verdict=ScreeningVerdict.INCLUDE,
+                rationale="confirmed eligible on full text",
+            ),
+        )  # fmt: skip
     with pytest.raises(GuardViolationError, match="no extracted"):
         advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     arm = make_arm(main_id)
@@ -324,8 +336,12 @@ async def test_full_pipeline(
     advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     with pytest.raises(GuardViolationError, match="not approved by a human"):
         decide(repo, gate(GateId.GATE_3))
-    repo.approve_extracted_arm(arm.arm_id, "Dr Human Reviewer")
-    repo.approve_extracted_arm(follow_arm.arm_id, "Dr Human Reviewer")
+    repo.approve_extracted_arm(arm.arm_id, reviewer_id=REVIEWER["id"])
+    repo.approve_extracted_arm(follow_arm.arm_id, reviewer_id=REVIEWER["id"])
+    with pytest.raises(GuardViolationError, match="risk-of-bias"):
+        decide(repo, gate(GateId.GATE_3))
+    for rid in (main_id, follow_id):
+        repo.save_rob(PID, approved_rob(rid, REVIEWER["id"]))
     with pytest.raises(GuardViolationError, match="PRISMA flow not final"):
         decide(repo, gate(GateId.GATE_3))
     prisma.record_fulltext_decision(main_id, include=True)

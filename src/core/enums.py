@@ -156,6 +156,9 @@ class RoBTool(StrEnum):
     ROB2 = "rob2"
     ROBINS_I = "robins_i"
     NOS = "nos"
+    # An established instrument not implemented here (e.g. MINORS, JBI case-series
+    # checklist), named in ``tool_rationale`` and recorded by a human only.
+    EXTERNAL = "external"
 
 
 class FullTextStatus(StrEnum):
@@ -164,6 +167,61 @@ class FullTextStatus(StrEnum):
     MISSING = "missing"
     USER_UPLOADED = "user_uploaded"
     UNOBTAINABLE = "unobtainable"
+    # Open-access structured full text (e.g. PMC JATS XML) retrieved, but no PDF yet.
+    OA_STRUCTURED_TEXT = "oa_structured_text"
+
+
+class UploadMatchStatus(StrEnum):
+    """Does a PDF belong to the study record it was linked to? (deterministic heuristics)"""
+
+    CONFIRMED = "confirmed"  # strong deterministic evidence (e.g. DOI printed on page 1)
+    UNCERTAIN = "uncertain"  # needs a human to confirm before Gate 2
+    MISMATCH = "mismatch"  # evidence that the PDF is a different report
+    HUMAN_CONFIRMED = "human_confirmed"  # an authenticated reviewer confirmed the link
+
+
+class DataStatus(StrEnum):
+    """What the source says about one requested datum."""
+
+    REPORTED = "reported"  # printed in the document, verbatim evidence attached
+    NOT_REPORTED = "not_reported"  # the document does not report it (never stored as zero)
+    AMBIGUOUS = "ambiguous"  # reported, but unclear (e.g. denominator or timepoint unclear)
+    CONTRADICTORY = "contradictory"  # the document reports conflicting values
+    INACCESSIBLE = "inaccessible"  # e.g. only in a figure or an image-only page
+    DERIVED = "derived"  # computed from reported data — not authorised in Stage 4
+
+
+class EvidenceCheckStatus(StrEnum):
+    """Result of checking a SourceEvidence against the parsed source document."""
+
+    VERIFIED = "verified"
+    HUMAN_ATTESTED = "human_attested"  # not machine-verifiable; a named human vouches for it
+    NOT_CHECKED = "not_checked"
+    HASH_MISMATCH = "hash_mismatch"
+    FILE_MISMATCH = "file_mismatch"
+    PAGE_OUT_OF_RANGE = "page_out_of_range"
+    WRONG_PAGE = "wrong_page"
+    QUOTE_NOT_FOUND = "quote_not_found"
+    NUMBER_NOT_IN_QUOTE = "number_not_in_quote"
+    LOCATION_MISMATCH = "location_mismatch"
+    PAGE_UNREADABLE = "page_unreadable"
+
+
+class ReviewStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    SUPERSEDED = "superseded"  # replaced by a human correction (a new item version)
+
+
+class ExtractionDomain(StrEnum):
+    STUDY_CHARACTERISTICS = "study_characteristics"  # design, institution, recruitment, n
+    BASELINE = "baseline"
+    INTERVENTION = "intervention"
+    OUTCOME_DEFINITION = "outcome_definition"
+    OUTCOME_DATA = "outcome_data"
+    FOLLOW_UP = "follow_up"
+    ADVERSE_EVENT = "adverse_event"
 
 
 class OverlapSeverity(StrEnum):

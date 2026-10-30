@@ -123,11 +123,14 @@ def test_approve_extracted_arm(repo: Repository) -> None:
     repo.save_records("p1", [make_record("rec1", "Trial")])
     arm = make_arm("rec1")
     repo.save_extracted_arm("p1", arm)
-    approved = repo.approve_extracted_arm(arm.arm_id, "Dr Reviewer")
+    with pytest.raises(SysRevError, match="enrolled"):
+        repo.approve_extracted_arm(arm.arm_id, reviewer_id="f" * 32)  # unauthenticated
+    reviewer_id, _ = repo.enroll_reviewer("Dr Reviewer")
+    approved = repo.approve_extracted_arm(arm.arm_id, reviewer_id=reviewer_id)
     assert approved.approved_by_human and approved.approved_at is not None
     assert repo.load_extracted_arms("p1")[0].approved_by == "Dr Reviewer"
     with pytest.raises(NotFoundError):
-        repo.approve_extracted_arm("missing", "x")
+        repo.approve_extracted_arm("missing", reviewer_id=reviewer_id)
 
 
 def test_append_only_tables(repo: Repository, session: Session) -> None:

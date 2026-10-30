@@ -26,16 +26,22 @@ src/
     schemas/       Pydantic v2 data contracts (one module per stage)
   state/           State machine (machine.py), SQLAlchemy models (db.py), repository.py
   apis/            Async, rate-limited clients: PubMed, Europe PMC, OpenAlex, Unpaywall, Crossref
-  screening/       Deduplication, Cohen's kappa + conflicts, PRISMA tracker, cohort-overlap detector
-  pdf_extractor/   Stage 4 source-grounded extraction        (contract only — not implemented)
+  screening/       Deduplication, Cohen's kappa + conflicts, PRISMA tracker, cohort-overlap detector,
+                   dual automated (LLM) screening + human adjudication, reviewer-reporting facts
+  llm/             Provider-agnostic LLM interface, config and registry (no provider built in)
+  fulltext/        Stage 3: OA retrieval (Europe PMC XML, Unpaywall PDF), safe download,
+                   content-addressed storage, uploads + identity matching, Gate 2 manifest
+  pdf_extractor/   pdfplumber/pypdf parsing (pages, blocks, tables, labels) + evidence grounding
+  extraction/      Stage 4: proposals → verification → Master Extraction Table; RoB drafts
   stats_engine/    Stage 5 deterministic statistics          (interface only — not implemented)
   auditor/         Stage 6 Auditor Agent                     (contract only — not implemented)
-  api_server/      FastAPI app: project state, guard inspection, gate decisions
+  api_server/      FastAPI app: project state, guards, gate decisions, Stage 2-4 review routes
   ui/              Reviewer UI                               (placeholder)
 tests/
   unit/            Schemas, identifiers, state machine, persistence, clients, screening, API
   integration/     End-to-end Stage 1→6 flow; opt-in live API smoke tests (`-m live`)
-  fixtures/        Synthetic API payloads (10.5555 test-prefix DOIs; not real citations)
+  fixtures/        Synthetic API payloads and a dependency-free synthetic-PDF builder
+                   (10.5555 test-prefix DOIs; invented content; not real citations or data)
 ```
 
 ---
@@ -107,9 +113,9 @@ A disagreement counts as unresolved even if no `ScreeningConflict` row was ever 
 | Stage 2 → Gate 1.5 | ≥1 stored record; **every unique (non-duplicate) record has title/abstract decisions from both reviewers**; PRISMA snapshot recorded, internally consistent and consistent with stored records |
 | Gate 1.5 → Stage 3 | As above, plus 0 unresolved title/abstract disagreements; 0 unresolved possible-duplicate pairs; 0 unresolved cohort-overlap warnings; PRISMA shows 0 records awaiting screening; ≥1 record included |
 | Stage 3 → Gate 2 | **Every title/abstract-included record has a full-text manifest entry** |
-| Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, or `UNOBTAINABLE` with a reason |
-| Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); ≥1 report included; every included report has ≥1 extracted arm; no arm belongs to a non-included report; 0 values without `SourceEvidence` |
-| Gate 3 → Stage 5 | As above, plus every arm approved by a human; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
+| Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, structured-text-only, or `UNOBTAINABLE` with a reason; **no linked PDF has an uncertain or mismatched identity** unless a human confirmed it |
+| Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); **every full-text outcome resting only on automated passes is confirmed by an authenticated human**; ≥1 report included; every included report has ≥1 extracted arm, belongs to a study (§9.3) that has one, or is recorded as qualitative-only by a human; no arm belongs to a non-included report; 0 values without `SourceEvidence` |
+| Gate 3 → Stage 5 | As above, plus every arm approved by a human; **0 master-table items awaiting review; every included study has a human-approved risk-of-bias assessment**; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
 | Stage 5 → Stage 6 | `stats_output.json` produced (hash recorded) |
 | Stage 6 → Audit | Manuscript draft exists |
 | Audit → COMPLETED | Latest `AuditReport.passed is True` |
@@ -226,6 +232,13 @@ must be timezone-aware.
   overall judgement may not be milder than the worst domain, as both tools' guidance
   specifies.
 
+Session 2 additions: `FullTextItem` records retrieval provenance (attempts, source URL,
+licence, XML hash, PDF identity `match_status`); `RiskOfBiasAssessment` gained approval
+stamps and draft rules (§9.4); `ScreeningDecision` gained `reviewer_id` (humans) and
+`automation` provenance (LLM passes). `master.py` defines `ExtractionItem`,
+`EvidenceCheck`, `ExtractionReviewEvent`, `StudyReportLink` and
+`QuantitativeUnavailability` (§9.3).
+
 ### 4.4 Stage 6 — `audit.py`
 * **`NumericClaimCheck`** — manuscript number vs `stats_output.json` key with tolerance;
   the status must agree with the numbers.
@@ -265,8 +278,18 @@ SQLAlchemy 2.0 typed ORM on SQLite (any SQLAlchemy URL works).
   the token); `gate_decisions.reviewer_id` is a `NOT NULL` foreign key to it.
 * `duplicate_candidates` stores unmerged, conflicting duplicate matches awaiting human
   adjudication.
-* `state_transitions`, `gate_decisions`, `source_evidence` are append-only (ORM
-  `before_update` / `before_delete` listeners raise `AppendOnlyViolationError`).
+* `state_transitions`, `gate_decisions`, `source_evidence` and (Session 2)
+  `extraction_review_events` are append-only (ORM `before_update` / `before_delete`
+  listeners raise `AppendOnlyViolationError`).
+* Session 2 tables: `fulltext_documents` (every stored PDF/XML with SHA-256, source and
+  uploader), `extraction_items` (the Master Extraction Table; a reviewed item can no
+  longer be changed — corrections create a new version), `study_report_links`
+  (report → study), `quantitative_unavailability` (qualitative-only inclusion).
+* Every *human* action persisted in Stages 2–4 (screening adjudication, PDF upload or
+  identity confirmation, unobtainable declaration, extraction review, arm approval,
+  study linking, risk-of-bias approval) passes `Repository.require_active_reviewer()`:
+  an unknown or revoked reviewer id is refused at the persistence layer, not only at the
+  HTTP layer. `approve_extracted_arm()` now takes the authenticated `reviewer_id`.
 * `projects.version_id` provides optimistic concurrency; `record_transition()` also
   rejects stale transitions whose `from_phase` no longer matches the stored phase.
 * SQLite foreign keys are switched on (`PRAGMA foreign_keys=ON`); datetimes round-trip as
@@ -378,6 +401,27 @@ categories and returns `None` when p_e = 1. `detect_conflicts()` flags disagreem
 double-`uncertain` records; `final_verdicts()` refuses to produce a consensus while any
 conflict is unresolved.
 
+### 8.2a Automated dual screening (`llm_screening.py`, `reporting.py`) — Session 2
+Two `LLMScreener`s (separate provider instances; distinct labels; neither sees the
+other's output) screen each record against the **approved** protocol. Criteria get
+stable ids (`I1..`, `E1..`). Replies must match `LLMScreeningResponse`; the
+**conservative policy** downgrades an `exclude` to `uncertain` unless it cites a
+predefined criterion, the model reports sufficient information, and every supporting
+quote occurs (whitespace/typography-normalised) in the screened text. Malformed replies
+become `uncertain`; transport failures record nothing and are retried on the next run
+(resume = existing decisions are skipped). Decisions are `is_human=False` with
+`AutomatedReviewerProvenance` (provider, model, prompt version, prompt/response
+SHA-256, raw verdict, policy notes). Every disagreement or `uncertain` becomes a
+`ScreeningConflict`; only `adjudicate()` with an enrolled reviewer resolves it.
+κ is computed by the existing `cohens_kappa()` over complete pairs.
+
+**Reporting.** `screening_reporting_facts()` derives who screened from stored decisions;
+`methods_statement()` renders a deterministic sentence that states the passes are
+automated and *not equivalent to independent human reviewers* (and when both passes
+used the same model, says so); `check_reviewer_claims()` flags text that describes them
+as two human reviewers. Human full-text responsibility: a full-text outcome supported
+only by automated passes blocks Gate 3 until a human confirms it.
+
 ### 8.3 PRISMA tracker (`prisma.py`)
 Counts are derived from recorded events (identification per database, duplicates removed,
 per-record screening/retrieval/eligibility outcomes), not typed in. Decisions are
@@ -430,6 +474,84 @@ index (shared author key, registry ID or institution token) to avoid all-pairs w
    Crossref/PubMed. `COMPLETED` is reachable only from a passing report; a failing report
    sends the manuscript back for redrafting.
 
+### 9.1 Stage 3 — full-text retrieval (`src/fulltext`) — Session 2
+`FullTextRetriever.run()` processes title/abstract-included records one at a time and
+commits after each (pause/resume across restarts; `.partial` leftovers are cleaned at
+start). Order of preference: Europe PMC open-access **JATS XML** (`/{PMCID}/fullTextXML`,
+PMCID via `EXT_ID:<pmid> AND SRC:MED` if needed) for provenance and structured text,
+then **Unpaywall** open-access PDF locations. Only URLs returned by these services are
+fetched; no paywall or authentication is circumvented. Downloads are streamed with a
+byte limit, require a `%PDF-` header within the first 1 KiB, are opened with pypdf, and
+are moved atomically into a content-addressed store (`<sha256>.pdf`). Each attempt is
+recorded (`RetrievalAttempt`); failures leave the report `MISSING`, never excluded.
+XML-only reports are *retrieved* (`OA_STRUCTURED_TEXT`) but are retried for a PDF on later
+runs because numeric evidence must cite a physical PDF page. Every PDF (OA or uploaded)
+is checked against its record (`assess_match`: DOI/PMID on page 1, fuzzy title,
+first-author surname; identical bytes linked to another record); uncertain or mismatched
+links block Gate 2 until `confirm_pdf_match()` by a reviewer. `mark_unobtainable()`
+needs a reviewer and a reason and counts as PRISMA "not retrieved", distinct from
+"assessed and excluded" (`report_flow()`). `build_manifest()` exports the missing-report
+manifest (title, authors, year, journal, DOI, PMID, PMCID, status, last attempt) as CSV
+or JSON.
+
+### 9.2 PDF parsing and evidence grounding (`src/pdf_extractor`) — Session 2
+pdfplumber (MIT) gives per-line text, ruled-table detection and cell extraction; pypdf
+reads `/PageLabels`. PyMuPDF was not used (AGPL licence; not needed). Output is a
+`ParsedDocument` with physical pages, logical page labels, a heuristic printed page
+number, classified blocks (`p{page}.b{n}`: paragraph, heading, table caption, figure
+legend, supplementary), tables (`p{page}.t{n}`, cells `…r{row}c{col}`), and per-page
+issues: image-only pages (no OCR is performed — flagged for manual review), unreadable or
+ragged tables, and table captions without detectable structure. Text-based tables that
+have no ruling lines are **not** reconstructed (flagged instead).
+
+`verify_evidence()` checks a `SourceEvidence` against the parsed document: SHA-256 and
+filename, page range, image-only page, quote present **on the cited page** (else
+`WRONG_PAGE` with the actual pages, or `QUOTE_NOT_FOUND`), the reported number as a whole
+token inside the quote, and — for structured ids — that the quote is in the cited
+block/table and the number in the cited cell. Matching normalises Unicode compatibility
+forms, ligatures, dashes, quotes, soft hyphens, words hyphenated across lines, letter
+case and whitespace next to non-digits, but never whitespace between digits, so `12 34`
+cannot match `1234` and `12` cannot match `125` or `12.5`. `select_context()` sends only
+the highest-scoring blocks/tables (labelled with page and id) to a model.
+
+### 9.3 Master Extraction Table (`src/extraction`) — Session 2
+An extractor (LLM or human) submits `ProposedValue`s: number as printed, page, location,
+verbatim quote — never a computed value (`value` is parsed from `reported_text`).
+`proposal_to_item()` grounds each proposal in the record's linked PDF (another PDF is
+refused) and stores an `ExtractionItem` with `data_status` (`reported`, `not_reported`,
+`ambiguous`, `contradictory`, `inaccessible`; `derived` is refused in Stage 4), the
+`EvidenceCheck` and discrepancy flags — including estimator conflicts (Kaplan-Meier /
+actuarial wording recorded as a crude count, competing-risks wording recorded as KM, or
+"x of n" wording recorded as KM). Missing data are `value=None`, never zero.
+
+Review (`accept_item`, `reject_item`, `correct_item`) requires an enrolled reviewer; a
+reported value can be accepted only if its evidence verified; flagged items need a note;
+corrections must themselves verify, or be explicitly `HUMAN_ATTESTED` (e.g. a figure or an
+image-only page) with the failed machine check recorded. Every action appends an
+`ExtractionReviewEvent` (before/after payloads). `build_arms()` assembles accepted items
+into human-approved `ExtractedStudyArm`s keyed by report, outcome, arm, timepoint **and
+estimator**, so crude proportions and KM/cumulative-incidence estimates are never merged;
+`analysis_compatibility()` states whether an arm can inform an outcome's summary measure
+without conversion. Reports are linked to studies (`link_reports_to_study`);
+`double_counting_risks()` flags the same outcome/arm/timepoint datum accepted from two
+reports of one study; `record_unavailability()` records an eligible study that is
+available only for qualitative synthesis (or not for one outcome) with a reason.
+`export_rows()` → CSV/JSON with study and report ids, every evidence field, verification
+and review status.
+
+### 9.4 Risk of bias (`src/extraction/rob.py`) — Session 2
+`select_rob_tool()` maps design and review type to RoB 2 (randomised), ROBINS-I
+(comparative non-randomised studies of interventions; NOS allowed with justification for
+cohort/case-control), NOS (single-group cohorts, with justification) or an `EXTERNAL`
+human-recorded instrument (case series and single-arm trials, for which none of the three
+is designed; e.g. MINORS or the JBI case-series checklist). `LLMRoBDrafter` produces RoB 2
+/ ROBINS-I drafts: invalid domains or judgements are refused, only verified quotes are
+kept as evidence, unverifiable quotes are listed in `needs_human_attention`, and a domain
+without verified support is marked `missing_information`. Schema rules: an automated
+draft can never carry an overall judgement; approval requires an enrolled reviewer (id,
+name, time) and an overall judgement no milder than the worst domain. GRADE is out of
+scope until Session 4.
+
 ---
 
 ## 10. Implementation status
@@ -442,11 +564,17 @@ index (shared author key, registry ID or institution token) to avoid all-pairs w
 | PubMed, Europe PMC, OpenAlex, Unpaywall, Crossref clients | Implemented; tested with mocked HTTP only. Live smoke tests (`pytest -m live`) were executed but all 6 failed with `ProxyError: 403 Forbidden` from the sandbox egress proxy before reaching any API. **Real API behaviour remains unverified** |
 | Deduplication (with cluster-level identifier-conflict blocking), κ/conflicts, PRISMA tracker (with pending-screening accounting), cohort overlap | Implemented and tested |
 | Fail-closed guards derived from persisted records, incl. PRISMA cross-check | Implemented and tested |
-| FastAPI (state, guards, gate decisions) | Implemented and tested; gate decisions require an enrolled reviewer's bearer token. Endpoints for system steps not yet exposed |
+| FastAPI (state, guards, gate decisions, Stage 2–4 review routes) | Implemented and tested; every human action requires an enrolled reviewer's bearer token. LLM runs and retrieval are started from Python, not over HTTP |
 | Reviewer enrollment CLI and token authentication | Implemented and tested; see §6 for the threat model and limitations |
 | Single-arm / case-series protocol and outcome schemas; crude vs KM vs cumulative-incidence distinction | Implemented and tested (schemas only; no statistics) |
-| LLM agents (PICO structuring, screening reviewers, drafting) | Not implemented |
-| PDF extraction (`pdf_extractor`) | Contract only |
+| LLM provider interface + registry (`src/llm`) | Implemented and tested with scripted providers. **No concrete vendor adapter ships**: a real provider must be registered explicitly, otherwise `ProviderNotConfiguredError` is raised |
+| Dual automated screening, conservative policy, resume, conflicts, κ, authenticated adjudication, reporting facts | Implemented and tested (mocked models). Screening accuracy of any real model is **unvalidated** |
+| Stage 3 retrieval (Europe PMC XML, Unpaywall PDF), downloads, uploads, identity matching, manifest, pause/resume | Implemented and tested with respx-mocked HTTP only; **no live retrieval was executed** |
+| PDF parsing and evidence grounding | Implemented and tested on generated synthetic PDFs; not yet evaluated on real journal PDFs (multi-column layouts, rotated tables, unruled tables) |
+| Master Extraction Table, review workflow, arms, exports, study linking, qualitative-only | Implemented and tested |
+| LLM extraction proposals / RoB drafts | Implemented and tested with scripted replies; real-model quality unvalidated |
+| JATS XML parsing for evidence; OCR; supplementary-file retrieval | Not implemented (XML is stored with provenance only; image-only pages are flagged) |
+| PICO structuring / manuscript drafting agents | Not implemented |
 | Statistics engine (`stats_engine`) | Interface only — raises `NotImplementedError` |
 | Plotting, PRISMA diagram rendering, GRADE SoF | Not implemented |
 | Auditor | Contract (`AuditReport`) only |
@@ -507,3 +635,10 @@ uvicorn src.api_server.main:app --reload                       # binds 127.0.0.1
     IETF; 2016.
 11. Sayers E. A General Introduction to the E-utilities. In: *Entrez Programming Utilities
    Help*. NCBI; https://www.ncbi.nlm.nih.gov/books/NBK25497/
+12. Slim K, Nini E, Forestier D, Kwiatkowski F, Panis Y, Chipponi J. Methodological index
+    for non-randomized studies (MINORS): development and validation of a new instrument.
+    *ANZ J Surg* 2003;73:712-716.
+13. Munn Z, Barker TH, Moola S, et al. Methodological quality of case series studies: an
+    introduction to the JBI critical appraisal tool. *JBI Evid Synth* 2020;18:2127-2133.
+14. Europe PMC RESTful Web Service documentation; Unpaywall REST API documentation
+    (https://europepmc.org/RestfulWebService; https://unpaywall.org/products/api).

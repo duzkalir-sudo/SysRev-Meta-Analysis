@@ -17,6 +17,7 @@ from src.core.enums import (
     FullTextStatus,
     RoBTool,
     TimepointType,
+    UploadMatchStatus,
 )
 from src.core.schemas.base import (
     DOI,
@@ -36,8 +37,42 @@ from src.core.schemas.protocol import FollowUpTimepoint
 # --------------------------------------------------------------------------- #
 
 
+AttemptOutcome = Literal[
+    "retrieved",
+    "not_available",
+    "invalid_url",
+    "network_error",
+    "http_error",
+    "not_pdf",
+    "too_large",
+    "malformed",
+    "duplicate",
+    "skipped",
+]
+
+
+class RetrievalAttempt(FrozenModel):
+    """One lawful retrieval attempt (an open-access service or a user upload)."""
+
+    service: NonEmptyStr = Field(description='e.g. "europe_pmc_fulltext_xml", "unpaywall"')
+    url: str | None = None
+    outcome: AttemptOutcome
+    detail: str | None = None
+    attempted_at: AwareDatetime = Field(default_factory=utc_now)
+
+
+_SHA256 = r"^[0-9a-f]{64}$"
+_PDF_STATUSES = (FullTextStatus.OA_DOWNLOADED, FullTextStatus.USER_UPLOADED)
+
+
 class FullTextItem(StrictModel):
-    """Retrieval status of one included report. Missing items form the Gate 2 manifest."""
+    """Retrieval status of one included report. Missing items form the Gate 2 manifest.
+
+    A report counts as *retrieved* only with a stored file whose SHA-256 is recorded. A PDF
+    whose link to the record is uncertain or contradicted (``match_status``) blocks Gate 2
+    until an authenticated human confirms it; an unobtainable report is "not retrieved"
+    (PRISMA), never an eligibility exclusion.
+    """
 
     record_id: Identifier
     first_author: str | None = None
@@ -49,21 +84,55 @@ class FullTextItem(StrictModel):
     status: FullTextStatus = FullTextStatus.PENDING
     oa_url: str | None = None
     pdf_filename: str | None = None
-    pdf_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    pdf_sha256: str | None = Field(default=None, pattern=_SHA256)
     unobtainable_reason: str | None = None
+    # --- Session 2: provenance of the retrieved full text
+    pmcid: str | None = None
+    source_url: str | None = None
+    source_kind: Literal["oa_pdf", "pmc_xml", "user_upload"] | None = None
+    license: str | None = None
+    xml_filename: str | None = None
+    xml_sha256: str | None = Field(default=None, pattern=_SHA256)
+    match_status: UploadMatchStatus | None = None
+    match_notes: list[str] = Field(default_factory=list)
+    confirmed_by: str | None = None
+    recorded_by: str | None = Field(
+        default=None, description="authenticated reviewer who uploaded / marked unobtainable"
+    )
+    attempts: list[RetrievalAttempt] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _rules(self) -> FullTextItem:
-        has_pdf = self.status in (FullTextStatus.OA_DOWNLOADED, FullTextStatus.USER_UPLOADED)
+        has_pdf = self.status in _PDF_STATUSES
         if has_pdf and not (self.pdf_filename and self.pdf_sha256):
             raise ValueError(f"status {self.status} requires pdf_filename and pdf_sha256")
+        if self.status == FullTextStatus.OA_STRUCTURED_TEXT and not (
+            self.xml_filename and self.xml_sha256
+        ):
+            raise ValueError("structured full text requires xml_filename and xml_sha256")
         if self.status == FullTextStatus.UNOBTAINABLE and not self.unobtainable_reason:
             raise ValueError("unobtainable reports require unobtainable_reason")
+        if self.match_status == UploadMatchStatus.HUMAN_CONFIRMED and not self.confirmed_by:
+            raise ValueError("a human-confirmed PDF match requires confirmed_by")
         return self
 
     @property
+    def is_retrieved(self) -> bool:
+        return self.status in (*_PDF_STATUSES, FullTextStatus.OA_STRUCTURED_TEXT)
+
+    @property
+    def match_unconfirmed(self) -> bool:
+        return self.status in _PDF_STATUSES and self.match_status in (
+            UploadMatchStatus.UNCERTAIN,
+            UploadMatchStatus.MISMATCH,
+        )
+
+    @property
     def blocks_gate2(self) -> bool:
-        return self.status in (FullTextStatus.PENDING, FullTextStatus.MISSING)
+        return (
+            self.status in (FullTextStatus.PENDING, FullTextStatus.MISSING)
+            or self.match_unconfirmed
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -378,22 +447,70 @@ class DomainJudgement(StrictModel):
     judgement: NonEmptyStr
     support: NonEmptyStr = Field(description="reviewer's justification")
     evidence: list[SourceEvidence] = Field(default_factory=list)
+    missing_information: bool = Field(
+        default=False, description="the report does not provide the information this domain needs"
+    )
+    needs_human_attention: list[str] = Field(
+        default_factory=list, description="e.g. supporting quotes that failed verification"
+    )
 
 
 class RiskOfBiasAssessment(StrictModel):
+    """A risk-of-bias assessment. Agent output is a *draft*: it may propose domain
+    judgements (each backed by verified evidence or flagged as missing information) but
+    may never set an overall judgement. Only an authenticated human approves.
+    """
+
     assessment_id: Identifier = Field(default_factory=new_id)
     record_id: Identifier
     outcome_id: Identifier | None = None
     tool: RoBTool
+    tool_rationale: str | None = None
     domains: list[DomainJudgement] = Field(default_factory=list)
     overall: str | None = None
     nos_stars: dict[str, int] | None = None
     assessor: NonEmptyStr
     assessed_by: ActorType
     approved_by_human: bool = False
+    approved_by: str | None = None
+    approved_reviewer_id: Identifier | None = None
+    approved_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _approval_rules(self) -> RiskOfBiasAssessment:
+        stamps = (self.approved_by, self.approved_reviewer_id, self.approved_at)
+        if self.approved_by_human:
+            if any(v is None for v in stamps):
+                raise ValueError(
+                    "approval requires approved_by, approved_reviewer_id and approved_at"
+                )
+            if self.tool != RoBTool.NOS and self.overall is None:
+                raise ValueError("an approved assessment needs an overall judgement")
+        elif any(v is not None for v in stamps):
+            raise ValueError("approval stamps are only allowed on approved assessments")
+        if self.assessed_by != ActorType.HUMAN and not self.approved_by_human:
+            if self.overall is not None:
+                raise ValueError(
+                    "automated drafts cannot set an overall judgement; a human must approve"
+                )
+            for d in self.domains:
+                if not d.evidence and not d.missing_information:
+                    raise ValueError(
+                        f"draft domain {d.domain!r} needs supporting evidence or an explicit "
+                        "missing_information flag"
+                    )
+        return self
 
     @model_validator(mode="after")
     def _tool_rules(self) -> RiskOfBiasAssessment:
+        if self.tool == RoBTool.EXTERNAL:
+            if self.assessed_by != ActorType.HUMAN:
+                raise ValueError("external-instrument assessments are recorded by humans only")
+            if not (self.tool_rationale and self.tool_rationale.strip()):
+                raise ValueError("name the external instrument and why it was chosen")
+            if self.nos_stars is not None:
+                raise ValueError("nos_stars is only valid for NOS")
+            return self
         if self.tool == RoBTool.NOS:
             self._validate_nos()
         else:

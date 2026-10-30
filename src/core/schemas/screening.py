@@ -7,7 +7,32 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from src.core.enums import ReviewerRole, ScreeningStage, ScreeningVerdict
-from src.core.schemas.base import AwareDatetime, Identifier, StrictModel, new_id, utc_now
+from src.core.schemas.base import (
+    AwareDatetime,
+    FrozenModel,
+    Identifier,
+    NonEmptyStr,
+    StrictModel,
+    new_id,
+    utc_now,
+)
+
+
+class AutomatedReviewerProvenance(FrozenModel):
+    """How an automated (LLM) screening decision was produced. Never describes a human."""
+
+    provider: NonEmptyStr
+    model_id: NonEmptyStr
+    reviewer_label: NonEmptyStr = Field(description='e.g. "llm-pass-1"')
+    prompt_version: NonEmptyStr
+    prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    response_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    temperature: float | None = None
+    raw_verdict: str | None = Field(
+        default=None, description="verdict proposed by the model before the conservative policy"
+    )
+    policy_notes: list[str] = Field(default_factory=list)
+    run_id: Identifier = Field(default_factory=new_id)
 
 
 class ScreeningDecision(StrictModel):
@@ -24,6 +49,10 @@ class ScreeningDecision(StrictModel):
     rationale: str = Field(min_length=1)
     criteria_cited: list[str] = Field(default_factory=list)
     decided_at: AwareDatetime = Field(default_factory=utc_now)
+    reviewer_id: Identifier | None = Field(
+        default=None, description="enrolled reviewer id; required to persist a human decision"
+    )
+    automation: AutomatedReviewerProvenance | None = None
 
     @model_validator(mode="after")
     def _rules(self) -> ScreeningDecision:
@@ -33,8 +62,18 @@ class ScreeningDecision(StrictModel):
             raise ValueError("exclusion_reason is only allowed for exclude verdicts")
         if self.reviewer == ReviewerRole.ADJUDICATOR and not self.is_human:
             raise ValueError("adjudication decisions must be made by a human")
-        if self.stage == ScreeningStage.FULL_TEXT and self.verdict == ScreeningVerdict.UNCERTAIN:
-            raise ValueError("full-text decisions must be include or exclude")
+        if self.is_human and self.automation is not None:
+            raise ValueError("a human decision cannot carry automated-reviewer provenance")
+        if not self.is_human and self.reviewer_id is not None:
+            raise ValueError("reviewer_id identifies enrolled humans only")
+        # Humans must commit at full text; an automated pass may defer to a human instead
+        # of guessing (conservative policy), which surfaces the record as a conflict.
+        if (
+            self.stage == ScreeningStage.FULL_TEXT
+            and self.verdict == ScreeningVerdict.UNCERTAIN
+            and self.is_human
+        ):
+            raise ValueError("human full-text decisions must be include or exclude")
         return self
 
 
