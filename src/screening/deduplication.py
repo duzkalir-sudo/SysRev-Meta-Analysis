@@ -39,7 +39,12 @@ SOURCE_PRIORITY: dict[SourceDatabase, int] = {
     SourceDatabase.EUROPE_PMC: 1,
     SourceDatabase.CROSSREF: 2,
     SourceDatabase.OPENALEX: 3,
-    SourceDatabase.MANUAL: 4,
+    SourceDatabase.EMBASE: 4,
+    SourceDatabase.SCOPUS: 5,
+    SourceDatabase.WEB_OF_SCIENCE: 6,
+    SourceDatabase.COCHRANE_CENTRAL: 7,
+    SourceDatabase.CLINICALTRIALS_GOV: 8,
+    SourceDatabase.MANUAL: 9,
 }
 
 
@@ -163,6 +168,30 @@ def _identifier_conflict(a: StudyRecord, b: StudyRecord) -> str | None:
     return None
 
 
+def _exact_conflict_factory(
+    title_floor: float | None,
+) -> Callable[[StudyRecord, StudyRecord], str | None]:
+    """Identifier conflict, or a shared identifier on clearly unrelated titles.
+
+    A wrong DOI/PMID in an export (or an erratum sharing a DOI) would otherwise merge two
+    different reports; such pairs go to a human instead. Translated titles may also fall
+    below the floor; they are then adjudicated rather than merged (conservative).
+    """
+
+    def conflict(a: StudyRecord, b: StudyRecord) -> str | None:
+        reason = _identifier_conflict(a, b)
+        if reason or title_floor is None:
+            return reason
+        ta, tb = a.normalized_title, b.normalized_title
+        if ta and tb:
+            score = fuzz.token_sort_ratio(ta, tb)
+            if score < title_floor:
+                return f"shared identifier but dissimilar titles (similarity {score:.0f})"
+        return None
+
+    return conflict
+
+
 def _contradiction(a: StudyRecord, b: StudyRecord) -> str | None:
     """Evidence against a fuzzy-title merge: identifier conflict or first-author mismatch."""
     conflict = _identifier_conflict(a, b)
@@ -179,13 +208,22 @@ def _representative_key(r: StudyRecord) -> tuple[int, int, str]:
 
 
 class Deduplicator:
-    def __init__(self, *, title_threshold: float = 95.0, year_tolerance: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        title_threshold: float = 95.0,
+        year_tolerance: int = 1,
+        exact_match_title_floor: float | None = None,
+    ) -> None:
         if not 50.0 <= title_threshold <= 100.0:
             raise ValueError("title_threshold must be within [50, 100]")
         if year_tolerance < 0:
             raise ValueError("year_tolerance must be >= 0")
+        if exact_match_title_floor is not None and not 0 <= exact_match_title_floor <= 100:
+            raise ValueError("exact_match_title_floor must be within [0, 100]")
         self.title_threshold = title_threshold
         self.year_tolerance = year_tolerance
+        self.exact_match_title_floor = exact_match_title_floor
 
     def deduplicate(self, records: Sequence[StudyRecord]) -> DeduplicationResult:
         ids = [r.record_id for r in records]
@@ -237,10 +275,13 @@ class Deduplicator:
             possible_duplicates=possible,
         )
 
-    @staticmethod
     def _exact_pass(
-        records: Sequence[StudyRecord], cs: _ClusterSet, reasons: dict[frozenset[str], str]
+        self,
+        records: Sequence[StudyRecord],
+        cs: _ClusterSet,
+        reasons: dict[frozenset[str], str],
     ) -> list[PossibleDuplicate]:
+        conflict = _exact_conflict_factory(self.exact_match_title_floor)
         possible: list[PossibleDuplicate] = []
         ordered = sorted(records, key=lambda x: x.record_id)
         for attr in IDENTIFIER_FIELDS:
@@ -256,7 +297,7 @@ class Deduplicator:
                     for prev in ids[:idx]:
                         if cs.find(prev) == cs.find(other):
                             continue
-                        blocker = cs.try_merge(prev, other, _identifier_conflict)
+                        blocker = cs.try_merge(prev, other, conflict)
                         if blocker:
                             possible.append(
                                 PossibleDuplicate(prev, other, f"exact {attr} ({key})", blocker)

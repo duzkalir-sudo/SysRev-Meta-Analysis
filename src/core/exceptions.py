@@ -44,5 +44,9 @@ class SearchResultTooLargeError(APIClientError):
     """
 
 
+class SearchIncompleteError(APIClientError):
+    """Retrieval returned fewer distinct records than the database reported."""
+
+
 class StatisticsInputError(SysRevError):
     """Stage 5 refuses its inputs (e.g. unapproved data, a plan that contradicts the protocol)."""

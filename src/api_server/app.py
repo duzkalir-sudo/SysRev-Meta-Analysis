@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,6 +27,9 @@ from src.core.schemas.pipeline import GateDecision, StateTransition
 from src.state.db import ReviewerORM, init_db, make_engine, make_session_factory
 from src.state.machine import GATE_OF_PHASE
 from src.state.repository import NotFoundError, Repository
+
+if TYPE_CHECKING:
+    from src.search.service import SearchClients
 
 
 class CreateProjectRequest(BaseModel):
@@ -97,8 +100,14 @@ def require_reviewer(request: Request, session: SessionDep) -> ReviewerORM:
 ReviewerDep = Annotated[ReviewerORM, Depends(require_reviewer)]
 
 
-def create_app(database_url: str = "sqlite:///:memory:", data_dir: Path | None = None) -> FastAPI:
+def create_app(
+    database_url: str = "sqlite:///:memory:",
+    data_dir: Path | None = None,
+    *,
+    search_clients: SearchClients | None = None,
+) -> FastAPI:
     from src.api_server.review_routes import build_review_router
+    from src.api_server.search_routes import build_search_router
     from src.core.config import get_settings
     from src.fulltext.storage import DocumentStore
 
@@ -113,9 +122,12 @@ def create_app(database_url: str = "sqlite:///:memory:", data_dir: Path | None =
 
     app = FastAPI(title="SysRev Meta-Analysis Agent", version=__version__, lifespan=lifespan)
     app.state.session_factory = factory
-    store = DocumentStore((data_dir or get_settings().data_dir) / "fulltext")
+    root = data_dir or get_settings().data_dir
+    store = DocumentStore(root / "fulltext")
     app.state.document_store = store
+    app.state.search_clients = search_clients  # None: built from settings on first use
     app.include_router(build_review_router(store))
+    app.include_router(build_search_router(DocumentStore(root / "searches")))
 
     def _view(repo: Repository, project_id: str) -> ProjectView:
         project = repo.get_project(project_id)

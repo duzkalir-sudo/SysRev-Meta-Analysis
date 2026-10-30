@@ -46,6 +46,29 @@ class SourceDatabase(StrEnum):
     OPENALEX = "openalex"
     CROSSREF = "crossref"
     MANUAL = "manual"
+    # Session 5: subscription or interface-only sources, entered through file imports.
+    EMBASE = "embase"
+    SCOPUS = "scopus"
+    WEB_OF_SCIENCE = "web_of_science"
+    COCHRANE_CENTRAL = "cochrane_central"
+    CLINICALTRIALS_GOV = "clinicaltrials_gov"  # a trial register (PRISMA "registers" box)
+
+
+class SearchRunKind(StrEnum):
+    """Entries of the append-only search log (PRISMA-S)."""
+
+    PREVIEW = "preview"  # count only; identifies nothing
+    EXECUTION = "execution"  # records retrieved through an API client
+    IMPORT = "import"  # records imported from a file exported by the user
+    NOT_SEARCHED = "not_searched"  # a protocol database a human declares was not searched
+    ACKNOWLEDGEMENT = "acknowledgement"  # a human acknowledges a count discrepancy
+    DEDUPLICATION = "deduplication"  # records prepared for screening
+
+
+class SearchRunStatus(StrEnum):
+    COMPLETE = "complete"
+    COUNT_MISMATCH = "count_mismatch"  # retrieved != reported; needs human acknowledgement
+    FAILED = "failed"  # attempted but nothing identified (kept for the audit trail)
 
 
 class ReviewDesign(StrEnum):

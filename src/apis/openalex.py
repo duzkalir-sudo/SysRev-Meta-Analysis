@@ -109,6 +109,20 @@ class OpenAlexClient(BaseAPIClient):
                     return
             cursor = meta.get("next_cursor") if results else None
 
+    async def count(self, *, search: str | None = None, filter_: str | None = None) -> int:
+        """OpenAlex ``meta.count`` for a search/filter (one result requested)."""
+        if not (search or filter_):
+            raise ValueError("provide search and/or filter_")
+        params: dict[str, Any] = {**self._common(), "per-page": 1}
+        if search:
+            params["search"] = search
+        if filter_:
+            params["filter"] = filter_
+        data = await self._get_json("works", params)
+        if not isinstance(data, dict) or "meta" not in data:
+            raise APIClientError("unexpected OpenAlex response shape")
+        return int((data.get("meta") or {}).get("count") or 0)
+
     async def search(
         self,
         *,

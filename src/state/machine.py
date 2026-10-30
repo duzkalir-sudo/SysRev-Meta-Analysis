@@ -66,6 +66,7 @@ class GuardContext:
 
     protocol_blockers: tuple[str, ...]
     # Stage 2 — identification, deduplication, title/abstract screening
+    search_problems: tuple[str, ...]
     records_identified: int
     records_unique: int
     unresolved_duplicate_candidates: int
@@ -117,7 +118,7 @@ def _prisma_recorded(c: GuardContext) -> list[str]:
 
 def _dual_screening_done(c: GuardContext) -> list[str]:
     """Stage 2 → Gate 1.5: search executed, both reviewers screened every unique record."""
-    v: list[str] = []
+    v: list[str] = [f"searches: {p}" for p in c.search_problems]
     if c.records_identified == 0:
         v.append("no records identified by the search")
     if c.ta_missing_decisions:

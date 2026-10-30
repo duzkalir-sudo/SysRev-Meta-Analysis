@@ -37,7 +37,9 @@ src/
 validation/        R reference script, metafor comparison, VALIDATION_REPORT.md
   auditor/         Stage 6 Auditor Agent                     (contract only — not implemented)
   api_server/      FastAPI app: project state, guards, gate decisions, Stage 2-4 review routes
-  ui/              Reviewer UI                               (placeholder)
+  search/          Session 5: database registry, protocol editor, search execution, RIS/BibTeX/CSV
+                   import, preparation for screening, PRISMA derivation, PRISMA-S report
+  ui/              Local Streamlit reviewer UI (Session 4; protocol & search pages in Session 5)
 tests/
   unit/            Schemas, identifiers, state machine, persistence, clients, screening, API
   integration/     End-to-end Stage 1→6 flow; opt-in live API smoke tests (`-m live`)
@@ -115,8 +117,8 @@ even if no `ScreeningConflict` row was ever saved.
 
 | Transition | Guard (all must hold) |
 |------------|------------------------|
-| Gate 1 → Stage 2 | Protocol exists; ≥1 search strategy; every strategy `syntax_validated`; every MeSH term `verified` against NLM MeSH |
-| Stage 2 → Gate 1.5 | ≥1 stored record; **every unique (non-duplicate) record has title/abstract decisions from both reviewers** (a human adjudication decides the verdict but never substitutes for a missing pass); PRISMA snapshot recorded, internally consistent and consistent with stored records |
+| Gate 1 → Stage 2 | Protocol exists; ≥1 search strategy; every strategy `syntax_validated`; every MeSH term `verified` against NLM MeSH; selected databases and strategies agree; **the current version is `approved` by an active enrolled reviewer whose name matches (`approved_reviewer_id`)** (Session 5) |
+| Stage 2 → Gate 1.5 | Once the search log is used (§9.7): every approved strategy has an execution, import or a reasoned "not searched" entry; no unacknowledged count discrepancy; records deduplicated after the last search/import; every record attributable to a logged run. Then: ≥1 stored record; **every unique (non-duplicate) record has title/abstract decisions from both reviewers** (a human adjudication decides the verdict but never substitutes for a missing pass); PRISMA snapshot recorded, internally consistent and consistent with stored records |
 | Gate 1.5 → Stage 3 | As above, plus 0 unresolved title/abstract disagreements; 0 unresolved possible-duplicate pairs; 0 unresolved cohort-overlap warnings; PRISMA shows 0 records awaiting screening; ≥1 record included |
 | Stage 3 → Gate 2 | **Every title/abstract-included record has a full-text manifest entry** |
 | Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, `UNOBTAINABLE` with a reason, or structured-text-only **with a human acknowledgement that no usable PDF is available**; **every linked PDF has a positive identity check** (`CONFIRMED` by the deterministic matcher or `HUMAN_CONFIRMED`; a missing check counts as unconfirmed) |
@@ -185,7 +187,8 @@ must be timezone-aware.
 * **`MeSHTerm`** — starts `verified=False`; may only be marked verified (with
   `verified_at`) after `PubMedClient.mesh_descriptor_exists()` confirms it.
 * **`SearchStrategy`** — per-database query with balanced-parentheses/quotes check,
-  date limits and filters (PRISMA-S reproducibility).
+  platform, date limits and filters (PRISMA-S reproducibility); content hash `sha256`;
+  validation method, validator and time (Session 5).
 
 ### 4.2 Stage 2 — `study.py`, `screening.py`, `cohort.py`
 * **`StudyRecord`** — one *report*. Identifiers are normalised on validation (DOI
@@ -692,7 +695,9 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
 | PRISMA diagram rendering, GRADE SoF | Not implemented |
 | Auditor | Contract (`AuditReport`) only |
-| Local UI (Streamlit, Session 4) | First usable version: projects, phase/blockers, authenticated advance and gate decisions, per-task model settings, keys, AI steps, screening queue and adjudication, PDF upload/identity, extraction accept/reject/arms, RoB approval, statistics and forest plots, usage/costs. Tested headlessly (Streamlit AppTest) on Linux; **not yet run on a Windows machine**. Not in the UI: protocol drafting, searches/imports, item corrections, study linking, double counting, analysis-plan editing (use the API/Python) |
+| Protocol editor, database selection, search execution (PubMed/Europe PMC/OpenAlex), RIS/BibTeX/CSV import, preparation for screening, search log, PRISMA derivation, PRISMA-S report (Session 5) | Implemented and tested with **mocked HTTP and synthetic export files only**; no live database call; parsers not tested on real vendor exports. Subscription-database APIs and a ClinicalTrials.gov API search are not implemented (manual import). Protocol amendments after Gate 1 and update (top-up) searches after screening has started are not supported |
+| Model discovery / "Refresh Models" (issue #9) | Not implemented (deferred from Session 5): needs official model-list calls for both providers, versioned catalogue snapshots with sources, unverified-model flags that block execution, a reviewed manual override, and the mocked acceptance scenarios listed in the issue |
+| Local UI (Streamlit, Session 4) | First usable version: projects, phase/blockers, authenticated advance and gate decisions, per-task model settings, keys, AI steps, screening queue and adjudication, PDF upload/identity, extraction accept/reject/arms, RoB approval, statistics and forest plots, usage/costs. Tested headlessly (Streamlit AppTest) on Linux; **not yet run on a Windows machine**. Session 5 adds protocol editing/approval, searches, imports, deduplication decisions and PRISMA recomputation. Not in the UI: item corrections, study linking, double counting, analysis-plan editing (use the API/Python) |
 
 ### 9.6 Real AI providers and the local UI (`src/llm`, `src/workflows`, `src/ui`) — Session 4
 
@@ -763,6 +768,69 @@ moves the state machine. New API endpoints: `GET /projects`, authenticated
 `POST /projects/{id}/advance` (non-gate transitions, guards apply), and read-only
 `/screening/{stage}/decisions`, `/extraction/ai-verifications`, `/ai/settings`,
 `/ai/usage`.
+
+### 9.7 Protocol editor, searches and imports (`src/search`) — Session 5
+
+**Protocol editor** (`protocol_editor.py`, `PUT /projects/{id}/protocol`): drafts are
+validated by `PICOProtocol` on every save. Version, status, approval fields and
+verification flags in the submitted body are discarded; MeSH terms are verified only by
+`verify_mesh()` (`PubMedClient.mesh_descriptor_exists`), strategies only by a clean API
+preview (`validation_method = api_preview` for PubMed, whose ESearch reports query errors;
+`api_accepted` for Europe PMC/OpenAlex, where a successful call is the only evidence) or an
+authenticated `human_attestation` (subscription databases, registers). A strategy is
+identified by the SHA-256 of its executable fields (database, platform, query, dates,
+languages, filters). On save, verification is carried over only for an unchanged MeSH
+descriptor or an unchanged strategy hash; changes are grouped as *eligibility*,
+*outcomes*, *search* or *administrative* material changes and returned with the list of
+invalidated items. Editing an approved protocol creates version *n*+1 as a draft (voiding
+the approval); approval (`POST /protocol/approve`) requires an enrolled reviewer and no
+`approval_blockers()`, and marks older approved versions `superseded`. Editing is allowed
+only in Stage 1. Every action is in the append-only `protocol_events` table with the full
+protocol payload.
+
+**Databases** (`databases.py`): PubMed, Europe PMC and OpenAlex are executed through the
+existing clients. Embase, Scopus, Web of Science, Cochrane CENTRAL and ClinicalTrials.gov
+are manual-import sources (subscription, institutional API entitlement, or not
+implemented). ClinicalTrials.gov is a register (PRISMA "registers" box).
+
+**Search log** (`search_runs`, append-only; `SearchRun`): previews, executions, imports,
+"not searched" declarations, acknowledgements and deduplication runs, each written after
+the event and — except previews — by an authenticated reviewer. Executions record the exact
+query (filters appended as `AND (...)`; date limits as E-utilities `datetype=pdat`
+`mindate`/`maxdate`, Europe PMC `FIRST_PDATE:[a TO b]`, OpenAlex
+`from_/to_publication_date` filters; language limits must be written into the query), the
+protocol version, the reported count, the records retrieved and stored, every raw response
+body (content-addressed, SHA-256; `api_key` removed from the recorded URL), and PubMed
+date partitions. `PubMedClient.esearch_all()` halves the publication-date range until each
+slice has ≤ 10,000 records and requires the union of distinct PMIDs to equal the total
+count, otherwise `SearchIncompleteError` (nothing saved; a `failed` attempt is logged and
+never counts as a search). Retrieved < reported is a `count_mismatch` that blocks Stage 2 →
+Gate 1.5 until acknowledged. Direct retrieval is refused above 50,000 records.
+
+**Imports** (`importers.py`): RIS (tag/value lines, continuation lines, `TY`…`ER`),
+BibTeX (nested braces, common LaTeX accents) and CSV (delimiter sniffing, header aliases,
+reviewer overrides). Only present fields are mapped; invalid identifiers are dropped with a
+warning; an entry without a title refuses the whole file, so stored records always equal
+the entries in the file. The file is stored content-addressed with its SHA-256, each raw
+entry in `search_raw_records` (append-only), and the same file cannot be imported twice.
+The count the reviewer read in the interface is compared with the records imported across
+all files of a strategy; a shortfall needs an acknowledgement.
+
+**Preparation** (`SearchService.prepare_for_screening`): resets `duplicate_of`, runs the
+existing `Deduplicator` with `exact_match_title_floor = 60` (a shared DOI/PMID with
+token-sort title similarity < 60 becomes a `DuplicateCandidate` instead of a merge; an
+unvalidated engineering threshold), stores candidates for human adjudication
+(`POST /duplicates/{id}/resolve`), records per-source identified/duplicate/unique counts
+and saves the PRISMA snapshot. It is refused once screening decisions exist or a duplicate
+pair was adjudicated, as are new searches and imports (update searches are not supported).
+Records stay *records*: duplicates of one report are linked by `duplicate_of`; reports of
+one study and overlapping cohorts are linked later (§9.3, §8.4), never merged here.
+
+**PRISMA** (`prisma_sync.derive_prisma`, `POST /prisma/recompute`): every count is derived
+from stored records, decisions and manifest rows with the same status functions as the
+guards. **PRISMA-S report** (`reporting.py`, `GET /searches/report`): databases searched
+are only those with an execution or import; selected databases without one are listed as
+not searched (with the recorded reason).
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

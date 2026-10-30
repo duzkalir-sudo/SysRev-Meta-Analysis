@@ -60,7 +60,14 @@ from src.screening import (
 from src.screening.llm_screening import adjudicate
 from src.state.repository import Repository
 from src.stats_engine.stage5 import run_stage5
-from tests.conftest import NOW, approved_rob, make_arm, make_evidence, make_protocol
+from tests.conftest import (
+    NOW,
+    approved_by,
+    approved_rob,
+    make_arm,
+    make_evidence,
+    make_protocol,
+)
 from tests.unit.test_api_clients import EPMC_RESULT, OPENALEX_WORK, esearch_json
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -112,7 +119,12 @@ async def test_full_pipeline(
     # Human rejects -> back to Stage 1, protocol revised, approved.
     decide(repo, gate(GateId.GATE_1, GateVerdict.REJECTED))
     assert repo.get_project(PID).phase == Phase.STAGE1_PROTOCOL
-    repo.save_protocol(PID, make_protocol())
+    repo.save_protocol(PID, make_protocol())  # a draft is not enough (Session 5)
+    advance(repo, Phase.GATE1_SEARCH_STRATEGY)
+    with pytest.raises(GuardViolationError, match="not been approved by an authenticated"):
+        decide(repo, gate(GateId.GATE_1))
+    decide(repo, gate(GateId.GATE_1, GateVerdict.REJECTED))
+    repo.save_protocol(PID, approved_by(REVIEWER["id"], version=2))
     advance(repo, Phase.GATE1_SEARCH_STRATEGY)
     decide(repo, gate(GateId.GATE_1))
     assert repo.get_project(PID).phase == Phase.STAGE2_SEARCH_SCREENING
@@ -507,7 +519,15 @@ def test_hitl_flow_over_http() -> None:
         assert wrong_gate.status_code == 409
 
         with app.state.session_factory() as session:
-            Repository(session).save_protocol(pid, make_protocol())
+            repo = Repository(session)
+            repo.save_protocol(pid, make_protocol())
+            session.commit()
+        draft_only = client.post(f"/projects/{pid}/gates/gate_1", json=approve, headers=auth)
+        assert draft_only.status_code == 409
+        with app.state.session_factory() as session:
+            repo = Repository(session)
+            reviewer_id = repo.list_reviewers()[0].id
+            repo.save_protocol(pid, approved_by(reviewer_id, name="Dr R", version=2))
             session.commit()
 
         ok = client.post(f"/projects/{pid}/gates/gate_1", json=approve, headers=auth)
