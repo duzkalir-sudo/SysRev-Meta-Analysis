@@ -147,7 +147,12 @@ def test_prisma_tracker_snapshot() -> None:
     assert s.reports_excluded_by_reason == {"wrong comparator": 1}
     assert s.reports_included == 2
     assert s.studies_included == 2
-    assert t.pending() == {"awaiting_retrieval_decision": 0, "awaiting_fulltext_decision": 0}
+    assert t.pending() == {
+        "awaiting_screening": 0,
+        "awaiting_retrieval_decision": 0,
+        "awaiting_fulltext_decision": 0,
+    }
+    assert s.is_final
 
 
 def test_prisma_tracker_studies_vs_reports() -> None:
@@ -159,10 +164,19 @@ def test_prisma_tracker_studies_vs_reports() -> None:
         t.snapshot()
 
 
-def test_prisma_tracker_detects_count_mismatch() -> None:
+def test_unscreened_identified_record_is_pending_not_screened() -> None:
     t = _populated_tracker()
-    t.record_identified(SourceDatabase.PUBMED, 1)  # an identified record never screened
-    with pytest.raises(PRISMAInconsistencyError, match="records_screened"):
+    t.record_identified(SourceDatabase.PUBMED, 1)  # an identified record not yet screened
+    s = t.snapshot()
+    assert s.records_screened == 6  # only completed decisions
+    assert s.records_awaiting_screening == 1
+    assert not s.is_final
+
+
+def test_more_decisions_than_records_entering_screening_is_inconsistent() -> None:
+    t = _populated_tracker()
+    t.record_duplicates_removed(1)  # now 6 decided but only 5 entered screening
+    with pytest.raises(PRISMAInconsistencyError, match="entered screening"):
         t.snapshot()
 
 
@@ -226,3 +240,94 @@ def test_prisma_redeciding_clears_downstream_state() -> None:
     s = t.snapshot()
     assert s.reports_not_retrieved == 2 and s.reports_included == 0
     assert s.is_final
+
+
+# --------------------------------------------------------------------------- partial screening
+# Regression tests for the PR #1 review: records identified but not yet screened must be
+# representable, distinct from completed screening, without corrupting final counts.
+
+
+def _identified_tracker(n: int = 10, duplicates: int = 2) -> PRISMATracker:
+    t = PRISMATracker()
+    t.record_identified(SourceDatabase.PUBMED, n - 4)
+    t.record_identified(SourceDatabase.EUROPE_PMC, 4)
+    t.record_duplicates_removed(duplicates)
+    return t
+
+
+def test_snapshot_before_any_screening() -> None:
+    s = _identified_tracker().snapshot()
+    assert (s.total_identified, s.duplicates_removed) == (10, 2)
+    assert s.records_screened == 0
+    assert s.records_awaiting_screening == 8
+    assert s.reports_sought == 0
+    assert not s.is_final
+
+
+def test_partially_screened_dataset_with_pool() -> None:
+    t = _identified_tracker()
+    pool = [f"r{i}" for i in range(8)]
+    t.register_screening_pool(pool)
+    t.record_title_abstract_decision("r0", include=True)
+    t.record_title_abstract_decision("r1", include=False)
+    t.record_title_abstract_decision("r2", include=False)
+    s = t.snapshot()
+    assert (s.records_screened, s.records_excluded, s.records_awaiting_screening) == (3, 2, 5)
+    assert s.reports_sought == 1  # only completed includes are sought
+    assert s.reports_awaiting_retrieval == 1
+    assert not s.is_final
+    assert t.pending()["awaiting_screening"] == 5
+
+
+def test_completing_screening_yields_exact_final_counts() -> None:
+    t = _identified_tracker()
+    pool = [f"r{i}" for i in range(8)]
+    t.register_screening_pool(pool)
+    for i, rid in enumerate(pool):
+        t.record_title_abstract_decision(rid, include=i < 3)
+    for rid in ("r0", "r1"):
+        t.record_retrieval(rid, retrieved=True)
+    t.record_retrieval("r2", retrieved=False)
+    t.record_fulltext_decision("r0", include=True)
+    t.record_fulltext_decision("r1", include=False, reason="no eligible outcome")
+    s = t.snapshot()
+    assert s.is_final
+    assert (s.records_screened, s.records_excluded, s.records_awaiting_screening) == (8, 5, 0)
+    assert (s.reports_sought, s.reports_not_retrieved, s.reports_assessed) == (3, 1, 2)
+    assert s.reports_excluded_by_reason == {"no eligible outcome": 1}
+    assert s.reports_included == 1
+
+
+def test_pool_rejects_unknown_records_and_size_mismatch() -> None:
+    t = _identified_tracker()
+    t.register_screening_pool(["r0", "r1"])  # 8 records entered screening, pool has 2
+    with pytest.raises(PRISMAInconsistencyError, match="not in the registered"):
+        t.record_title_abstract_decision("ghost", include=True)
+    with pytest.raises(PRISMAInconsistencyError, match="awaiting screening"):
+        t.snapshot()
+
+
+def test_pool_registration_rejects_prior_out_of_pool_decisions() -> None:
+    t = _identified_tracker()
+    t.record_title_abstract_decision("x", include=True)
+    with pytest.raises(PRISMAInconsistencyError, match="outside the pool"):
+        t.register_screening_pool(["r0"])
+
+
+def test_prisma_counts_schema_pending_screening_invariant() -> None:
+    from src.core.schemas import PRISMACounts
+
+    ok = PRISMACounts(
+        identified_by_database={SourceDatabase.PUBMED: 10},
+        records_screened=4,
+        records_awaiting_screening=6,
+        records_excluded=4,
+    )
+    assert not ok.is_final
+    with pytest.raises(ValueError, match="awaiting screening"):
+        PRISMACounts(
+            identified_by_database={SourceDatabase.PUBMED: 10},
+            records_screened=4,
+            records_awaiting_screening=5,
+            records_excluded=4,
+        )

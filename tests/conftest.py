@@ -38,14 +38,62 @@ from src.state.machine import GuardContext
 
 NOW = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
 
-# A guard context in which every precondition is satisfied.
+# A guard context in which every precondition is satisfied (every field must be explicit).
 READY = GuardContext(
     protocol_blockers=(),
     records_identified=100,
-    extraction_arms=10,
+    records_unique=80,
+    unresolved_duplicate_candidates=0,
+    ta_missing_decisions=0,
+    ta_unresolved_conflicts=0,
+    ta_included=12,
+    unresolved_cohort_warnings=0,
+    prisma_recorded=True,
+    prisma_violations=(),
+    prisma_awaiting_screening=0,
+    prisma_pending_reports=0,
+    fulltext_items_missing=0,
+    fulltext_items_blocking=0,
+    ft_missing_decisions=0,
+    ft_unresolved_conflicts=0,
+    ft_included=10,
+    included_reports_without_extraction=0,
+    arms_for_non_included_reports=0,
+    extracted_values_without_evidence=0,
+    extraction_arms=20,
+    unapproved_extraction_arms=0,
     stats_output_present=True,
     manuscript_present=True,
     audit_passed=True,
+)
+
+# What the repository reports for a freshly created project: nothing recorded yet.
+EMPTY = GuardContext(
+    protocol_blockers=("protocol not drafted",),
+    records_identified=0,
+    records_unique=0,
+    unresolved_duplicate_candidates=0,
+    ta_missing_decisions=0,
+    ta_unresolved_conflicts=0,
+    ta_included=0,
+    unresolved_cohort_warnings=0,
+    prisma_recorded=False,
+    prisma_violations=(),
+    prisma_awaiting_screening=0,
+    prisma_pending_reports=0,
+    fulltext_items_missing=0,
+    fulltext_items_blocking=0,
+    ft_missing_decisions=0,
+    ft_unresolved_conflicts=0,
+    ft_included=0,
+    included_reports_without_extraction=0,
+    arms_for_non_included_reports=0,
+    extracted_values_without_evidence=0,
+    extraction_arms=0,
+    unapproved_extraction_arms=0,
+    stats_output_present=False,
+    manuscript_present=False,
+    audit_passed=None,
 )
 
 
@@ -181,6 +229,7 @@ def make_protocol(**overrides: Any) -> PICOProtocol:
 
 
 __all__ = [
+    "EMPTY",
     "NOW",
     "READY",
     "FakeClock",

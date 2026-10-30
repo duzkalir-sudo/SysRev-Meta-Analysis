@@ -13,8 +13,19 @@ from src.core.schemas.extraction import (
     parse_reported_number,
 )
 from src.core.schemas.pipeline import GateDecision, PRISMACounts, ProjectState, StateTransition
-from src.core.schemas.protocol import MeSHTerm, OutcomeDefinition, PICOProtocol, SearchStrategy
-from src.core.schemas.screening import AgreementStatistics, ScreeningConflict, ScreeningDecision
+from src.core.schemas.protocol import (
+    FollowUpTimepoint,
+    MeSHTerm,
+    OutcomeDefinition,
+    PICOProtocol,
+    SearchStrategy,
+)
+from src.core.schemas.screening import (
+    AgreementStatistics,
+    DuplicateCandidate,
+    ScreeningConflict,
+    ScreeningDecision,
+)
 from src.core.schemas.study import Author, RecruitmentPeriod, SearchProvenance, StudyRecord
 
 __all__ = [
@@ -24,8 +35,10 @@ __all__ = [
     "CitationCheck",
     "CohortOverlapWarning",
     "DomainJudgement",
+    "DuplicateCandidate",
     "ExtractedStudyArm",
     "ExtractedValue",
+    "FollowUpTimepoint",
     "FullTextItem",
     "GateDecision",
     "MasterExtractionTable",

@@ -95,7 +95,9 @@ def test_contradicting_evidence_blocks_fuzzy_merge(
     assert result.duplicates_removed == 0
     assert len(result.possible_duplicates) == 1
     pd = result.possible_duplicates[0]
-    assert (pd.record_id_a, pd.record_id_b, pd.blocking_reason) == ("a", "b", reason)
+    assert (pd.record_id_a, pd.record_id_b) == ("a", "b")
+    assert pd.blocking_reason.startswith(reason)
+    assert pd.match_basis == "fuzzy title"
     assert pd.title_similarity == pytest.approx(100.0)
 
 
@@ -198,3 +200,100 @@ def test_threshold_controls_sensitivity() -> None:
     b = make_record("b", "Drug X lowers HbA1c in older adults: randomised trial")
     assert deduplicate([a, b], title_threshold=99.0).duplicates_removed == 0
     assert deduplicate([a, b], title_threshold=85.0).duplicates_removed == 1
+
+
+# --------------------------------------------------------------------------- identifier conflicts
+# Regression tests for the PR #1 review: exact-identifier matching must never silently merge
+# records whose other identifiers conflict, directly or through transitive chains.
+
+
+def test_shared_doi_with_conflicting_pmids_is_not_merged() -> None:
+    a = make_record("a", "Alpha trial", doi="10.5555/x", pmid="1")
+    b = make_record("b", "Beta report", doi="10.5555/x", pmid="2")
+    result = deduplicate([a, b])
+    assert result.duplicate_of == {}
+    assert result.requires_adjudication
+    [pd] = result.possible_duplicates
+    assert pd.match_basis == "exact doi (10.5555/x)"
+    assert pd.blocking_reason == "different PMIDs (1 vs 2)"
+    assert pd.title_similarity is None
+
+
+def test_shared_pmid_with_conflicting_dois_is_not_merged() -> None:
+    a = make_record("a", "T", pmid="7", doi="10.5555/a")
+    b = make_record("b", "T", pmid="7", doi="10.5555/b")
+    result = deduplicate([a, b])
+    assert result.duplicate_of == {}
+    assert result.possible_duplicates[0].blocking_reason.startswith("different DOIs")
+
+
+def test_shared_pmcid_with_conflicting_openalex_ids_is_not_merged() -> None:
+    a = make_record("a", "T one", pmcid="PMC1", openalex_id="W1")
+    b = make_record("b", "T two", pmcid="PMC1", openalex_id="W2")
+    result = deduplicate([a, b])
+    assert result.duplicate_of == {}
+    assert "OpenAlex" in result.possible_duplicates[0].blocking_reason
+
+
+def test_transitive_identifier_chain_cannot_mix_dois() -> None:
+    """a~b share a DOI, b~c share a PMID, but a and c carry different DOIs."""
+    a = make_record("a", "First title", doi="10.5555/x")
+    b = make_record("b", "Second title", doi="10.5555/x", pmid="9")
+    c = make_record("c", "Third title", doi="10.5555/y", pmid="9")
+    result = deduplicate([a, b, c])
+    for members in result.clusters().values():
+        dois = {r.doi for r in result.all_records if r.record_id in members and r.doi}
+        assert len(dois) <= 1, f"cluster {members} mixes DOIs {dois}"
+    assert result.duplicate_of == {"a": "b"}
+    [pd] = result.possible_duplicates
+    assert {pd.record_id_a, pd.record_id_b} == {"b", "c"}
+    assert pd.match_basis == "exact pmid (9)"
+
+
+def test_conflicting_anchor_does_not_prevent_compatible_merges() -> None:
+    """Three records share a DOI; a's PMID conflicts, but b and c agree and must merge."""
+    a = make_record("a", "T", doi="10.5555/x", pmid="1")
+    b = make_record("b", "T", doi="10.5555/x", pmid="2")
+    c = make_record("c", "T", doi="10.5555/x", pmid="2")
+    result = deduplicate([a, b, c])
+    assert result.duplicate_of == {"c": "b"}
+    pairs = {frozenset((p.record_id_a, p.record_id_b)) for p in result.possible_duplicates}
+    assert frozenset(("a", "b")) in pairs
+    assert all("a" in p for p in pairs)
+
+
+def test_identifier_conflict_detection_is_order_independent() -> None:
+    recs = [
+        make_record("a", "First title", doi="10.5555/x"),
+        make_record("b", "Second title", doi="10.5555/x", pmid="9"),
+        make_record("c", "Third title", doi="10.5555/y", pmid="9"),
+        make_record("d", "Fourth", doi="10.5555/y"),
+    ]
+    reference = deduplicate(recs)
+    rng = random.Random(7)
+    for _ in range(10):
+        shuffled = recs[:]
+        rng.shuffle(shuffled)
+        result = deduplicate(shuffled)
+        assert result.duplicate_of == reference.duplicate_of
+        assert {frozenset((p.record_id_a, p.record_id_b)) for p in result.possible_duplicates} == {
+            frozenset((p.record_id_a, p.record_id_b)) for p in reference.possible_duplicates
+        }
+
+
+def test_possible_duplicates_are_reported_once_per_pair() -> None:
+    # Same DOI and same PMCID, conflicting PMIDs: blocked by two identifiers, reported once.
+    a = make_record("a", "T", doi="10.5555/x", pmcid="PMC3", pmid="1")
+    b = make_record("b", "T", doi="10.5555/x", pmcid="PMC3", pmid="2")
+    result = deduplicate([a, b])
+    assert len(result.possible_duplicates) == 1
+
+
+def test_possible_duplicate_converts_to_persistable_candidate() -> None:
+    a = make_record("z", "T", doi="10.5555/x", pmid="1")
+    b = make_record("m", "T", doi="10.5555/x", pmid="2")
+    [pd] = deduplicate([a, b]).possible_duplicates
+    cand = pd.to_candidate()
+    assert (cand.record_id_a, cand.record_id_b) == ("m", "z")  # canonical order
+    assert cand.resolution == "unresolved"
+    assert not cand.is_resolved

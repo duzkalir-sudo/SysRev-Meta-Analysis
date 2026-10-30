@@ -7,7 +7,16 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from src.core.enums import ActorType, SourceDatabase, StudyDesign
+from src.core.enums import (
+    ActorType,
+    ClinicalOutcomeType,
+    ComparisonType,
+    EffectMeasure,
+    ReviewDesign,
+    SourceDatabase,
+    StudyDesign,
+    TimepointType,
+)
 from src.core.schemas.base import AwareDatetime, Identifier, NonEmptyStr, StrictModel, new_id
 
 
@@ -61,27 +70,125 @@ class SearchStrategy(StrictModel):
         return value
 
 
+class FollowUpTimepoint(StrictModel):
+    """When an outcome is assessed. Purely descriptive; no time arithmetic is performed."""
+
+    kind: TimepointType
+    value: float | None = Field(default=None, gt=0)
+    window_min: float | None = Field(default=None, ge=0)
+    window_max: float | None = Field(default=None, gt=0)
+    unit: Literal["days", "weeks", "months", "years"] | None = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> FollowUpTimepoint:
+        if self.kind == TimepointType.FIXED:
+            if self.value is None or self.unit is None:
+                raise ValueError("a fixed timepoint needs value and unit (e.g. 5 years)")
+            if self.window_min is not None or self.window_max is not None:
+                raise ValueError("a fixed timepoint cannot have a window")
+        elif self.kind == TimepointType.WINDOW:
+            if self.window_min is None or self.window_max is None or self.unit is None:
+                raise ValueError("a window timepoint needs window_min, window_max and unit")
+            if self.window_min > self.window_max:
+                raise ValueError("window_min must not exceed window_max")
+            if self.value is not None:
+                raise ValueError("a window timepoint cannot also have a fixed value")
+        elif any(v is not None for v in (self.value, self.window_min, self.window_max)):
+            raise ValueError("'last follow-up' timepoints carry no numeric time")
+        return self
+
+    @property
+    def label(self) -> str:
+        if self.kind == TimepointType.FIXED:
+            return f"{self.value:g} {self.unit}"
+        if self.kind == TimepointType.WINDOW:
+            return f"{self.window_min:g}-{self.window_max:g} {self.unit}"
+        return "last follow-up"
+
+
+# Which summary measures are valid for each (comparison, data type) combination.
+ALLOWED_MEASURES: dict[tuple[ComparisonType, str], frozenset[EffectMeasure]] = {
+    (ComparisonType.COMPARATIVE, "dichotomous"): frozenset(
+        {EffectMeasure.RR, EffectMeasure.OR, EffectMeasure.RD}
+    ),
+    (ComparisonType.COMPARATIVE, "continuous"): frozenset({EffectMeasure.MD, EffectMeasure.SMD}),
+    (ComparisonType.COMPARATIVE, "time_to_event"): frozenset({EffectMeasure.HR}),
+    (ComparisonType.COMPARATIVE, "count_rate"): frozenset({EffectMeasure.IRR}),
+    (ComparisonType.SINGLE_GROUP, "dichotomous"): frozenset({EffectMeasure.PROPORTION}),
+    (ComparisonType.SINGLE_GROUP, "continuous"): frozenset(
+        {EffectMeasure.MEAN, EffectMeasure.MEDIAN}
+    ),
+    (ComparisonType.SINGLE_GROUP, "time_to_event"): frozenset(
+        {
+            EffectMeasure.KM_PROBABILITY,
+            EffectMeasure.CUMULATIVE_INCIDENCE,
+            EffectMeasure.MEDIAN_TIME_TO_EVENT,
+        }
+    ),
+    (ComparisonType.SINGLE_GROUP, "count_rate"): frozenset({EffectMeasure.INCIDENCE_RATE}),
+}
+# Estimates defined *at* a time t (survival-type probabilities) need fixed timepoints.
+TIME_POINT_ESTIMATES = frozenset({EffectMeasure.KM_PROBABILITY, EffectMeasure.CUMULATIVE_INCIDENCE})
+
+
 class OutcomeDefinition(StrictModel):
+    """A protocol outcome.
+
+    ``data_type`` + ``comparison`` determine the admissible summary measures. A crude
+    proportion (``dichotomous`` / ``PROPORTION``, events ÷ n, censoring ignored) is a
+    different quantity from a Kaplan-Meier probability (``time_to_event`` /
+    ``KM_PROBABILITY``) or a competing-risks cumulative incidence
+    (``CUMULATIVE_INCIDENCE``); the schema keeps them apart so they cannot be pooled
+    together by accident.
+    """
+
     outcome_id: Identifier
     name: NonEmptyStr
     kind: Literal["primary", "secondary"]
-    data_type: Literal["dichotomous", "continuous", "time_to_event"]
-    preferred_effect_measure: Literal["RR", "OR", "RD", "MD", "SMD", "HR"]
-    timepoint: str | None = None
+    clinical_type: ClinicalOutcomeType = ClinicalOutcomeType.OTHER
+    definition: str | None = Field(
+        default=None, description='operational definition, e.g. "no growth >2 mm on MRI"'
+    )
+    grading_system: str | None = Field(default=None, description='e.g. "CTCAE v5.0", "BNI"')
+    data_type: Literal["dichotomous", "continuous", "time_to_event", "count_rate"]
+    comparison: ComparisonType = ComparisonType.COMPARATIVE
+    preferred_effect_measure: EffectMeasure
+    timepoints: list[FollowUpTimepoint] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _measure_matches_type(self) -> OutcomeDefinition:
-        allowed = {
-            "dichotomous": {"RR", "OR", "RD"},
-            "continuous": {"MD", "SMD"},
-            "time_to_event": {"HR"},
-        }[self.data_type]
+        allowed = ALLOWED_MEASURES[(self.comparison, self.data_type)]
         if self.preferred_effect_measure not in allowed:
             raise ValueError(
                 f"effect measure {self.preferred_effect_measure} is invalid for "
-                f"{self.data_type} outcomes (allowed: {sorted(allowed)})"
+                f"{self.comparison} {self.data_type} outcomes "
+                f"(allowed: {sorted(m.value for m in allowed)})"
+            )
+        needs_time = (
+            self.comparison == ComparisonType.SINGLE_GROUP
+            and self.preferred_effect_measure != EffectMeasure.MEDIAN_TIME_TO_EVENT
+        )
+        if needs_time and not self.timepoints:
+            raise ValueError("single-group outcomes must specify at least one follow-up timepoint")
+        if self.preferred_effect_measure in TIME_POINT_ESTIMATES and any(
+            t.kind != TimepointType.FIXED for t in self.timepoints
+        ):
+            raise ValueError(
+                f"{self.preferred_effect_measure} is an estimate at a time t: every timepoint "
+                "must be fixed (e.g. 5 years), not a window or last follow-up"
             )
         return self
+
+    @property
+    def is_safety_outcome(self) -> bool:
+        return self.clinical_type == ClinicalOutcomeType.ADVERSE_EVENT
+
+
+# Case-control sampling fixes the outcome distribution by design, so proportions and
+# incidence cannot be estimated from it; it is therefore excluded from single-arm reviews.
+SINGLE_ARM_EXCLUDED_DESIGNS = frozenset({StudyDesign.CASE_CONTROL})
+# Designs without a concurrent comparison group cannot inform a comparative review.
+NON_COMPARATIVE_DESIGNS = frozenset({StudyDesign.SINGLE_ARM_TRIAL, StudyDesign.CASE_SERIES})
 
 
 class PICOProtocol(StrictModel):
@@ -93,7 +200,10 @@ class PICOProtocol(StrictModel):
     research_question: NonEmptyStr
     population: NonEmptyStr
     intervention: NonEmptyStr
-    comparator: NonEmptyStr
+    review_design: ReviewDesign = ReviewDesign.COMPARATIVE
+    comparator: str | None = Field(
+        default=None, description="required for comparative reviews; absent for single-arm"
+    )
     outcomes: list[OutcomeDefinition] = Field(min_length=1)
     study_designs: list[StudyDesign] = Field(min_length=1)
     inclusion_criteria: list[NonEmptyStr] = Field(min_length=1)
@@ -112,6 +222,7 @@ class PICOProtocol(StrictModel):
             raise ValueError("outcome_id values must be unique")
         if not any(o.kind == "primary" for o in self.outcomes):
             raise ValueError("at least one primary outcome is required")
+        self._design_consistency()
         if self.status == "approved":
             if not (self.approved_by and self.approved_at):
                 raise ValueError("approved protocols require approved_by and approved_at")
@@ -119,6 +230,29 @@ class PICOProtocol(StrictModel):
             if problems:
                 raise ValueError("protocol cannot be approved: " + "; ".join(problems))
         return self
+
+    def _design_consistency(self) -> None:
+        designs = set(self.study_designs)
+        if self.review_design == ReviewDesign.COMPARATIVE:
+            if not (self.comparator and self.comparator.strip()):
+                raise ValueError("comparative reviews require a comparator")
+            bad = sorted(d.value for d in designs & NON_COMPARATIVE_DESIGNS)
+            if bad:
+                raise ValueError(
+                    f"designs without a comparison group in a comparative review: {bad}"
+                )
+        else:
+            if self.comparator is not None:
+                raise ValueError("single-arm reviews must not define a comparator")
+            comparative = [o.outcome_id for o in self.outcomes
+                           if o.comparison == ComparisonType.COMPARATIVE]  # fmt: skip
+            if comparative:
+                raise ValueError(
+                    f"single-arm reviews cannot have comparative outcomes: {comparative}"
+                )
+            bad = sorted(d.value for d in designs & SINGLE_ARM_EXCLUDED_DESIGNS)
+            if bad:
+                raise ValueError(f"designs that cannot estimate single-group outcomes: {bad}")
 
     def approval_blockers(self) -> list[str]:
         """Reasons the protocol is not yet ready for HITL Gate 1 approval."""

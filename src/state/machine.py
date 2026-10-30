@@ -54,23 +54,46 @@ TRANSITIONS: dict[Phase, frozenset[Phase]] = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class GuardContext:
-    """Snapshot of project facts that guards evaluate. Built by the persistence layer."""
+    """Snapshot of persisted project facts that guards evaluate.
 
-    protocol_blockers: tuple[str, ...] = ("protocol not drafted",)
-    records_identified: int = 0
-    unresolved_screening_conflicts: int = 0
-    unresolved_cohort_warnings: int = 0
-    prisma_violations: tuple[str, ...] = ()
-    prisma_pending_reports: int = 0
-    fulltext_items_blocking: int = 0
-    extracted_values_without_evidence: int = 0
-    extraction_arms: int = 0
-    unapproved_extraction_arms: int = 0
-    stats_output_present: bool = False
-    manuscript_present: bool = False
-    audit_passed: bool | None = None
+    Every field is required: there are deliberately no defaults, so a caller cannot obtain
+    a passing guard by omitting information. Production code builds this exclusively with
+    :meth:`Repository.build_guard_context`, which derives each value from stored records
+    and decisions. Absent data is reported as missing work (fail closed), never as done.
+    """
+
+    protocol_blockers: tuple[str, ...]
+    # Stage 2 — identification, deduplication, title/abstract screening
+    records_identified: int
+    records_unique: int
+    unresolved_duplicate_candidates: int
+    ta_missing_decisions: int
+    ta_unresolved_conflicts: int
+    ta_included: int
+    unresolved_cohort_warnings: int
+    # PRISMA snapshot, cross-checked against persisted records
+    prisma_recorded: bool
+    prisma_violations: tuple[str, ...]
+    prisma_awaiting_screening: int
+    prisma_pending_reports: int
+    # Stage 3 — full-text retrieval manifest
+    fulltext_items_missing: int
+    fulltext_items_blocking: int
+    # Stage 4 — full-text eligibility and extraction
+    ft_missing_decisions: int
+    ft_unresolved_conflicts: int
+    ft_included: int
+    included_reports_without_extraction: int
+    arms_for_non_included_reports: int
+    extracted_values_without_evidence: int
+    extraction_arms: int
+    unapproved_extraction_arms: int
+    # Stages 5-6
+    stats_output_present: bool
+    manuscript_present: bool
+    audit_passed: bool | None
 
 
 Guard = Callable[[GuardContext], list[str]]
@@ -80,31 +103,89 @@ def _protocol_ready(c: GuardContext) -> list[str]:
     return [f"protocol: {b}" for b in c.protocol_blockers]
 
 
-def _screening_complete(c: GuardContext) -> list[str]:
+def _prisma_recorded(c: GuardContext) -> list[str]:
+    if not c.prisma_recorded:
+        return ["PRISMA counts have not been recorded for this project"]
+    return [f"PRISMA: {p}" for p in c.prisma_violations]
+
+
+def _dual_screening_done(c: GuardContext) -> list[str]:
+    """Stage 2 → Gate 1.5: search executed, both reviewers screened every unique record."""
     v: list[str] = []
     if c.records_identified == 0:
         v.append("no records identified by the search")
-    if c.unresolved_screening_conflicts:
-        v.append(f"{c.unresolved_screening_conflicts} unresolved screening conflict(s)")
+    if c.ta_missing_decisions:
+        v.append(
+            f"{c.ta_missing_decisions} unique record(s) lack title/abstract decisions from "
+            "both reviewers"
+        )
+    v.extend(_prisma_recorded(c))
+    return v
+
+
+def _screening_complete(c: GuardContext) -> list[str]:
+    """Gate 1.5 → Stage 3: every conflict, duplicate and overlap question settled by a human."""
+    v = _dual_screening_done(c)
+    if c.ta_unresolved_conflicts:
+        v.append(f"{c.ta_unresolved_conflicts} unresolved title/abstract screening conflict(s)")
+    if c.unresolved_duplicate_candidates:
+        v.append(f"{c.unresolved_duplicate_candidates} unresolved possible-duplicate pair(s)")
     if c.unresolved_cohort_warnings:
         v.append(f"{c.unresolved_cohort_warnings} unresolved cohort-overlap warning(s)")
-    v.extend(f"PRISMA: {p}" for p in c.prisma_violations)
+    if c.prisma_recorded and c.prisma_awaiting_screening:
+        v.append(f"PRISMA: {c.prisma_awaiting_screening} record(s) still awaiting screening")
+    if c.records_identified and c.ta_included == 0 and not c.ta_missing_decisions:
+        v.append("no records were included at title/abstract screening")
+    return v
+
+
+def _manifest_complete(c: GuardContext) -> list[str]:
+    """Stage 3 → Gate 2: every title/abstract-included record has a full-text manifest entry."""
+    v: list[str] = []
+    if c.ta_included == 0:
+        v.append("no records were included at title/abstract screening")
+    if c.fulltext_items_missing:
+        v.append(f"{c.fulltext_items_missing} included record(s) have no full-text manifest entry")
     return v
 
 
 def _fulltext_resolved(c: GuardContext) -> list[str]:
+    v = _manifest_complete(c)
     if c.fulltext_items_blocking:
-        return [
+        v.append(
             f"{c.fulltext_items_blocking} report(s) still missing: upload the PDF or mark "
             "unobtainable with a reason"
-        ]
-    return []
+        )
+    return v
+
+
+def _eligibility_documented(c: GuardContext) -> list[str]:
+    v: list[str] = []
+    if c.ft_missing_decisions:
+        v.append(
+            f"{c.ft_missing_decisions} retrieved report(s) lack full-text eligibility decisions"
+        )
+    if c.ft_unresolved_conflicts:
+        v.append(f"{c.ft_unresolved_conflicts} unresolved full-text eligibility conflict(s)")
+    if c.ft_included == 0 and not c.ft_missing_decisions and not c.ft_unresolved_conflicts:
+        v.append("no reports were included after full-text assessment")
+    return v
 
 
 def _extraction_grounded(c: GuardContext) -> list[str]:
-    v: list[str] = []
+    """Stage 4 → Gate 3: eligibility documented and every included report extracted."""
+    v = _eligibility_documented(c)
     if c.extraction_arms == 0:
         v.append("no extracted study arms")
+    if c.included_reports_without_extraction:
+        v.append(
+            f"{c.included_reports_without_extraction} included report(s) have no extracted data"
+        )
+    if c.arms_for_non_included_reports:
+        v.append(
+            f"{c.arms_for_non_included_reports} extracted arm(s) belong to reports not included "
+            "at full-text assessment"
+        )
     if c.extracted_values_without_evidence:
         v.append(f"{c.extracted_values_without_evidence} extracted value(s) lack SourceEvidence")
     return v
@@ -114,9 +195,10 @@ def _extraction_approved(c: GuardContext) -> list[str]:
     v = _extraction_grounded(c)
     if c.unapproved_extraction_arms:
         v.append(f"{c.unapproved_extraction_arms} extraction arm(s) not approved by a human")
-    if c.prisma_pending_reports:
-        v.append(f"PRISMA flow not final: {c.prisma_pending_reports} report(s) awaiting decision")
-    v.extend(f"PRISMA: {p}" for p in c.prisma_violations)
+    v.extend(_prisma_recorded(c))
+    pending = c.prisma_awaiting_screening + c.prisma_pending_reports
+    if c.prisma_recorded and pending:
+        v.append(f"PRISMA flow not final: {pending} record(s)/report(s) awaiting decision")
     return v
 
 
@@ -138,10 +220,9 @@ def _audit_failed(c: GuardContext) -> list[str]:
 
 GUARDS: dict[tuple[Phase, Phase], Guard] = {
     (Phase.GATE1_SEARCH_STRATEGY, Phase.STAGE2_SEARCH_SCREENING): _protocol_ready,
-    (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS): (
-        lambda c: [] if c.records_identified else ["no records identified by the search"]
-    ),
+    (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS): _dual_screening_done,
     (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL): _screening_complete,
+    (Phase.STAGE3_FULLTEXT_RETRIEVAL, Phase.GATE2_MISSING_FULLTEXT): _manifest_complete,
     (Phase.GATE2_MISSING_FULLTEXT, Phase.STAGE4_EXTRACTION_ROB): _fulltext_resolved,
     (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL): _extraction_grounded,
     (Phase.GATE3_EXTRACTION_APPROVAL, Phase.STAGE5_META_ANALYSIS): _extraction_approved,

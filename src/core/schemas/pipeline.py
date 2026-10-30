@@ -25,6 +25,10 @@ class GateDecision(FrozenModel):
     gate: GateId
     verdict: GateVerdict
     reviewer_name: NonEmptyStr
+    reviewer_id: Identifier | None = Field(
+        default=None,
+        description="enrolled reviewer who authenticated this decision; required to persist it",
+    )
     decided_at: AwareDatetime = Field(default_factory=utc_now)
     comments: str | None = None
 
@@ -70,6 +74,8 @@ class PRISMACounts(StrictModel):
     studies_included: int = Field(default=0, ge=0)
     reports_included: int = Field(default=0, ge=0)
     # Work in progress (not PRISMA boxes): must be zero before a flow diagram is final.
+    # ``records_screened`` counts only records with a *completed* title/abstract decision.
+    records_awaiting_screening: int = Field(default=0, ge=0)
     reports_awaiting_retrieval: int = Field(default=0, ge=0)
     reports_awaiting_assessment: int = Field(default=0, ge=0)
 
@@ -94,8 +100,12 @@ class PRISMACounts(StrictModel):
 
     @property
     def is_final(self) -> bool:
-        """True when no report is still awaiting retrieval or eligibility assessment."""
-        return self.reports_awaiting_retrieval == 0 and self.reports_awaiting_assessment == 0
+        """True when no record awaits screening and no report awaits retrieval/assessment."""
+        return (
+            self.records_awaiting_screening == 0
+            and self.reports_awaiting_retrieval == 0
+            and self.reports_awaiting_assessment == 0
+        )
 
     def invariant_violations(self) -> list[str]:
         v: list[str] = []
@@ -108,10 +118,12 @@ class PRISMACounts(StrictModel):
             + self.marked_ineligible_by_automation
             + self.removed_other_reasons
         )
-        if self.records_screened != self.total_identified - removed:
+        entering_screening = self.total_identified - removed
+        if self.records_screened + self.records_awaiting_screening != entering_screening:
             v.append(
-                f"records_screened ({self.records_screened}) != identified "
-                f"({self.total_identified}) - removed before screening ({removed})"
+                f"records_screened ({self.records_screened}) + awaiting screening "
+                f"({self.records_awaiting_screening}) != identified ({self.total_identified})"
+                f" - removed before screening ({removed})"
             )
         if self.reports_sought != self.records_screened - self.records_excluded:
             v.append(

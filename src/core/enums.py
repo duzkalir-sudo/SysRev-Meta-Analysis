@@ -48,6 +48,11 @@ class SourceDatabase(StrEnum):
     MANUAL = "manual"
 
 
+class ReviewDesign(StrEnum):
+    COMPARATIVE = "comparative"
+    SINGLE_ARM = "single_arm"
+
+
 class StudyDesign(StrEnum):
     RCT = "rct"
     CLUSTER_RCT = "cluster_rct"
@@ -57,6 +62,63 @@ class StudyDesign(StrEnum):
     RETROSPECTIVE_COHORT = "retrospective_cohort"
     CASE_CONTROL = "case_control"
     CROSS_SECTIONAL = "cross_sectional"
+    SINGLE_ARM_TRIAL = "single_arm_trial"
+    CASE_SERIES = "case_series"
+
+
+class ComparisonType(StrEnum):
+    COMPARATIVE = "comparative"
+    SINGLE_GROUP = "single_group"
+
+
+class EffectMeasure(StrEnum):
+    """Summary measure an outcome is analysed on. Defines the target only; computes nothing."""
+
+    # Comparative (between groups)
+    RR = "RR"
+    OR = "OR"
+    RD = "RD"
+    MD = "MD"
+    SMD = "SMD"
+    HR = "HR"
+    IRR = "IRR"
+    # Single group
+    PROPORTION = "PROPORTION"  # crude events / n, ignores censoring
+    KM_PROBABILITY = "KM_PROBABILITY"  # Kaplan-Meier (or actuarial) probability at time t
+    CUMULATIVE_INCIDENCE = "CUMULATIVE_INCIDENCE"  # competing-risks cumulative incidence at t
+    MEDIAN_TIME_TO_EVENT = "MEDIAN_TIME_TO_EVENT"
+    INCIDENCE_RATE = "INCIDENCE_RATE"  # events per person-time
+    MEAN = "MEAN"
+    MEDIAN = "MEDIAN"
+
+
+class ClinicalOutcomeType(StrEnum):
+    TUMOR_CONTROL = "tumor_control"
+    AVM_OBLITERATION = "avm_obliteration"
+    PAIN_RELIEF = "pain_relief"
+    HEARING_PRESERVATION = "hearing_preservation"
+    ADVERSE_EVENT = "adverse_event"
+    OVERALL_SURVIVAL = "overall_survival"
+    PROGRESSION_FREE_SURVIVAL = "progression_free_survival"
+    FUNCTIONAL_OUTCOME = "functional_outcome"
+    OTHER = "other"
+
+
+class TimepointType(StrEnum):
+    FIXED = "fixed"  # e.g. at 5 years
+    WINDOW = "window"  # e.g. between 24 and 36 months
+    LAST_FOLLOW_UP = "last_follow_up"  # at each patient's last follow-up (variable)
+
+
+class EstimateType(StrEnum):
+    """How a study-reported arm-level estimate was derived (as stated by the authors)."""
+
+    CRUDE_PROPORTION = "crude_proportion"
+    KAPLAN_MEIER = "kaplan_meier"
+    ACTUARIAL_LIFE_TABLE = "actuarial_life_table"
+    CUMULATIVE_INCIDENCE = "cumulative_incidence"  # competing-risks estimator
+    INCIDENCE_RATE = "incidence_rate"
+    MEDIAN_TIME_TO_EVENT = "median_time_to_event"
 
 
 class ScreeningStage(StrEnum):
@@ -79,6 +141,7 @@ class ReviewerRole(StrEnum):
 class ArmRole(StrEnum):
     INTERVENTION = "intervention"
     CONTROL = "control"
+    SINGLE_GROUP = "single_group"
     OTHER = "other"
 
 

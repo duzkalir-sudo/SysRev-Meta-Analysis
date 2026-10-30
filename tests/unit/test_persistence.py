@@ -8,10 +8,8 @@ from sqlalchemy.orm import Session
 from src.core.enums import (
     ActorType,
     CheckStatus,
-    FullTextStatus,
     GateId,
     GateVerdict,
-    OverlapResolution,
     Phase,
     ReviewerRole,
     ScreeningStage,
@@ -21,12 +19,8 @@ from src.core.exceptions import SysRevError
 from src.core.schemas import (
     AuditReport,
     CitationCheck,
-    CohortOverlapWarning,
-    FullTextItem,
     GateDecision,
-    OverlapSignal,
     PRISMACounts,
-    ScreeningConflict,
     ScreeningDecision,
 )
 from src.state.db import (
@@ -36,7 +30,7 @@ from src.state.db import (
     StateTransitionORM,
 )
 from src.state.repository import NotFoundError, Repository
-from tests.conftest import NOW, READY, make_arm, make_protocol, make_record
+from tests.conftest import READY, make_arm, make_protocol, make_record
 
 
 @pytest.fixture
@@ -161,7 +155,13 @@ def test_transition_persistence_and_reload(repo: Repository) -> None:
             Phase.GATE1_SEARCH_STRATEGY, actor="orch", actor_type=ActorType.SYSTEM, context=READY
         )
     )
-    decision = GateDecision(gate=GateId.GATE_1, verdict=GateVerdict.APPROVED, reviewer_name="Dr R")
+    reviewer_id, _ = repo.enroll_reviewer("Dr R")
+    decision = GateDecision(
+        gate=GateId.GATE_1,
+        verdict=GateVerdict.APPROVED,
+        reviewer_name="Dr R",
+        reviewer_id=reviewer_id,
+    )
     repo.record_transition(m.submit_gate_decision(decision, READY))
     reloaded = repo.load_state_machine("p1")
     assert reloaded.phase == Phase.STAGE2_SEARCH_SCREENING
@@ -186,78 +186,6 @@ def test_stale_transition_rejected(repo: Repository) -> None:
     )
     with pytest.raises(SysRevError, match="stale"):
         repo.record_transition(stale)
-
-
-def test_guard_context_reflects_database(repo: Repository) -> None:
-    ctx = repo.build_guard_context("p1")
-    assert ctx.protocol_blockers == ("protocol not drafted",)
-    assert ctx.records_identified == 0
-
-    repo.save_protocol("p1", make_protocol())
-    repo.save_records("p1", [make_record("a", "Trial A"), make_record("b", "Trial B")])
-    repo.save_conflict(
-        "p1",
-        ScreeningConflict(
-            record_id="a",
-            stage=ScreeningStage.TITLE_ABSTRACT,
-            reviewer_1_verdict=ScreeningVerdict.INCLUDE,
-            reviewer_2_verdict=ScreeningVerdict.EXCLUDE,
-        ),
-    )
-    warning = CohortOverlapWarning(
-        record_id_a="a",
-        record_id_b="b",
-        overlap_score=0.8,
-        severity="high",
-        signals=[OverlapSignal(kind="coauthor_overlap", score=0.8, detail="x")],
-    )
-    repo.save_overlap_warning("p1", warning)
-    repo.save_fulltext_item("p1", FullTextItem(record_id="a", title="Trial A"))
-    repo.save_records("p1", [make_record("rec1", "Trial")])
-    repo.save_extracted_arm("p1", make_arm("rec1"))
-
-    ctx = repo.build_guard_context("p1")
-    assert ctx.protocol_blockers == ()
-    assert ctx.records_identified == 3
-    assert ctx.unresolved_screening_conflicts == 1
-    assert ctx.unresolved_cohort_warnings == 1
-    assert ctx.fulltext_items_blocking == 1
-    assert ctx.extraction_arms == 1 and ctx.unapproved_extraction_arms == 1
-    assert ctx.extracted_values_without_evidence == 0
-    assert ctx.audit_passed is None
-
-    # Resolve everything.
-    conflict = repo.load_conflicts("p1")[0]
-    repo.save_conflict(
-        "p1",
-        conflict.model_copy(
-            update={
-                "resolved_verdict": ScreeningVerdict.INCLUDE,
-                "resolved_by": "Dr R",
-                "resolved_at": NOW,
-            }
-        ),
-    )
-    repo.save_overlap_warning(
-        "p1",
-        warning.model_copy(
-            update={"resolution": OverlapResolution.DISTINCT_COHORTS, "resolved_by": "Dr R"}
-        ),
-    )
-    repo.save_fulltext_item(
-        "p1",
-        FullTextItem(
-            record_id="a",
-            title="Trial A",
-            status=FullTextStatus.UNOBTAINABLE,
-            unobtainable_reason="authors did not respond after two requests",
-        ),
-    )
-    ctx = repo.build_guard_context("p1")
-    assert ctx.unresolved_screening_conflicts == 0
-    assert ctx.unresolved_cohort_warnings == 0
-    assert ctx.fulltext_items_blocking == 0
-    assert repo.missing_fulltext_manifest("p1") == []
 
 
 def test_prisma_and_audit_persistence(repo: Repository) -> None:

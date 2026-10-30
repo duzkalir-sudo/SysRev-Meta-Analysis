@@ -6,14 +6,23 @@ hand-edited rows fail loudly instead of propagating into the analysis.
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
-from src.core.enums import FullTextStatus, OverlapResolution, Phase
+from src.core.enums import (
+    FullTextStatus,
+    OverlapResolution,
+    Phase,
+    ScreeningStage,
+    ScreeningVerdict,
+)
 from src.core.exceptions import SysRevError
 from src.core.schemas import (
     AuditReport,
     CohortOverlapWarning,
+    DuplicateCandidate,
     ExtractedStudyArm,
     ExtractedValue,
     FullTextItem,
@@ -28,15 +37,26 @@ from src.core.schemas import (
     StudyRecord,
 )
 from src.core.schemas.base import utc_now
+from src.core.security import (
+    format_token,
+    generate_secret,
+    hash_secret,
+    new_salt,
+    parse_token,
+    verify_secret,
+)
+from src.screening.agreement import screening_status
 from src.state.db import (
     AuditReportORM,
     CohortOverlapWarningORM,
+    DuplicateCandidateORM,
     ExtractedArmORM,
     ExtractedValueORM,
     FullTextItemORM,
     GateDecisionORM,
     ProjectORM,
     ProtocolORM,
+    ReviewerORM,
     RiskOfBiasORM,
     ScreeningConflictORM,
     ScreeningDecisionORM,
@@ -84,6 +104,7 @@ class Repository:
             )
         gate_id = None
         if transition.gate_decision is not None:
+            self._require_enrolled_reviewer(transition.gate_decision)
             gate_id = self.save_gate_decision(transition.project_id, transition.gate_decision)
         self.session.add(
             StateTransitionORM(
@@ -118,6 +139,7 @@ class Repository:
                     gate=g.gate,  # type: ignore[arg-type]
                     verdict=g.verdict,  # type: ignore[arg-type]
                     reviewer_name=g.reviewer_name,
+                    reviewer_id=g.reviewer_id,
                     comments=g.comments,
                     decided_at=g.decided_at,
                 )
@@ -136,13 +158,67 @@ class Repository:
             )
         return result
 
+    # ------------------------------------------------------------------ reviewers
+    def enroll_reviewer(self, display_name: str) -> tuple[str, str]:
+        """Create a reviewer and return ``(reviewer_id, token)``. The token is not stored."""
+        name = display_name.strip()
+        if not name:
+            raise ValueError("display_name must not be empty")
+        reviewer_id = uuid.uuid4().hex
+        secret, salt = generate_secret(), new_salt()
+        self.session.add(
+            ReviewerORM(
+                id=reviewer_id,
+                display_name=name,
+                salt=salt,
+                token_hash=hash_secret(secret, salt),
+            )
+        )
+        self.session.flush()
+        return reviewer_id, format_token(reviewer_id, secret)
+
+    def authenticate_reviewer(self, token: str) -> ReviewerORM | None:
+        """Return the active reviewer owning ``token``, or ``None``."""
+        parsed = parse_token(token)
+        if parsed is None:
+            return None
+        reviewer_id, secret = parsed
+        row = self.session.get(ReviewerORM, reviewer_id)
+        if row is None or row.revoked_at is not None:
+            return None
+        return row if verify_secret(secret, row.salt, row.token_hash) else None
+
+    def revoke_reviewer(self, reviewer_id: str) -> None:
+        row = self.session.get(ReviewerORM, reviewer_id)
+        if row is None:
+            raise NotFoundError(f"reviewer {reviewer_id} not found")
+        if row.revoked_at is None:
+            row.revoked_at = utc_now()
+            self.session.flush()
+
+    def list_reviewers(self) -> list[ReviewerORM]:
+        return list(self.session.scalars(select(ReviewerORM).order_by(ReviewerORM.created_at)))
+
+    def _require_enrolled_reviewer(self, decision: GateDecision) -> None:
+        """A gate decision may only be persisted for an active, enrolled reviewer."""
+        if decision.reviewer_id is None:
+            raise SysRevError("gate decisions must be authenticated by an enrolled reviewer")
+        row = self.session.get(ReviewerORM, decision.reviewer_id)
+        if row is None or row.revoked_at is not None:
+            raise SysRevError(f"reviewer {decision.reviewer_id} is not enrolled or was revoked")
+        if row.display_name != decision.reviewer_name:
+            raise SysRevError("reviewer_name does not match the enrolled reviewer")
+
     def save_gate_decision(self, project_id: str, decision: GateDecision) -> str:
+        if decision.reviewer_id is None:
+            raise SysRevError("gate decisions must be authenticated by an enrolled reviewer")
         self.session.add(
             GateDecisionORM(
                 id=decision.decision_id,
                 project_id=project_id,
                 gate=decision.gate.value,
                 verdict=decision.verdict.value,
+                reviewer_id=decision.reviewer_id,
                 reviewer_name=decision.reviewer_name,
                 comments=decision.comments,
                 decided_at=decision.decided_at,
@@ -259,6 +335,86 @@ class Repository:
         ).all()
         return [ScreeningConflict.model_validate(r.payload) for r in rows]
 
+    # ------------------------------------------------------------------ duplicate candidates
+    def save_duplicate_candidate(self, project_id: str, candidate: DuplicateCandidate) -> None:
+        self.session.merge(
+            DuplicateCandidateORM(
+                id=candidate.candidate_id,
+                project_id=project_id,
+                record_id_a=candidate.record_id_a,
+                record_id_b=candidate.record_id_b,
+                resolution=candidate.resolution,
+                payload=candidate.model_dump(mode="json"),
+            )
+        )
+        self.session.flush()
+
+    def load_duplicate_candidates(self, project_id: str) -> list[DuplicateCandidate]:
+        rows = self.session.scalars(
+            select(DuplicateCandidateORM)
+            .where(DuplicateCandidateORM.project_id == project_id)
+            .order_by(DuplicateCandidateORM.record_id_a, DuplicateCandidateORM.record_id_b)
+        ).all()
+        return [DuplicateCandidate.model_validate(r.payload) for r in rows]
+
+    def resolve_duplicate_candidate(
+        self,
+        project_id: str,
+        candidate_id: str,
+        *,
+        resolution: str,
+        resolved_by: str,
+        note: str | None = None,
+    ) -> DuplicateCandidate:
+        """Record a human adjudication; ``duplicate_keep_*`` re-points the dropped cluster.
+
+        The caller remains responsible for updating PRISMA ``duplicates_removed``; the guard
+        cross-check rejects the PRISMA snapshot until it matches the stored records.
+        """
+        row = self.session.get(DuplicateCandidateORM, candidate_id)
+        if row is None or row.project_id != project_id:
+            raise NotFoundError(f"duplicate candidate {candidate_id} not found")
+        resolved = DuplicateCandidate.model_validate(
+            row.payload
+            | {
+                "resolution": resolution,
+                "resolved_by": resolved_by,
+                "resolved_at": utc_now(),
+                "resolution_note": note,
+            }
+        )
+        if resolution in ("duplicate_keep_a", "duplicate_keep_b"):
+            keep, drop = (
+                (resolved.record_id_a, resolved.record_id_b)
+                if resolution == "duplicate_keep_a"
+                else (resolved.record_id_b, resolved.record_id_a)
+            )
+            self._merge_clusters(project_id, keep=keep, drop=drop)
+        self.save_duplicate_candidate(project_id, resolved)
+        return resolved
+
+    def _merge_clusters(self, project_id: str, *, keep: str, drop: str) -> None:
+        def representative(record_id: str) -> str:
+            row = self.session.get(StudyRecordORM, record_id)
+            if row is None or row.project_id != project_id:
+                raise NotFoundError(f"record {record_id} not found")
+            return row.duplicate_of or row.id
+
+        keep_rep, drop_rep = representative(keep), representative(drop)
+        if keep_rep == drop_rep:
+            return
+        rows = self.session.scalars(
+            select(StudyRecordORM).where(
+                StudyRecordORM.project_id == project_id,
+                (StudyRecordORM.id == drop_rep) | (StudyRecordORM.duplicate_of == drop_rep),
+            )
+        ).all()
+        for row in rows:
+            record = StudyRecord.model_validate(row.payload | {"duplicate_of": keep_rep})
+            row.duplicate_of = keep_rep
+            row.payload = record.model_dump(mode="json")
+        self.session.flush()
+
     # ------------------------------------------------------------------ cohort overlap
     def save_overlap_warning(self, project_id: str, warning: CohortOverlapWarning) -> None:
         self.session.merge(
@@ -322,6 +478,10 @@ class Repository:
             arm_label=arm.arm_label,
             arm_role=arm.arm_role.value,
             timepoint=arm.timepoint,
+            estimate_type=arm.estimate_type.value if arm.estimate_type else None,
+            estimate_scale=arm.estimate_scale,
+            ci_level=arm.ci_level,
+            follow_up=arm.follow_up.model_dump(mode="json") if arm.follow_up else None,
             approved_by_human=arm.approved_by_human,
             approved_by=arm.approved_by,
             approved_at=arm.approved_at,
@@ -409,6 +569,10 @@ class Repository:
             "arm_label": row.arm_label,
             "arm_role": row.arm_role,
             "timepoint": row.timepoint,
+            "estimate_type": row.estimate_type,
+            "estimate_scale": row.estimate_scale,
+            "ci_level": row.ci_level,
+            "follow_up": row.follow_up,
             "approved_by_human": row.approved_by_human,
             "approved_by": row.approved_by,
             "approved_at": row.approved_at,
@@ -460,7 +624,7 @@ class Repository:
 
     # ------------------------------------------------------------------ guards
     def build_guard_context(self, project_id: str) -> GuardContext:
-        """Compute the facts that state-machine guards evaluate, directly from the database."""
+        """Derive every guard fact from persisted rows. Missing data counts as missing work."""
         project = self.get_project(project_id)
         protocol = self.latest_protocol(project_id)
         protocol_blockers = (
@@ -470,17 +634,24 @@ class Repository:
         def count(stmt: Select[int]) -> int:
             return int(self.session.scalar(stmt) or 0)
 
-        records = count(
+        # ---- Stage 2: records, duplicates, title/abstract screening
+        record_rows = self.session.execute(
+            select(StudyRecordORM.id, StudyRecordORM.duplicate_of).where(
+                StudyRecordORM.project_id == project_id
+            )
+        ).all()
+        unique_ids = {rid for rid, dup in record_rows if dup is None}
+        decisions = self.load_screening_decisions(project_id)
+        conflicts = self.load_conflicts(project_id)
+        ta = screening_status(unique_ids, decisions, conflicts, ScreeningStage.TITLE_ABSTRACT)
+        ta_included = ta.ids_with(ScreeningVerdict.INCLUDE)
+
+        unresolved_duplicates = count(
             select(func.count())
-            .select_from(StudyRecordORM)
-            .where(StudyRecordORM.project_id == project_id)
-        )
-        conflicts = count(
-            select(func.count())
-            .select_from(ScreeningConflictORM)
+            .select_from(DuplicateCandidateORM)
             .where(
-                ScreeningConflictORM.project_id == project_id,
-                ScreeningConflictORM.resolved_verdict.is_(None),
+                DuplicateCandidateORM.project_id == project_id,
+                DuplicateCandidateORM.resolution == "unresolved",
             )
         )
         warnings = count(
@@ -491,20 +662,36 @@ class Repository:
                 CohortOverlapWarningORM.resolution == OverlapResolution.UNRESOLVED.value,
             )
         )
-        fulltext_blocking = len(self.missing_fulltext_manifest(project_id))
-        arms = count(
-            select(func.count())
-            .select_from(ExtractedArmORM)
-            .where(ExtractedArmORM.project_id == project_id)
+
+        # ---- Stage 3: full-text manifest (only title/abstract-included records matter)
+        manifest = dict(
+            self.session.execute(
+                select(FullTextItemORM.record_id, FullTextItemORM.status).where(
+                    FullTextItemORM.project_id == project_id
+                )
+            ).all()
         )
-        unapproved = count(
-            select(func.count())
-            .select_from(ExtractedArmORM)
-            .where(
-                ExtractedArmORM.project_id == project_id,
-                ExtractedArmORM.approved_by_human.is_(False),
+        blocking_statuses = {FullTextStatus.PENDING.value, FullTextStatus.MISSING.value}
+        retrieved_statuses = {
+            FullTextStatus.OA_DOWNLOADED.value,
+            FullTextStatus.USER_UPLOADED.value,
+        }
+        fulltext_missing = len(ta_included - set(manifest))
+        fulltext_blocking = sum(1 for st in manifest.values() if st in blocking_statuses)
+        retrieved = {rid for rid in ta_included if manifest.get(rid) in retrieved_statuses}
+        unobtainable = {
+            rid for rid in ta_included if manifest.get(rid) == FullTextStatus.UNOBTAINABLE.value
+        }
+
+        # ---- Stage 4: full-text eligibility and extraction
+        ft = screening_status(retrieved, decisions, conflicts, ScreeningStage.FULL_TEXT)
+        ft_included = ft.ids_with(ScreeningVerdict.INCLUDE)
+        arm_rows = self.session.execute(
+            select(ExtractedArmORM.record_id, ExtractedArmORM.approved_by_human).where(
+                ExtractedArmORM.project_id == project_id
             )
-        )
+        ).all()
+        arm_records = {rid for rid, _ in arm_rows}
         # Defence in depth: the NOT NULL FK already forbids this; count anyway.
         no_evidence = count(
             select(func.count())
@@ -515,23 +702,69 @@ class Repository:
                 ExtractedValueORM.evidence_id.is_(None),
             )
         )
+
+        # ---- PRISMA snapshot cross-checked against the persisted facts above
         prisma = self.load_prisma(project_id)
+        prisma_violations: list[str] = []
+        if prisma is not None:
+            prisma_violations = prisma.invariant_violations()
+            expected = {
+                "total_identified": len(record_rows),
+                "duplicates_removed": len(record_rows) - len(unique_ids),
+                "records_screened": len(ta.final),
+                "records_excluded": len(ta.ids_with(ScreeningVerdict.EXCLUDE)),
+                "records_awaiting_screening": len(ta.missing) + len(ta.unresolved),
+                "reports_not_retrieved": len(unobtainable),
+                "reports_assessed": len(retrieved),
+                "reports_included": len(ft_included),
+            }
+            for name, value in expected.items():
+                actual = getattr(prisma, name)
+                if actual != value:
+                    prisma_violations.append(
+                        f"{name} is {actual} but persisted records imply {value}"
+                    )
+            ft_excluded = len(ft.ids_with(ScreeningVerdict.EXCLUDE))
+            if sum(prisma.reports_excluded_by_reason.values()) != ft_excluded:
+                prisma_violations.append(
+                    f"reports excluded with reasons sum to "
+                    f"{sum(prisma.reports_excluded_by_reason.values())} but {ft_excluded} "
+                    "full-text exclusions are recorded"
+                )
+            if prisma.marked_ineligible_by_automation or prisma.removed_other_reasons:
+                prisma_violations.append(
+                    "removals other than duplicates cannot yet be verified against persisted "
+                    "records"
+                )
+
         audit = self.latest_audit_report(project_id)
         return GuardContext(
             protocol_blockers=protocol_blockers,
-            records_identified=records,
-            unresolved_screening_conflicts=conflicts,
+            records_identified=len(record_rows),
+            records_unique=len(unique_ids),
+            unresolved_duplicate_candidates=unresolved_duplicates,
+            ta_missing_decisions=len(ta.missing),
+            ta_unresolved_conflicts=len(ta.unresolved),
+            ta_included=len(ta_included),
             unresolved_cohort_warnings=warnings,
-            prisma_violations=tuple(prisma.invariant_violations()) if prisma else (),
+            prisma_recorded=prisma is not None,
+            prisma_violations=tuple(prisma_violations),
+            prisma_awaiting_screening=prisma.records_awaiting_screening if prisma else 0,
             prisma_pending_reports=(
                 prisma.reports_awaiting_retrieval + prisma.reports_awaiting_assessment
                 if prisma
                 else 0
             ),
+            fulltext_items_missing=fulltext_missing,
             fulltext_items_blocking=fulltext_blocking,
+            ft_missing_decisions=len(ft.missing),
+            ft_unresolved_conflicts=len(ft.unresolved),
+            ft_included=len(ft_included),
+            included_reports_without_extraction=len(ft_included - arm_records),
+            arms_for_non_included_reports=sum(1 for rid, _ in arm_rows if rid not in ft_included),
             extracted_values_without_evidence=no_evidence,
-            extraction_arms=arms,
-            unapproved_extraction_arms=unapproved,
+            extraction_arms=len(arm_rows),
+            unapproved_extraction_arms=sum(1 for _, approved in arm_rows if not approved),
             stats_output_present=project.stats_output_sha256 is not None,
             manuscript_present=project.manuscript_version is not None,
             audit_passed=None if audit is None else audit.passed,

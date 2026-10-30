@@ -12,9 +12,11 @@ from pydantic import Field, field_validator, model_validator
 from src.core.enums import (
     ActorType,
     ArmRole,
+    EstimateType,
     EvidenceLocationType,
     FullTextStatus,
     RoBTool,
+    TimepointType,
 )
 from src.core.schemas.base import (
     DOI,
@@ -27,6 +29,7 @@ from src.core.schemas.base import (
     new_id,
     utc_now,
 )
+from src.core.schemas.protocol import FollowUpTimepoint
 
 # --------------------------------------------------------------------------- #
 # Stage 3 — full-text retrieval manifest
@@ -169,12 +172,46 @@ _NUMERIC_FIELDS = (
     "q3",
     "minimum",
     "maximum",
+    "reported_estimate",
+    "ci_lower",
+    "ci_upper",
+    "n_at_risk",
+    "follow_up_median",
+    "person_time",
 )
-_COUNT_FIELDS = ("n_randomized", "n_analyzed", "events")
+_COUNT_FIELDS = ("n_randomized", "n_analyzed", "events", "n_at_risk")
+_SAMPLE_SIZE_FIELDS = frozenset({"n_randomized", "n_analyzed", "n_at_risk", "follow_up_median"})
+# Estimates on a probability scale (bounded by 0-1 or 0-100 %).
+PROBABILITY_ESTIMATES = frozenset(
+    {
+        EstimateType.CRUDE_PROPORTION,
+        EstimateType.KAPLAN_MEIER,
+        EstimateType.ACTUARIAL_LIFE_TABLE,
+        EstimateType.CUMULATIVE_INCIDENCE,
+    }
+)
+# Estimates defined at a specific time t (require a fixed timepoint).
+TIME_T_ESTIMATES = frozenset(
+    {
+        EstimateType.KAPLAN_MEIER,
+        EstimateType.ACTUARIAL_LIFE_TABLE,
+        EstimateType.CUMULATIVE_INCIDENCE,
+    }
+)
 
 
 class ExtractedStudyArm(StrictModel):
-    """Arm-level outcome data for one study, outcome and timepoint."""
+    """Arm-level outcome data for one study, outcome and timepoint.
+
+    Comparative arms use ``arm_role`` intervention/control; single-arm studies and case
+    series use ``single_group``. For non-randomised studies ``n_randomized`` holds the
+    number enrolled.
+
+    Raw counts (``events`` / ``n_analyzed``) and an author-reported summary
+    (``reported_estimate`` + ``estimate_type``) are separate fields: a Kaplan-Meier
+    5-year tumour-control probability is never stored as, or inferred from, a crude
+    proportion. Nothing here is computed; every number is a verbatim extraction.
+    """
 
     arm_id: Identifier = Field(default_factory=new_id)
     record_id: Identifier
@@ -195,6 +232,18 @@ class ExtractedStudyArm(StrictModel):
     minimum: ExtractedValue | None = None
     maximum: ExtractedValue | None = None
 
+    # Author-reported summary estimate (e.g. "5-year actuarial control 92.3% (95% CI ...)")
+    estimate_type: EstimateType | None = None
+    estimate_scale: Literal["percent", "proportion"] | None = None
+    reported_estimate: ExtractedValue | None = None
+    ci_lower: ExtractedValue | None = None
+    ci_upper: ExtractedValue | None = None
+    ci_level: float | None = Field(default=None, gt=0, lt=100, description="e.g. 95")
+    follow_up: FollowUpTimepoint | None = None
+    n_at_risk: ExtractedValue | None = None
+    follow_up_median: ExtractedValue | None = None
+    person_time: ExtractedValue | None = None
+
     approved_by_human: bool = False
     approved_by: str | None = None
     approved_at: AwareDatetime | None = None
@@ -213,14 +262,16 @@ class ExtractedStudyArm(StrictModel):
     @model_validator(mode="after")
     def _plausibility(self) -> ExtractedStudyArm:
         values = self.extracted_values()
-        outcome_fields = set(values) - {"n_randomized", "n_analyzed"}
+        outcome_fields = set(values) - _SAMPLE_SIZE_FIELDS
         if not outcome_fields:
-            raise ValueError("an arm needs at least one outcome datum (events, mean, median, ...)")
+            raise ValueError(
+                "an arm needs at least one outcome datum (events, mean, median, estimate, ...)"
+            )
         for name in _COUNT_FIELDS:
             v = self._num(name)
             if v is not None and (v < 0 or not float(v).is_integer()):
                 raise ValueError(f"{name} must be a non-negative integer count")
-        for name in ("sd", "se"):
+        for name in ("sd", "se", "follow_up_median", "person_time"):
             v = self._num(name)
             if v is not None and v < 0:
                 raise ValueError(f"{name} must be non-negative")
@@ -233,6 +284,10 @@ class ExtractedStudyArm(StrictModel):
             raise ValueError("events cannot exceed n_analyzed")
         if n_an is not None and n_rand is not None and n_an > n_rand:
             raise ValueError("n_analyzed cannot exceed n_randomized")
+        at_risk = self._num("n_at_risk")
+        if at_risk is not None and n_an is not None and at_risk > n_an:
+            raise ValueError("n_at_risk cannot exceed n_analyzed")
+        self._validate_reported_estimate()
         ordered = [
             (k, x)
             for k in ("minimum", "q1", "median", "q3", "maximum")
@@ -244,6 +299,48 @@ class ExtractedStudyArm(StrictModel):
         if self.approved_by_human and not (self.approved_by and self.approved_at):
             raise ValueError("human approval requires approved_by and approved_at")
         return self
+
+    def _validate_reported_estimate(self) -> None:
+        est = self.reported_estimate
+        if (est is None) != (self.estimate_type is None):
+            raise ValueError("reported_estimate and estimate_type must be given together")
+        has_ci = self.ci_lower is not None or self.ci_upper is not None
+        if has_ci:
+            if est is None or self.ci_lower is None or self.ci_upper is None:
+                raise ValueError("a confidence interval needs both bounds and a reported_estimate")
+            if self.ci_level is None:
+                raise ValueError("ci_level is required with a confidence interval (e.g. 95)")
+            if not self.ci_lower.value <= est.value <= self.ci_upper.value:
+                raise ValueError("reported_estimate must lie within its confidence interval")
+        elif self.ci_level is not None:
+            raise ValueError("ci_level given without a confidence interval")
+        if est is None or self.estimate_type is None:
+            if self.estimate_scale is not None:
+                raise ValueError("estimate_scale is only meaningful with a reported_estimate")
+            return
+        etype = self.estimate_type
+        if etype in PROBABILITY_ESTIMATES:
+            if self.estimate_scale is None:
+                raise ValueError(f"{etype} estimates need estimate_scale (percent or proportion)")
+            upper = 100.0 if self.estimate_scale == "percent" else 1.0
+            for name in ("reported_estimate", "ci_lower", "ci_upper"):
+                v = self._num(name)
+                if v is not None and not 0.0 <= v <= upper:
+                    raise ValueError(f"{name} {v} is outside 0-{upper:g} for {etype}")
+        elif self.estimate_scale is not None:
+            raise ValueError(f"estimate_scale does not apply to {etype}")
+        if self.follow_up is None and etype != EstimateType.MEDIAN_TIME_TO_EVENT:
+            raise ValueError(f"{etype} estimates need the follow_up timepoint they refer to")
+        if etype in TIME_T_ESTIMATES and (
+            self.follow_up is None or self.follow_up.kind != TimepointType.FIXED
+        ):
+            raise ValueError(
+                f"{etype} is a probability at a time t: follow_up must be a fixed timepoint"
+            )
+        if etype in (EstimateType.INCIDENCE_RATE, EstimateType.MEDIAN_TIME_TO_EVENT) and not (
+            est.unit
+        ):
+            raise ValueError(f"{etype} estimates need a unit (e.g. per 100 person-years, months)")
 
 
 # --------------------------------------------------------------------------- #

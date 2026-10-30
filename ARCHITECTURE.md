@@ -13,7 +13,7 @@ implemented today and what is not.
 |---|-----------|----------------------|
 | G1 | **Zero fabrication of literature.** Bibliographic records come only from deterministic API clients (PubMed E-utilities, Europe PMC, OpenAlex, Crossref) or user-uploaded PDFs. An LLM never writes a citation, identifier or study datum from its weights. | `src/apis/*` build `StudyRecord`s only from fields present in API responses. Invalid identifiers are **dropped, never "repaired"**. Each record carries a `SearchProvenance` (database, query, endpoint, timestamp, reported hit count). |
 | G2 | **Zero LLM arithmetic.** Effect sizes, pooled estimates, heterogeneity, bias tests and Median/IQR→Mean/SD conversions are computed by deterministic code. | `ExtractedValue` rejects any value that is not literally the number printed in its `verbatim_quote` (§4.3). Derived numbers can only originate from `src/stats_engine` (planned). The Auditor cross-checks manuscript numbers against `stats_output.json`. |
-| G3 | **Humans own every gate.** The pipeline cannot pass a HITL gate without a recorded human decision. | `PipelineStateMachine` refuses gate exits unless `actor_type == HUMAN` and a matching `GateDecision` is supplied (§3). |
+| G3 | **Humans own every gate.** The pipeline cannot pass a HITL gate without a recorded, authenticated human decision. | `PipelineStateMachine` refuses gate exits unless `actor_type == HUMAN` and a matching `GateDecision` is supplied (§3). The HTTP gate endpoint requires an enrolled reviewer's bearer token, and the repository refuses to persist a gate decision without an active enrolled reviewer (§6). |
 | G4 | **Append-only audit trail.** | `state_transitions`, `gate_decisions` and `source_evidence` rows raise on ORM update/delete (§5). |
 
 ---
@@ -90,22 +90,38 @@ stateDiagram-v2
 
 ### 3.2 Guards
 
-Guards are pure functions over a `GuardContext` snapshot. In production the snapshot is
-computed from the database by `Repository.build_guard_context()`, so guards reflect
-persisted facts, not what an agent claims.
+Guards are pure functions over a `GuardContext` snapshot. **Guards fail closed:**
+`GuardContext` has no default values, so no caller can obtain a passing guard by
+omitting a fact, and `Repository.build_guard_context()` derives every value from
+persisted rows. Absent data (no PRISMA snapshot, no manifest rows, no decisions) is
+reported as missing work, never as completion.
+
+Screening status is computed per record from the stored `ScreeningDecision`s
+(`screening_status()`): a record is *decided* only when a human adjudicator decided it,
+a stored conflict was resolved, or Reviewer 1 and Reviewer 2 agree on include/exclude.
+A disagreement counts as unresolved even if no `ScreeningConflict` row was ever saved.
 
 | Transition | Guard (all must hold) |
 |------------|------------------------|
 | Gate 1 → Stage 2 | Protocol exists; ≥1 search strategy; every strategy `syntax_validated`; every MeSH term `verified` against NLM MeSH |
-| Stage 2 → Gate 1.5 | ≥1 record identified |
-| Gate 1.5 → Stage 3 | ≥1 record; 0 unresolved screening conflicts; 0 unresolved cohort-overlap warnings; PRISMA counts satisfy invariants |
-| Gate 2 → Stage 4 | Every full-text item is downloaded, uploaded, or marked `UNOBTAINABLE` with a reason |
-| Stage 4 → Gate 3 | ≥1 extracted arm; 0 values without `SourceEvidence` |
-| Gate 3 → Stage 5 | As above, plus every arm approved by a human; PRISMA flow final (no reports awaiting retrieval/assessment) |
+| Stage 2 → Gate 1.5 | ≥1 stored record; **every unique (non-duplicate) record has title/abstract decisions from both reviewers**; PRISMA snapshot recorded, internally consistent and consistent with stored records |
+| Gate 1.5 → Stage 3 | As above, plus 0 unresolved title/abstract disagreements; 0 unresolved possible-duplicate pairs; 0 unresolved cohort-overlap warnings; PRISMA shows 0 records awaiting screening; ≥1 record included |
+| Stage 3 → Gate 2 | **Every title/abstract-included record has a full-text manifest entry** |
+| Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, or `UNOBTAINABLE` with a reason |
+| Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); ≥1 report included; every included report has ≥1 extracted arm; no arm belongs to a non-included report; 0 values without `SourceEvidence` |
+| Gate 3 → Stage 5 | As above, plus every arm approved by a human; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
 | Stage 5 → Stage 6 | `stats_output.json` produced (hash recorded) |
 | Stage 6 → Audit | Manuscript draft exists |
 | Audit → COMPLETED | Latest `AuditReport.passed is True` |
 | Audit → Stage 6 | Latest `AuditReport.passed is False` |
+
+**PRISMA cross-check.** The stored `PRISMACounts` snapshot must agree with the database:
+total identified = stored records; duplicates removed = records with `duplicate_of`;
+records screened / excluded / awaiting screening = derived title/abstract status;
+reports not retrieved / assessed = manifest `UNOBTAINABLE` / retrieved entries; reports
+included and Σ(exclusion reasons) = derived full-text status. Removals other than
+duplicates (automation, other reasons) are not yet recorded per record, so any non-zero
+value is reported as unverifiable and blocks progress.
 
 `GuardViolationError.violations` lists every failed condition, and
 `GET /projects/{id}/guards` exposes them to the UI before a reviewer acts.
@@ -120,12 +136,40 @@ which blocks an LLM from smuggling extra keys into structured output. All timest
 must be timezone-aware.
 
 ### 4.1 Stage 1 — `protocol.py`
-* **`PICOProtocol`** — title, question, P/I/C, `outcomes: list[OutcomeDefinition]` (≥1
-  primary; effect measure must suit the data type: RR/OR/RD for dichotomous, MD/SMD for
-  continuous, HR for time-to-event), study designs, inclusion/exclusion criteria, MeSH
-  terms, search strategies, PROSPERO ID (`CRD` + 11 digits), versioning, approval
-  fields. `approval_blockers()` lists what prevents Gate 1 approval; an `approved`
-  protocol with blockers fails validation.
+* **`PICOProtocol`** — title, question, P/I/C, `review_design`
+  (`comparative` | `single_arm`), `outcomes: list[OutcomeDefinition]` (≥1 primary), study
+  designs, inclusion/exclusion criteria, MeSH terms, search strategies, PROSPERO ID
+  (`CRD` + 11 digits), versioning, approval fields. `approval_blockers()` lists what
+  prevents Gate 1 approval; an `approved` protocol with blockers fails validation.
+  * *Comparative* reviews require a `comparator` and may not list designs without a
+    comparison group (`single_arm_trial`, `case_series`).
+  * *Single-arm* reviews (e.g. stereotactic radiosurgery case series) must not define a
+    comparator, may contain only `single_group` outcomes, and exclude `case_control`
+    designs, whose outcome-based sampling does not permit estimating proportions or
+    incidence.
+* **`OutcomeDefinition`** — `clinical_type` (tumour control, AVM obliteration, pain
+  relief, hearing preservation, adverse event, OS, PFS, functional outcome, other),
+  operational `definition`, `grading_system` (e.g. CTCAE v5.0, BNI), `data_type`
+  (dichotomous / continuous / time-to-event / count-rate), `comparison`
+  (comparative / single-group), `preferred_effect_measure` and structured
+  `timepoints`. Admissible measures:
+
+  | comparison | dichotomous | continuous | time-to-event | count/rate |
+  |---|---|---|---|---|
+  | comparative | RR, OR, RD | MD, SMD | HR | IRR |
+  | single-group | PROPORTION (crude) | MEAN, MEDIAN | KM_PROBABILITY, CUMULATIVE_INCIDENCE, MEDIAN_TIME_TO_EVENT | INCIDENCE_RATE |
+
+  A crude proportion (events ÷ n, censoring ignored) and a Kaplan-Meier probability
+  (accounts for right-censoring; Kaplan & Meier 1958) are different quantities and sit
+  in different cells, so they cannot be confused or pooled together by schema. Where
+  competing risks exist (e.g. death before radiation necrosis), 1 − KM overestimates
+  the cumulative incidence (Gooley et al. 1999), hence the separate
+  `CUMULATIVE_INCIDENCE` measure. Single-group outcomes need ≥1 timepoint (except
+  median time-to-event); KM and cumulative-incidence outcomes need **fixed** timepoints
+  (an estimate at time *t*), whereas crude proportions may use "last follow-up" or a
+  window.
+* **`FollowUpTimepoint`** — `fixed` (value + unit), `window` (min–max + unit) or
+  `last_follow_up`. Descriptive only; no time arithmetic.
 * **`MeSHTerm`** — starts `verified=False`; may only be marked verified (with
   `verified_at`) after `PubMedClient.mesh_descriptor_exists()` confirms it.
 * **`SearchStrategy`** — per-database query with balanced-parentheses/quotes check,
@@ -144,6 +188,10 @@ must be timezone-aware.
   undefined).
 * **`CohortOverlapWarning`** — canonical pair (`a < b`), score, severity, per-signal
   breakdown, shared authors/institutions/registry IDs; resolution requires `resolved_by`.
+* **`DuplicateCandidate`** — a pair the deduplicator matched but refused to merge
+  (`match_basis`, `conflict`, optional title similarity). Resolution (`distinct`,
+  `duplicate_keep_a`, `duplicate_keep_b`) requires `resolved_by` and `resolved_at`;
+  `Repository.resolve_duplicate_candidate()` re-points the dropped cluster's records.
 
 ### 4.3 Stages 3–4 — `extraction.py`
 * **`FullTextItem`** — the Gate 2 manifest row (first author, year, journal, title, PMID,
@@ -158,10 +206,20 @@ must be timezone-aware.
   separators and a lone decimal comma, and performs no arithmetic. Consequently, a
   computed number (e.g. a mean estimated from a median) **cannot** be stored as an
   extracted value.
-* **`ExtractedStudyArm`** — arm-level data (n randomised/analysed, events, mean, SD, SE,
-  median, Q1, Q3, min, max), each an `ExtractedValue`. Plausibility checks: counts are
-  non-negative integers, events ≤ n analysed ≤ n randomised, SD/SE ≥ 0,
-  min ≤ Q1 ≤ median ≤ Q3 ≤ max; human approval requires approver and timestamp.
+* **`ExtractedStudyArm`** — arm-level data (n randomised/enrolled, n analysed, events,
+  mean, SD, SE, median, Q1, Q3, min, max), each an `ExtractedValue`; `arm_role` includes
+  `single_group` for single-arm studies. An author-reported summary is held separately:
+  `estimate_type` (crude proportion, Kaplan-Meier, actuarial life table, cumulative
+  incidence, incidence rate, median time-to-event), `estimate_scale`
+  (percent | proportion), `reported_estimate`, `ci_lower`/`ci_upper` + `ci_level`,
+  `follow_up` (`FollowUpTimepoint`), `n_at_risk`, `follow_up_median`, `person_time`.
+  Plausibility checks: counts are non-negative integers; events ≤ n analysed ≤ n
+  randomised; n at risk ≤ n analysed; SD/SE/follow-up/person-time ≥ 0;
+  min ≤ Q1 ≤ median ≤ Q3 ≤ max; estimate and type given together; CI needs both bounds,
+  a level and must contain the estimate; probability-type estimates lie within 0–1 or
+  0–100 %; KM / life-table / cumulative-incidence estimates require a fixed `follow_up`;
+  rates and median times require a unit. A KM probability is therefore never stored as,
+  or derived from, `events`/`n`. Human approval requires approver and timestamp.
 * **`RiskOfBiasAssessment`** — RoB 2 (5 domains; low/some concerns/high),
   ROBINS-I (7 domains; low/moderate/serious/critical/no information) or NOS (stars:
   selection ≤4, comparability ≤2, outcome/exposure ≤3). For RoB 2 and ROBINS-I the
@@ -177,16 +235,19 @@ must be timezone-aware.
   report does not pass.
 
 ### 4.5 Pipeline — `pipeline.py`
-* **`GateDecision`** (frozen), **`StateTransition`** (frozen), **`ProjectState`**.
-* **`PRISMACounts`** — the PRISMA 2020 flow boxes plus two work-in-progress counters.
-  Invariants enforced at construction:
-  * screened = identified − duplicates − automation-ineligible − other removals
+* **`GateDecision`** (frozen; carries `reviewer_id` of the authenticated reviewer),
+  **`StateTransition`** (frozen), **`ProjectState`**.
+* **`PRISMACounts`** — the PRISMA 2020 flow boxes plus three work-in-progress counters
+  (`records_awaiting_screening`, `reports_awaiting_retrieval`,
+  `reports_awaiting_assessment`). `records_screened` counts only records with a
+  *completed* title/abstract decision. Invariants enforced at construction:
+  * screened + awaiting screening = identified − duplicates − automation-ineligible − other removals
   * sought = screened − excluded
   * assessed = sought − not retrieved − awaiting retrieval
   * reports included = assessed − Σ(excluded with reasons) − awaiting assessment
   * studies included ≤ reports included
 
-  `is_final` is true only when nothing is awaiting retrieval or assessment.
+  `is_final` is true only when nothing is awaiting screening, retrieval or assessment.
 
 ---
 
@@ -200,6 +261,10 @@ SQLAlchemy 2.0 typed ORM on SQLite (any SQLAlchemy URL works).
   `NOT NULL` + FK, so the database itself refuses a number without provenance.
 * Extracted arms are write-once (corrections create a new arm); approval updates only the
   approval columns.
+* `reviewers` stores enrolled reviewers with a salted scrypt hash of their token (never
+  the token); `gate_decisions.reviewer_id` is a `NOT NULL` foreign key to it.
+* `duplicate_candidates` stores unmerged, conflicting duplicate matches awaiting human
+  adjudication.
 * `state_transitions`, `gate_decisions`, `source_evidence` are append-only (ORM
   `before_update` / `before_delete` listeners raise `AppendOnlyViolationError`).
 * `projects.version_id` provides optimistic concurrency; `record_transition()` also
@@ -209,7 +274,56 @@ SQLAlchemy 2.0 typed ORM on SQLite (any SQLAlchemy URL works).
 
 ---
 
-## 6. Literature API clients (`src/apis`)
+## 6. Human approval integrity
+
+**Problem.** The first version accepted a `reviewer_name` in the request body as proof
+of human approval, so any process able to send an HTTP request (including an autonomous
+agent) could impersonate the reviewer.
+
+**Mechanism (minimal, local).**
+
+1. **Enrollment out of band.** A human runs
+   `python -m src.api_server.reviewer_cli enroll "Dr Jane Doe"` in a terminal. The
+   command refuses to run unless stdin and stdout are TTYs and the name is re-typed.
+   It prints a token `rvw_<reviewer_id>_<secret>` **once**; the 256-bit secret comes
+   from `secrets.token_urlsafe(32)`. `list` and `revoke` subcommands exist.
+2. **Only a hash is stored.** `reviewers.token_hash` is scrypt(secret, 16-byte random
+   salt; n = 2¹⁴, r = 8, p = 1; RFC 7914), compared in constant time. Reading the
+   database does not reveal a usable token.
+3. **Bearer authentication on gate decisions.** `POST /projects/{id}/gates/{gate}`
+   requires `Authorization: Bearer <token>`. Missing, malformed, wrong or revoked tokens
+   return 401 (`WWW-Authenticate: Bearer`). The request body accepts only `verdict` and
+   `comments`; a body that names a reviewer is rejected (422), not silently ignored. The
+   decision's `reviewer_name` and `reviewer_id` come from the authenticated token.
+4. **Persistence enforcement.** `Repository.record_transition()` refuses any gate
+   decision whose `reviewer_id` is missing, unknown, revoked, or whose name does not match
+   the enrolled reviewer; `gate_decisions.reviewer_id` is a `NOT NULL` foreign key.
+5. **Hygiene.** The server is meant to bind to loopback (uvicorn's default
+   `127.0.0.1`); file-based SQLite directories are created with mode `0700`. Tokens
+   must not be placed in `.env`, the repository, or anywhere an agent process can read.
+
+**Remaining limitations (threat model).** These measures stop an agent that can only
+reach the HTTP API, or that only knows a reviewer's name, from approving a gate. They do
+**not** protect against a process running as the same OS user with general shell or
+file access, which could:
+
+* drive the enrollment CLI through a pseudo-terminal and mint its own token;
+* read a token from the human's terminal scrollback, clipboard, password-manager export
+  or any file it was saved to;
+* write the SQLite file directly (insert a reviewer hash or a transition row), bypassing
+  application code entirely; or
+* import the library in-process and call the repository with a known `reviewer_id`.
+
+Robust separation therefore requires running the agent as a **different OS user or in a
+container** with no access to the database file, the CLI, or the reviewer's session, and
+talking to the API only over loopback. Further hardening not yet implemented: token
+expiry/rotation, rate limiting of failed authentication, signed (e.g. Ed25519) decisions
+verifiable independently of the database, TLS for any non-loopback deployment, and
+multi-reviewer sign-off.
+
+---
+
+## 7. Literature API clients (`src/apis`)
 
 All clients share `BaseAPIClient`: an `httpx.AsyncClient`, an `AsyncRateLimiter`
 (sliding window, safe under concurrency, injectable clock), retries on 429/500/502/503/504
@@ -230,10 +344,16 @@ before raising them.
 
 ---
 
-## 7. Screening algorithms (`src/screening`)
+## 8. Screening algorithms (`src/screening`)
 
-### 7.1 Deduplication (`deduplication.py`)
-1. **Exact pass** — union-find over DOI, PMID, PMCID and OpenAlex ID (transitive).
+### 8.1 Deduplication (`deduplication.py`)
+1. **Exact pass** — union-find over DOI, PMID, PMCID and OpenAlex ID. Before two
+   clusters are joined, **every member of one is compared with every member of the
+   other**; if any identifier would take two different values in the merged cluster
+   (e.g. a shared DOI but different PMIDs, or a DOI→PMID chain linking two different
+   DOIs), the merge is refused and the pair is returned as a `PossibleDuplicate`
+   (`match_basis = "exact <identifier> (<value>)"`). A conflicting record does not stop
+   compatible records sharing the same identifier from merging with each other.
 2. **Fuzzy pass** — records are blocked by publication year (±1; unknown years compared
    with all), titles normalised (markup removed, diacritics folded, case-folded,
    punctuation collapsed) and compared with RapidFuzz `token_sort_ratio`
@@ -242,25 +362,34 @@ before raising them.
    different PMIDs, different first-author surnames). Contradicted pairs are returned as
    `PossibleDuplicate` for human review. This is deliberately conservative: a false merge
    silently deletes a study, while a missed merge is caught at screening.
+
+   Blocked pairs are reported once per pair; `PossibleDuplicate.to_candidate()` converts
+   them to persistable `DuplicateCandidate`s, and every candidate must be adjudicated by a
+   human before Gate 1.5 can be released.
 3. **Representative** — the most complete record (PMID > DOI > abstract > …), ties by
    source priority then `record_id`. Missing identifiers are filled from duplicates,
    never overwritten.
 
 The result is independent of input order (tested by shuffling).
 
-### 7.2 Dual screening support (`agreement.py`)
+### 8.2 Dual screening support (`agreement.py`)
 `cohens_kappa()` implements κ = (p_o − p_e)/(1 − p_e) (Cohen, 1960) for any number of
 categories and returns `None` when p_e = 1. `detect_conflicts()` flags disagreements and
 double-`uncertain` records; `final_verdicts()` refuses to produce a consensus while any
 conflict is unresolved.
 
-### 7.3 PRISMA tracker (`prisma.py`)
+### 8.3 PRISMA tracker (`prisma.py`)
 Counts are derived from recorded events (identification per database, duplicates removed,
 per-record screening/retrieval/eligibility outcomes), not typed in. Decisions are
-idempotent; re-excluding a record clears its downstream state. `snapshot()` returns a
-validated `PRISMACounts` or raises `PRISMAInconsistencyError`.
+idempotent; re-excluding a record clears its downstream state.
 
-### 7.4 Overlapping Cohort Detector (`cohort_overlap.py`)
+Incomplete screening is represented explicitly: `records_awaiting_screening` is the set of
+registered records without a final decision (`register_screening_pool()`, recommended),
+or else identified − removed − decided. A snapshot taken mid-screening is therefore valid
+but not final, and more decisions than records entering screening raises an error.
+`snapshot()` returns a validated `PRISMACounts` or raises `PRISMAInconsistencyError`.
+
+### 8.4 Overlapping Cohort Detector (`cohort_overlap.py`)
 Flags report pairs that may describe the same participants; it never excludes or merges.
 
 | Signal | Score in [0, 1] |
@@ -281,7 +410,7 @@ index (shared author key, registry ID or institution token) to avoid all-pairs w
 
 ---
 
-## 8. Verification workflow (end to end)
+## 9. Verification workflow (end to end)
 
 1. **Search provenance** — each record stores its database, exact query, endpoint, time
    and reported hit count → PRISMA-S reporting and reproducibility.
@@ -303,16 +432,19 @@ index (shared author key, registry ID or institution token) to avoid all-pairs w
 
 ---
 
-## 9. Implementation status
+## 10. Implementation status
 
 | Component | Status |
 |-----------|--------|
 | Data contracts (all stages) | Implemented and tested |
 | State machine, guards, HITL gates | Implemented and tested |
 | SQLAlchemy persistence, append-only trail | Implemented and tested |
-| PubMed, Europe PMC, OpenAlex, Unpaywall, Crossref clients | Implemented; tested with mocked HTTP. Live smoke tests exist (`pytest -m live`) but **have not been run against the real services** in the development sandbox (outbound access was blocked) |
-| Deduplication, κ/conflicts, PRISMA tracker, cohort overlap | Implemented and tested |
-| FastAPI (state, guards, gate decisions) | Implemented and tested; endpoints for system steps not yet exposed |
+| PubMed, Europe PMC, OpenAlex, Unpaywall, Crossref clients | Implemented; tested with mocked HTTP only. Live smoke tests (`pytest -m live`) were executed but all 6 failed with `ProxyError: 403 Forbidden` from the sandbox egress proxy before reaching any API. **Real API behaviour remains unverified** |
+| Deduplication (with cluster-level identifier-conflict blocking), κ/conflicts, PRISMA tracker (with pending-screening accounting), cohort overlap | Implemented and tested |
+| Fail-closed guards derived from persisted records, incl. PRISMA cross-check | Implemented and tested |
+| FastAPI (state, guards, gate decisions) | Implemented and tested; gate decisions require an enrolled reviewer's bearer token. Endpoints for system steps not yet exposed |
+| Reviewer enrollment CLI and token authentication | Implemented and tested; see §6 for the threat model and limitations |
+| Single-arm / case-series protocol and outcome schemas; crude vs KM vs cumulative-incidence distinction | Implemented and tested (schemas only; no statistics) |
 | LLM agents (PICO structuring, screening reviewers, drafting) | Not implemented |
 | PDF extraction (`pdf_extractor`) | Contract only |
 | Statistics engine (`stats_engine`) | Interface only — raises `NotImplementedError` |
@@ -334,7 +466,7 @@ Each method must be validated against published worked examples before use.
 
 ---
 
-## 10. Development
+## 11. Development
 
 ```bash
 pip install -e ".[dev]"
@@ -342,12 +474,13 @@ pytest                 # unit + integration (live tests excluded by default)
 pytest -m live         # opt-in, real network; set SYSREV_NCBI_EMAIL
 ruff check src tests && ruff format --check src tests
 mypy                   # strict mode over src/
-uvicorn src.api_server.main:app --reload
+python -m src.api_server.reviewer_cli enroll "Dr Jane Doe"   # human, in a terminal
+uvicorn src.api_server.main:app --reload                       # binds 127.0.0.1
 ```
 
 ---
 
-## 11. References
+## 12. References
 
 1. Page MJ, McKenzie JE, Bossuyt PM, et al. The PRISMA 2020 statement: an updated
    guideline for reporting systematic reviews. *BMJ* 2021;372:n71. doi:10.1136/bmj.n71
@@ -365,5 +498,12 @@ uvicorn src.api_server.main:app --reload
    Institute (web resource).
 7. Cohen J. A coefficient of agreement for nominal scales. *Educ Psychol Meas*
    1960;20:37-46.
-8. Sayers E. A General Introduction to the E-utilities. In: *Entrez Programming Utilities
+8. Kaplan EL, Meier P. Nonparametric estimation from incomplete observations.
+   *J Am Stat Assoc* 1958;53:457-481.
+9. Gooley TA, Leisenring W, Crowley J, Storer BE. Estimation of failure probabilities in
+   the presence of competing risks: new representations of old estimators. *Stat Med*
+   1999;18:695-706.
+10. Percival C, Josefsson S. The scrypt Password-Based Key Derivation Function. RFC 7914,
+    IETF; 2016.
+11. Sayers E. A General Introduction to the E-utilities. In: *Entrez Programming Utilities
    Help*. NCBI; https://www.ncbi.nlm.nih.gov/books/NBK25497/

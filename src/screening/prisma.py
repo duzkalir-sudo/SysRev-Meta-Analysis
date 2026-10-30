@@ -10,6 +10,7 @@ Page MJ, McKenzie JE, Bossuyt PM, et al. The PRISMA 2020 statement. BMJ
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 
 from src.core.enums import SourceDatabase
 from src.core.exceptions import PRISMAInconsistencyError
@@ -30,6 +31,7 @@ class PRISMATracker:
         self._fulltext_excluded: dict[str, str] = {}
         self._included_reports: set[str] = set()
         self._studies_included: int | None = None
+        self._screening_pool: set[str] | None = None
 
     # -------------------------------------------------------------- identification
     def record_identified(self, database: SourceDatabase, n: int) -> None:
@@ -58,11 +60,29 @@ class PRISMATracker:
         self._other_removed += n
 
     # -------------------------------------------------------------- screening
+    def register_screening_pool(self, record_ids: Iterable[str]) -> None:
+        """Declare the unique records (after deduplication) that must be screened.
+
+        Optional but recommended: once registered, decisions for unknown records are
+        rejected and ``records_awaiting_screening`` is the exact set still undecided.
+        Without a pool, pending screening is derived from the counts
+        (identified − removed − decided).
+        """
+        pool = set(record_ids)
+        decided = self._screened_included | self._screened_excluded
+        if not decided <= pool:
+            raise PRISMAInconsistencyError(
+                f"decisions exist for records outside the pool: {sorted(decided - pool)}"
+            )
+        self._screening_pool = pool
+
     def record_title_abstract_decision(self, record_id: str, *, include: bool) -> None:
         """Final (post-adjudication) title/abstract outcome for one unique record.
 
         Re-deciding a record clears its downstream retrieval and eligibility state.
         """
+        if self._screening_pool is not None and record_id not in self._screening_pool:
+            raise PRISMAInconsistencyError(f"{record_id} is not in the registered screening pool")
         self._screened_included.discard(record_id)
         self._screened_excluded.discard(record_id)
         if not include:
@@ -109,6 +129,12 @@ class PRISMATracker:
         screened = len(self._screened_included) + len(self._screened_excluded)
         reports_included = len(self._included_reports)
         pending = self.pending()
+        if pending["awaiting_screening"] < 0:
+            raise PRISMAInconsistencyError(
+                f"{screened} records screened but only "
+                f"{screened + pending['awaiting_screening']} entered screening "
+                "(identified − removed before screening)"
+            )
         try:
             return PRISMACounts(
                 identified_by_database=dict(self._identified),
@@ -118,6 +144,7 @@ class PRISMATracker:
                 removed_other_reasons=self._other_removed,
                 records_screened=screened,
                 records_excluded=len(self._screened_excluded),
+                records_awaiting_screening=pending["awaiting_screening"],
                 reports_sought=len(self._screened_included),
                 reports_not_retrieved=len(self._not_retrieved),
                 reports_assessed=len(self._retrieved),  # retrieved reports are assessed
@@ -137,8 +164,16 @@ class PRISMATracker:
             raise PRISMAInconsistencyError(str(exc)) from exc
 
     def pending(self) -> dict[str, int]:
-        """Work items not yet accounted for, useful for progress display."""
+        """Work items not yet accounted for (a negative count signals inconsistency)."""
+        decided = len(self._screened_included) + len(self._screened_excluded)
+        if self._screening_pool is not None:
+            awaiting_screening = len(self._screening_pool) - decided
+        else:
+            removed = self._duplicates + self._automation_ineligible + self._other_removed
+            entering = sum(self._identified.values()) + self._registers - removed
+            awaiting_screening = entering - decided
         return {
+            "awaiting_screening": awaiting_screening,
             "awaiting_retrieval_decision": len(
                 self._screened_included - self._retrieved - self._not_retrieved
             ),

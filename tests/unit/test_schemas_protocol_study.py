@@ -9,6 +9,7 @@ from src.core.enums import ReviewerRole, ScreeningStage, ScreeningVerdict, Sourc
 from src.core.schemas import (
     Author,
     CohortOverlapWarning,
+    DuplicateCandidate,
     MeSHTerm,
     OutcomeDefinition,
     OverlapSignal,
@@ -58,7 +59,7 @@ def test_protocol_requires_exclusion_criteria() -> None:
 
 
 def test_outcome_effect_measure_must_match_data_type() -> None:
-    with pytest.raises(ValidationError, match="invalid for dichotomous"):
+    with pytest.raises(ValidationError, match="invalid for comparative dichotomous"):
         OutcomeDefinition(
             outcome_id="mort",
             name="Mortality",
@@ -270,3 +271,24 @@ def test_cohort_warning_canonical_order_and_resolution() -> None:
             signals=sig,
             resolution="distinct_cohorts",
         )
+
+
+def test_duplicate_candidate_rules() -> None:
+    base = {"match_basis": "exact doi (10.5555/x)", "conflict": "different PMIDs"}
+    with pytest.raises(ValidationError, match="canonical"):
+        DuplicateCandidate(record_id_a="b", record_id_b="a", **base)
+    with pytest.raises(ValidationError, match="itself"):
+        DuplicateCandidate(record_id_a="a", record_id_b="a", **base)
+    with pytest.raises(ValidationError, match="resolved_by"):
+        DuplicateCandidate(record_id_a="a", record_id_b="b", resolution="distinct", **base)
+    with pytest.raises(ValidationError, match="only allowed once resolved"):
+        DuplicateCandidate(record_id_a="a", record_id_b="b", resolved_by="Dr R", **base)
+    ok = DuplicateCandidate(
+        record_id_a="a",
+        record_id_b="b",
+        resolution="distinct",
+        resolved_by="Dr R",
+        resolved_at=NOW,
+        **base,
+    )
+    assert ok.is_resolved

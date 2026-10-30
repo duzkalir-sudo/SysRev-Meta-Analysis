@@ -60,11 +60,15 @@ Sleep = Callable[[float], Awaitable[None]]
 PID = "proj1"
 
 
+REVIEWER: dict[str, str] = {}  # set once the human reviewer is enrolled
+
+
 def gate(g: GateId, verdict: GateVerdict = GateVerdict.APPROVED) -> GateDecision:
     return GateDecision(
         gate=g,
         verdict=verdict,
         reviewer_name="Dr Human Reviewer",
+        reviewer_id=REVIEWER["id"],
         comments=None if verdict == GateVerdict.APPROVED else "please revise",
     )
 
@@ -91,6 +95,7 @@ async def test_full_pipeline(
 ) -> None:
     repo = Repository(session)
     repo.create_project(PID, "Synthetic review of drug X")
+    REVIEWER["id"], _ = repo.enroll_reviewer("Dr Human Reviewer")
 
     # ---------------- Stage 1: protocol drafted -> Gate 1 -------------------------------
     advance(repo, Phase.GATE1_SEARCH_STRATEGY)
@@ -207,6 +212,13 @@ async def test_full_pipeline(
     for w in warnings:
         repo.save_overlap_warning(PID, w)
 
+    # PRISMA snapshot during screening: one record decided, one awaiting adjudication.
+    prisma.register_screening_pool([r.record_id for r in unique])
+    prisma.record_title_abstract_decision(main_id, include=True)
+    with pytest.raises(GuardViolationError, match="PRISMA counts have not been recorded"):
+        advance(repo, Phase.GATE1_5_SCREENING_CONFLICTS)
+    repo.save_prisma(PID, prisma.snapshot())
+    assert repo.load_prisma(PID).records_awaiting_screening == 1  # type: ignore[union-attr]
     advance(repo, Phase.GATE1_5_SCREENING_CONFLICTS)
 
     # ---------------- Gate 1.5: human must resolve conflicts + overlap warnings ---------
@@ -289,14 +301,31 @@ async def test_full_pipeline(
     repo.save_prisma(PID, prisma.snapshot())
 
     # ---------------- Stage 4: grounded extraction -> Gate 3 ----------------------------
+    with pytest.raises(GuardViolationError, match="lack full-text eligibility decisions"):
+        advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
+    for rid in (main_id, follow_id):  # dual full-text eligibility assessment
+        for reviewer in (ReviewerRole.REVIEWER_1, ReviewerRole.REVIEWER_2):
+            repo.save_screening_decision(
+                PID,
+                ScreeningDecision(
+                    record_id=rid, reviewer=reviewer, reviewer_identity=f"agent-{reviewer.value}",
+                    stage=ScreeningStage.FULL_TEXT, verdict=ScreeningVerdict.INCLUDE,
+                    rationale="eligible on full text",
+                ),
+            )  # fmt: skip
     with pytest.raises(GuardViolationError, match="no extracted"):
         advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     arm = make_arm(main_id)
     repo.save_extracted_arm(PID, arm)
+    with pytest.raises(GuardViolationError, match="1 included report"):
+        advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
+    follow_arm = make_arm(follow_id)
+    repo.save_extracted_arm(PID, follow_arm)
     advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     with pytest.raises(GuardViolationError, match="not approved by a human"):
         decide(repo, gate(GateId.GATE_3))
     repo.approve_extracted_arm(arm.arm_id, "Dr Human Reviewer")
+    repo.approve_extracted_arm(follow_arm.arm_id, "Dr Human Reviewer")
     with pytest.raises(GuardViolationError, match="PRISMA flow not final"):
         decide(repo, gate(GateId.GATE_3))
     prisma.record_fulltext_decision(main_id, include=True)
@@ -364,52 +393,58 @@ async def test_full_pipeline(
 
 
 def test_hitl_flow_over_http() -> None:
-    """Gate decisions submitted through the FastAPI layer are guarded and recorded."""
+    """Gate decisions submitted through the FastAPI layer are authenticated, guarded, recorded."""
     app = create_app("sqlite:///:memory:")
-    client = TestClient(app)
-    pid = client.post("/projects", json={"title": "HTTP review"}).json()["project_id"]
+    with TestClient(app) as client:
+        pid = client.post("/projects", json={"title": "HTTP review"}).json()["project_id"]
 
-    # System steps have no HTTP endpoint yet; drive them through the repository.
-    with app.state.session_factory() as session:
-        repo = Repository(session)
-        m = repo.load_state_machine(pid)
-        repo.record_transition(
-            m.transition(
-                Phase.GATE1_SEARCH_STRATEGY,
-                actor="orchestrator",
-                actor_type=ActorType.SYSTEM,
-                context=repo.build_guard_context(pid),
+        # System steps have no HTTP endpoint yet; drive them through the repository.
+        # The reviewer is enrolled out of band (in production: the terminal-only CLI).
+        with app.state.session_factory() as session:
+            repo = Repository(session)
+            _, token = repo.enroll_reviewer("Dr R")
+            m = repo.load_state_machine(pid)
+            repo.record_transition(
+                m.transition(
+                    Phase.GATE1_SEARCH_STRATEGY,
+                    actor="orchestrator",
+                    actor_type=ActorType.SYSTEM,
+                    context=repo.build_guard_context(pid),
+                )
             )
+            session.commit()
+        auth = {"Authorization": f"Bearer {token}"}
+        approve = {"verdict": "approved"}
+
+        view = client.get(f"/projects/{pid}").json()
+        assert view["awaiting_gate"] == "gate_1"
+        guards = client.get(f"/projects/{pid}/guards").json()
+        assert guards["stage2_search_screening"] == ["protocol: protocol not drafted"]
+        assert guards["stage1_protocol"] == []
+
+        # An unauthenticated request naming a reviewer is refused outright.
+        impersonation = client.post(
+            f"/projects/{pid}/gates/gate_1", json={"verdict": "approved", "reviewer_name": "Dr R"}
         )
-        session.commit()
+        assert impersonation.status_code == 401
+        assert client.get(f"/projects/{pid}").json()["phase"] == "gate1_search_strategy"
 
-    view = client.get(f"/projects/{pid}").json()
-    assert view["awaiting_gate"] == "gate_1"
-    guards = client.get(f"/projects/{pid}/guards").json()
-    assert guards["stage2_search_screening"] == ["protocol: protocol not drafted"]
-    assert guards["stage1_protocol"] == []
+        blocked = client.post(f"/projects/{pid}/gates/gate_1", json=approve, headers=auth)
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["violations"] == ["protocol: protocol not drafted"]
 
-    blocked = client.post(
-        f"/projects/{pid}/gates/gate_1", json={"verdict": "approved", "reviewer_name": "Dr R"}
-    )
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"]["violations"] == ["protocol: protocol not drafted"]
+        wrong_gate = client.post(f"/projects/{pid}/gates/gate_3", json=approve, headers=auth)
+        assert wrong_gate.status_code == 409
 
-    wrong_gate = client.post(
-        f"/projects/{pid}/gates/gate_3", json={"verdict": "approved", "reviewer_name": "Dr R"}
-    )
-    assert wrong_gate.status_code == 409
+        with app.state.session_factory() as session:
+            Repository(session).save_protocol(pid, make_protocol())
+            session.commit()
 
-    with app.state.session_factory() as session:
-        Repository(session).save_protocol(pid, make_protocol())
-        session.commit()
-
-    ok = client.post(
-        f"/projects/{pid}/gates/gate_1", json={"verdict": "approved", "reviewer_name": "Dr R"}
-    )
-    assert ok.status_code == 200
-    body = ok.json()
-    assert body["phase"] == "stage2_search_screening"
-    last = body["history"][-1]
-    assert last["actor_type"] == "human"
-    assert last["gate_decision"]["reviewer_name"] == "Dr R"
+        ok = client.post(f"/projects/{pid}/gates/gate_1", json=approve, headers=auth)
+        assert ok.status_code == 200
+        body = ok.json()
+        assert body["phase"] == "stage2_search_screening"
+        last = body["history"][-1]
+        assert last["actor_type"] == "human"
+        assert last["gate_decision"]["reviewer_name"] == "Dr R"
+        assert last["gate_decision"]["reviewer_id"]

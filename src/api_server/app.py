@@ -2,11 +2,16 @@
 
 All phase changes go through :class:`PipelineStateMachine`; guard facts are
 computed from the database by :meth:`Repository.build_guard_context`.
+
+Gate decisions require ``Authorization: Bearer <reviewer token>``. The token is issued
+to a human by the terminal-only enrollment CLI (``python -m src.api_server.reviewer_cli``)
+and the reviewer's identity is taken from it — a request body cannot name a reviewer.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -18,7 +23,7 @@ from src.core.enums import GateId, GateVerdict, Phase
 from src.core.exceptions import GuardViolationError, StateTransitionError
 from src.core.schemas.base import new_id
 from src.core.schemas.pipeline import GateDecision, StateTransition
-from src.state.db import init_db, make_engine, make_session_factory
+from src.state.db import ReviewerORM, init_db, make_engine, make_session_factory
 from src.state.machine import GATE_OF_PHASE
 from src.state.repository import NotFoundError, Repository
 
@@ -29,9 +34,10 @@ class CreateProjectRequest(BaseModel):
 
 
 class GateDecisionRequest(BaseModel):
+    """Body of a gate decision. Identity comes from the bearer token, never from the body."""
+
     model_config = ConfigDict(extra="forbid")
     verdict: GateVerdict
-    reviewer_name: str = Field(min_length=1)
     comments: str | None = None
 
 
@@ -57,12 +63,36 @@ def get_session(request: Request) -> Iterator[Session]:
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
+def require_reviewer(request: Request, session: SessionDep) -> ReviewerORM:
+    """Authenticate an enrolled human reviewer from the ``Authorization`` header only."""
+    header = request.headers.get("Authorization", "")
+    scheme, _, token = header.partition(" ")
+    reviewer = None
+    if scheme.lower() == "bearer" and token:
+        reviewer = Repository(session).authenticate_reviewer(token)
+    if reviewer is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "gate decisions require a valid reviewer token (Authorization: Bearer ...)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return reviewer
+
+
+ReviewerDep = Annotated[ReviewerORM, Depends(require_reviewer)]
+
+
 def create_app(database_url: str = "sqlite:///:memory:") -> FastAPI:
     engine = make_engine(database_url)
     init_db(engine)
     factory: sessionmaker[Session] = make_session_factory(engine)
 
-    app = FastAPI(title="SysRev Meta-Analysis Agent", version=__version__)
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        engine.dispose()
+
+    app = FastAPI(title="SysRev Meta-Analysis Agent", version=__version__, lifespan=lifespan)
     app.state.session_factory = factory
 
     def _view(repo: Repository, project_id: str) -> ProjectView:
@@ -108,7 +138,11 @@ def create_app(database_url: str = "sqlite:///:memory:") -> FastAPI:
 
     @app.post("/projects/{project_id}/gates/{gate}")
     def decide_gate(
-        project_id: str, gate: GateId, body: GateDecisionRequest, session: SessionDep
+        project_id: str,
+        gate: GateId,
+        body: GateDecisionRequest,
+        session: SessionDep,
+        reviewer: ReviewerDep,
     ) -> ProjectView:
         repo = Repository(session)
         try:
@@ -119,7 +153,8 @@ def create_app(database_url: str = "sqlite:///:memory:") -> FastAPI:
             decision = GateDecision(
                 gate=gate,
                 verdict=body.verdict,
-                reviewer_name=body.reviewer_name,
+                reviewer_name=reviewer.display_name,
+                reviewer_id=reviewer.id,
                 comments=body.comments,
             )
         except ValueError as exc:

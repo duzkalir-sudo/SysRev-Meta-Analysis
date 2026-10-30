@@ -15,7 +15,7 @@ from src.state.machine import (
     GuardContext,
     PipelineStateMachine,
 )
-from tests.conftest import READY
+from tests.conftest import EMPTY, READY
 
 
 def approve(gate: GateId) -> GateDecision:
@@ -145,7 +145,7 @@ def test_gate_decision_rejected_outside_gates() -> None:
 @pytest.mark.parametrize("gate_phase", list(GATE_OF_PHASE))
 def test_rejection_moves_back_and_skips_guards(gate_phase: Phase) -> None:
     m = PipelineStateMachine("p1", gate_phase)
-    t = m.submit_gate_decision(reject(GATE_OF_PHASE[gate_phase]), GuardContext())
+    t = m.submit_gate_decision(reject(GATE_OF_PHASE[gate_phase]), EMPTY)
     assert m.phase == GATE_OUTCOMES[gate_phase][1]
     assert t.reason == "revise"
 
@@ -158,7 +158,7 @@ def test_rejection_moves_back_and_skips_guards(gate_phase: Phase) -> None:
         (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS,
          {"records_identified": 0}, "no records"),
         (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL,
-         {"unresolved_screening_conflicts": 3}, "3 unresolved screening"),
+         {"ta_unresolved_conflicts": 3}, "3 unresolved title/abstract"),
         (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL,
          {"unresolved_cohort_warnings": 1}, "cohort-overlap"),
         (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL,
@@ -213,3 +213,81 @@ def test_stats_require_final_prisma_flow() -> None:
     ctx = dataclasses.replace(READY, prisma_pending_reports=2)
     with pytest.raises(GuardViolationError, match="PRISMA flow not final"):
         m.submit_gate_decision(approve(GateId.GATE_3), ctx)
+
+
+# --------------------------------------------------------------------------- fail-closed guards
+# Regression tests for the PR #1 review: absent data must never read as completed work.
+
+
+def test_guard_context_has_no_defaults() -> None:
+    """Omitting any fact is a TypeError, so no caller can get a passing guard by omission."""
+    with pytest.raises(TypeError):
+        GuardContext()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        GuardContext(protocol_blockers=())  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize(
+    ("phase", "target"),
+    [
+        (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS),
+        (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL),
+        (Phase.STAGE3_FULLTEXT_RETRIEVAL, Phase.GATE2_MISSING_FULLTEXT),
+        (Phase.GATE2_MISSING_FULLTEXT, Phase.STAGE4_EXTRACTION_ROB),
+        (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL),
+        (Phase.GATE3_EXTRACTION_APPROVAL, Phase.STAGE5_META_ANALYSIS),
+    ],
+)
+def test_empty_project_cannot_pass_any_stage_2_to_4_step(phase: Phase, target: Phase) -> None:
+    m = PipelineStateMachine("p1", phase)
+    decision = approve(GATE_OF_PHASE[phase]) if phase in GATE_OF_PHASE else None
+    actor_type = ActorType.HUMAN if decision else ActorType.SYSTEM
+    with pytest.raises(GuardViolationError):
+        m.transition(target, actor="x", actor_type=actor_type, context=EMPTY,
+                     gate_decision=decision)  # fmt: skip
+    assert m.phase == phase
+
+
+@pytest.mark.parametrize(
+    ("phase", "target", "bad_context", "fragment"),
+    [
+        (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS,
+         {"prisma_recorded": False}, "PRISMA counts have not been recorded"),
+        (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS,
+         {"ta_missing_decisions": 4}, "lack title/abstract decisions"),
+        (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL,
+         {"unresolved_duplicate_candidates": 2}, "possible-duplicate"),
+        (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL,
+         {"prisma_awaiting_screening": 5}, "awaiting screening"),
+        (Phase.GATE1_5_SCREENING_CONFLICTS, Phase.STAGE3_FULLTEXT_RETRIEVAL,
+         {"ta_included": 0}, "no records were included"),
+        (Phase.STAGE3_FULLTEXT_RETRIEVAL, Phase.GATE2_MISSING_FULLTEXT,
+         {"fulltext_items_missing": 3}, "no full-text manifest entry"),
+        (Phase.GATE2_MISSING_FULLTEXT, Phase.STAGE4_EXTRACTION_ROB,
+         {"fulltext_items_missing": 1}, "no full-text manifest entry"),
+        (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL,
+         {"ft_missing_decisions": 2}, "lack full-text eligibility decisions"),
+        (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL,
+         {"ft_unresolved_conflicts": 1}, "full-text eligibility conflict"),
+        (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL,
+         {"ft_included": 0}, "no reports were included after full-text"),
+        (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL,
+         {"included_reports_without_extraction": 1}, "have no extracted data"),
+        (Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL,
+         {"arms_for_non_included_reports": 1}, "not included at full-text"),
+        (Phase.GATE3_EXTRACTION_APPROVAL, Phase.STAGE5_META_ANALYSIS,
+         {"prisma_recorded": False}, "PRISMA counts have not been recorded"),
+        (Phase.GATE3_EXTRACTION_APPROVAL, Phase.STAGE5_META_ANALYSIS,
+         {"prisma_awaiting_screening": 1}, "PRISMA flow not final"),
+    ],
+)  # fmt: skip
+def test_fail_closed_guards(
+    phase: Phase, target: Phase, bad_context: dict[str, object], fragment: str
+) -> None:
+    m = PipelineStateMachine("p1", phase)
+    ctx = dataclasses.replace(READY, **bad_context)  # type: ignore[arg-type]
+    decision = approve(GATE_OF_PHASE[phase]) if phase in GATE_OF_PHASE else None
+    actor_type = ActorType.HUMAN if decision else ActorType.SYSTEM
+    with pytest.raises(GuardViolationError, match=fragment):
+        m.transition(target, actor="x", actor_type=actor_type, context=ctx,
+                     gate_decision=decision)  # fmt: skip

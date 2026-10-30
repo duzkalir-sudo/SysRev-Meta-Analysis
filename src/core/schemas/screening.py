@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field, model_validator
 
 from src.core.enums import ReviewerRole, ScreeningStage, ScreeningVerdict
@@ -78,3 +80,43 @@ class AgreementStatistics(StrictModel):
     kappa: float | None = Field(
         default=None, ge=-1.0, le=1.0, description="None when undefined (p_e == 1)"
     )
+
+
+class DuplicateCandidate(StrictModel):
+    """A pair the deduplicator matched but refused to merge because evidence conflicts.
+
+    Examples: a shared DOI with different PMIDs, or near-identical titles with different
+    DOIs. A human must adjudicate every candidate before Gate 1.5 can be released.
+    The pair is stored in canonical order (``record_id_a < record_id_b``).
+    """
+
+    candidate_id: Identifier = Field(default_factory=new_id)
+    record_id_a: Identifier
+    record_id_b: Identifier
+    match_basis: str = Field(min_length=1, description='e.g. "exact doi (10.x/y)", "fuzzy title"')
+    conflict: str = Field(min_length=1)
+    title_similarity: float | None = Field(default=None, ge=0.0, le=100.0)
+    resolution: Literal["unresolved", "distinct", "duplicate_keep_a", "duplicate_keep_b"] = (
+        "unresolved"
+    )
+    resolved_by: str | None = None
+    resolved_at: AwareDatetime | None = None
+    resolution_note: str | None = None
+
+    @model_validator(mode="after")
+    def _rules(self) -> DuplicateCandidate:
+        if self.record_id_a == self.record_id_b:
+            raise ValueError("a record cannot be a duplicate candidate of itself")
+        if self.record_id_a > self.record_id_b:
+            raise ValueError("record ids must be in canonical order (a < b)")
+        stamps = (self.resolved_by, self.resolved_at)
+        if self.resolution != "unresolved":
+            if any(v is None for v in stamps):
+                raise ValueError("resolved candidates need resolved_by and resolved_at")
+        elif any(v is not None for v in stamps):
+            raise ValueError("resolved_by/resolved_at are only allowed once resolved")
+        return self
+
+    @property
+    def is_resolved(self) -> bool:
+        return self.resolution != "unresolved"

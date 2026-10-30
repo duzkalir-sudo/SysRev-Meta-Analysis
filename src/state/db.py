@@ -14,6 +14,7 @@ Design choices:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, ClassVar
 
 from sqlalchemy import (
@@ -170,6 +171,18 @@ class CohortOverlapWarningORM(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class DuplicateCandidateORM(Base):
+    __tablename__ = "duplicate_candidates"
+    __table_args__ = (UniqueConstraint("project_id", "record_id_a", "record_id_b"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    record_id_a: Mapped[str] = mapped_column(ForeignKey("study_records.id"))
+    record_id_b: Mapped[str] = mapped_column(ForeignKey("study_records.id"))
+    resolution: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 class FullTextItemORM(Base):
     __tablename__ = "fulltext_items"
     __table_args__ = (UniqueConstraint("project_id", "record_id"),)
@@ -208,6 +221,10 @@ class ExtractedArmORM(Base):
     arm_label: Mapped[str] = mapped_column(Text)
     arm_role: Mapped[str] = mapped_column(String(16))
     timepoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    estimate_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    estimate_scale: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    ci_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    follow_up: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     approved_by_human: Mapped[bool] = mapped_column(Boolean, default=False)
     approved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -244,6 +261,19 @@ class RiskOfBiasORM(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class ReviewerORM(Base):
+    """An enrolled human reviewer. Only a salted scrypt hash of the token is stored."""
+
+    __tablename__ = "reviewers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_name: Mapped[str] = mapped_column(Text)
+    salt: Mapped[str] = mapped_column(String(64))
+    token_hash: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+    revoked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
 class GateDecisionORM(Base):
     __tablename__ = "gate_decisions"
 
@@ -251,6 +281,7 @@ class GateDecisionORM(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
     gate: Mapped[str] = mapped_column(String(16))
     verdict: Mapped[str] = mapped_column(String(16))
+    reviewer_id: Mapped[str] = mapped_column(ForeignKey("reviewers.id"), nullable=False)
     reviewer_name: Mapped[str] = mapped_column(Text)
     comments: Mapped[str | None] = mapped_column(Text, nullable=True)
     decided_at: Mapped[datetime] = mapped_column()
@@ -324,6 +355,18 @@ def make_engine(url: str = "sqlite:///:memory:", *, echo: bool = False) -> Engin
     if engine.dialect.name == "sqlite":
         event.listen(engine, "connect", _enable_sqlite_foreign_keys)
     return engine
+
+
+def prepare_sqlite_path(url: str) -> None:
+    """Create the parent directory of a file-based SQLite URL with owner-only permissions.
+
+    The database holds reviewer credential hashes and the audit trail; other OS users
+    should not be able to read or write it.
+    """
+    if not url.startswith("sqlite:///") or ":memory:" in url:
+        return
+    path = Path(url.removeprefix("sqlite:///"))
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
 def init_db(engine: Engine) -> None:

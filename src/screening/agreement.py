@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Hashable, Sequence
+from collections.abc import Hashable, Iterable, Sequence
+from dataclasses import dataclass
 
 from src.core.enums import ReviewerRole, ScreeningStage, ScreeningVerdict
 from src.core.schemas.screening import AgreementStatistics, ScreeningConflict, ScreeningDecision
@@ -99,3 +100,66 @@ def final_verdicts(
             raise ValueError(f"record {rid} has an unresolved screening conflict")
         out[rid] = conflict.resolved_verdict
     return out
+
+
+@dataclass(frozen=True, slots=True)
+class ScreeningStatus:
+    """Per-record outcome of one screening stage, derived only from recorded decisions.
+
+    ``missing`` — records lacking a decision from Reviewer 1 and/or Reviewer 2 (and no
+    human adjudication). ``unresolved`` — records whose reviewers disagree, or were both
+    uncertain, with no human resolution. Neither is ever treated as complete.
+    """
+
+    final: dict[str, ScreeningVerdict]
+    missing: tuple[str, ...]
+    unresolved: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing and not self.unresolved
+
+    def ids_with(self, verdict: ScreeningVerdict) -> set[str]:
+        return {rid for rid, v in self.final.items() if v == verdict}
+
+
+def screening_status(
+    record_ids: Iterable[str],
+    decisions: Sequence[ScreeningDecision],
+    conflicts: Sequence[ScreeningConflict],
+    stage: ScreeningStage,
+) -> ScreeningStatus:
+    """Fail-closed status of ``stage`` for ``record_ids``; never raises on incomplete data.
+
+    Precedence: a human ADJUDICATOR decision, then a resolved ``ScreeningConflict``, then
+    agreement between Reviewer 1 and Reviewer 2 on a definitive verdict.
+    """
+    by_record: dict[str, dict[ReviewerRole, ScreeningDecision]] = {}
+    for d in decisions:
+        if d.stage == stage:
+            by_record.setdefault(d.record_id, {})[d.reviewer] = d
+    resolutions = {
+        c.record_id: c.resolved_verdict
+        for c in conflicts
+        if c.stage == stage and c.resolved_verdict is not None
+    }
+    final: dict[str, ScreeningVerdict] = {}
+    missing: list[str] = []
+    unresolved: list[str] = []
+    for rid in sorted(set(record_ids)):
+        roles = by_record.get(rid, {})
+        adjudication = roles.get(ReviewerRole.ADJUDICATOR)
+        if adjudication is not None and adjudication.verdict != ScreeningVerdict.UNCERTAIN:
+            final[rid] = adjudication.verdict
+            continue
+        if rid in resolutions:
+            final[rid] = resolutions[rid]
+            continue
+        d1, d2 = roles.get(ReviewerRole.REVIEWER_1), roles.get(ReviewerRole.REVIEWER_2)
+        if d1 is None or d2 is None:
+            missing.append(rid)
+        elif d1.verdict == d2.verdict and d1.verdict != ScreeningVerdict.UNCERTAIN:
+            final[rid] = d1.verdict
+        else:
+            unresolved.append(rid)
+    return ScreeningStatus(final=final, missing=tuple(missing), unresolved=tuple(unresolved))
