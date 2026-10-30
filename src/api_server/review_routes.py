@@ -29,10 +29,12 @@ from src.extraction import (
     link_reports_to_study,
     record_unavailability,
     reject_item,
+    resolve_double_counting,
 )
 from src.fulltext import (
     DocumentStore,
     UploadRejectedError,
+    acknowledge_xml_only,
     build_manifest,
     confirm_pdf_match,
     manifest_csv,
@@ -91,6 +93,15 @@ class UnavailabilityBody(_Body):
                          "overlapping_cohort", "figure_only", "other"]  # fmt: skip
     reason: str = Field(min_length=1)
     outcome_id: str | None = None
+
+
+class DoubleCountingBody(_Body):
+    study_id: str = Field(min_length=1)
+    outcome_id: str = Field(min_length=1)
+    justification: str = Field(min_length=1)
+    keep_record_id: str | None = None
+    drop_record_ids: list[str] = Field(default_factory=list)
+    non_overlapping_record_ids: list[str] = Field(default_factory=list)
 
 
 class RoBApprovalBody(_Body):
@@ -208,6 +219,14 @@ def build_review_router(store: DocumentStore) -> APIRouter:
                                                note=body.note))  # fmt: skip
         return item.model_dump(mode="json")
 
+    @router.post("/fulltext/{record_id}/acknowledge-xml-only")
+    def xml_only(project_id: str, record_id: str, body: NoteBody, session: SessionDep,
+                 reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
+        repo = Repository(session)
+        item = _call(lambda: acknowledge_xml_only(repo, project_id, record_id,
+                                                  reviewer=reviewer, note=body.note))  # fmt: skip
+        return item.model_dump(mode="json")
+
     @router.post("/fulltext/{record_id}/unobtainable")
     def unobtainable(project_id: str, record_id: str, body: ReasonBody, session: SessionDep,
                      reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
@@ -294,6 +313,24 @@ def build_review_router(store: DocumentStore) -> APIRouter:
             )
         )  # fmt: skip
         return [x.model_dump(mode="json") for x in links]
+
+    @router.get("/extraction/double-counting")
+    def double_counting(project_id: str, session: SessionDep) -> list[str]:
+        return Repository(session).double_counting_conflicts(project_id)
+
+    @router.post("/extraction/double-counting/resolve", status_code=status.HTTP_201_CREATED)
+    def resolve_overlap(project_id: str, body: DoubleCountingBody, session: SessionDep,
+                        reviewer: ReviewerDep) -> list[str]:  # fmt: skip
+        repo = Repository(session)
+        _call(
+            lambda: resolve_double_counting(
+                repo, project_id, study_id=body.study_id, outcome_id=body.outcome_id,
+                reviewer=reviewer, justification=body.justification,
+                keep_record_id=body.keep_record_id, drop_record_ids=body.drop_record_ids,
+                non_overlapping_record_ids=body.non_overlapping_record_ids,
+            )
+        )  # fmt: skip
+        return repo.double_counting_conflicts(project_id)
 
     @router.get("/extraction/export")
     def export(project_id: str, session: SessionDep,

@@ -56,6 +56,11 @@ OTHER_PDF = synthetic_article(
 )
 
 
+async def public_dns(host: str) -> list[str]:
+    """Offline stand-in for DNS: every synthetic test host is a public address."""
+    return ["93.184.215.14"]
+
+
 def records() -> list[object]:
     return [
         make_record(
@@ -93,7 +98,12 @@ def clients(
     return (
         EuropePMCClient(**common),  # type: ignore[arg-type]
         UnpaywallClient(email="test@example.org", **common),  # type: ignore[arg-type]
-        PDFDownloader(store, http_client=http, limits=DownloadLimits(max_bytes=2_000_000)),
+        PDFDownloader(
+            store,
+            http_client=http,
+            limits=DownloadLimits(max_bytes=2_000_000),
+            resolver=public_dns,
+        ),
     )
 
 
@@ -155,7 +165,7 @@ async def test_download_failures_are_classified(
 ) -> None:
     store = DocumentStore(tmp_path)
     respx.get("https://oa.example.org/x.pdf").mock(return_value=response)
-    dl = PDFDownloader(store, limits=DownloadLimits(max_bytes=2000))
+    dl = PDFDownloader(store, limits=DownloadLimits(max_bytes=2000), resolver=public_dns)
     result = await dl.fetch("https://oa.example.org/x.pdf")
     await dl.aclose()
     assert not result.ok and result.failure == failure
@@ -168,7 +178,7 @@ async def test_download_success_network_error_and_invalid_url(tmp_path: Path) ->
     store = DocumentStore(tmp_path)
     respx.get("https://oa.example.org/ok.pdf").mock(return_value=httpx.Response(200, content=PDF))
     respx.get("https://oa.example.org/down.pdf").mock(side_effect=httpx.ConnectError("boom"))
-    dl = PDFDownloader(store)
+    dl = PDFDownloader(store, resolver=public_dns)
     ok = await dl.fetch("https://oa.example.org/ok.pdf")
     assert ok.ok and ok.stored is not None
     assert ok.stored.path.read_bytes() == PDF and ok.stored.filename == f"{ok.stored.sha256}.pdf"
@@ -266,7 +276,8 @@ async def test_network_failure_then_resume_after_restart(
         item = repo.get_fulltext_item(PID, "r1")
         assert item is not None and item.status == FullTextStatus.OA_STRUCTURED_TEXT
         assert any(a.outcome == "network_error" for a in item.attempts)
-        assert not item.blocks_gate2 and item.is_retrieved
+        # retrieved for PRISMA, but no usable PDF: Gate 2 waits for a human decision
+        assert item.is_retrieved and not item.has_usable_pdf and item.blocks_gate2
         epmc, upw, dl = clients(no_wait_limiter, no_sleep, store)
         second = await FullTextRetriever(
             repo, PID, store, downloader=dl, europepmc=epmc, unpaywall=upw

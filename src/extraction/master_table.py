@@ -32,6 +32,7 @@ from src.core.schemas.base import utc_now
 from src.core.schemas.extraction import ExtractedStudyArm
 from src.core.schemas.master import (
     ARM_DOMAINS,
+    CohortContributionDecision,
     EvidenceCheck,
     ExtractionItem,
     ExtractionReviewEvent,
@@ -403,21 +404,57 @@ def record_unavailability(
 
 
 def double_counting_risks(repo: Repository, project_id: str) -> list[str]:
-    """Accepted arm data for the same outcome/arm/timepoint from >1 report of one study."""
-    items = [i for i in repo.load_extraction_items(project_id)
-             if i.review_status == ReviewStatus.ACCEPTED and i.domain in ARM_DOMAINS]  # fmt: skip
-    studies = repo.study_ids(project_id, {i.record_id for i in items})
-    seen: dict[tuple[str, ...], set[str]] = defaultdict(set)
-    for i in items:
-        key = (studies[i.record_id], i.outcome_id or "", i.arm_role or "", i.timepoint or "",
-               i.field_name)  # fmt: skip
-        seen[key].add(i.record_id)
-    return [
-        f"study {k[0]}: {k[4]} for outcome {k[1]} ({k[2]}, {k[3] or 'no timepoint'}) comes "
-        f"from {len(v)} reports {sorted(v)} — use one report per cohort"
-        for k, v in sorted(seen.items())
-        if len(v) > 1
-    ]
+    """Same cohort, same outcome/arm/timepoint/estimator, arm data from >1 report.
+
+    These block Gate 3 → Stage 5 (``unresolved_double_counting``) until a human resolves
+    them with :func:`resolve_double_counting`.
+    """
+    return repo.double_counting_conflicts(project_id)
+
+
+def resolve_double_counting(
+    repo: Repository,
+    project_id: str,
+    *,
+    study_id: str,
+    outcome_id: str,
+    reviewer: ReviewerORM,
+    justification: str,
+    keep_record_id: str | None = None,
+    drop_record_ids: Sequence[str] = (),
+    non_overlapping_record_ids: Sequence[str] = (),
+) -> None:
+    """Document how one cohort contributes to ``outcome_id`` (exactly one mode):
+
+    * ``keep_record_id`` + ``drop_record_ids``: the dropped reports are recorded as
+      unavailable for this outcome (``overlapping_cohort``), so only one report's patients
+      are pooled;
+    * ``non_overlapping_record_ids``: a human attests the reports contribute different
+      participants (e.g. distinct recruitment periods), so all may be pooled.
+    """
+    reviewer = repo.require_active_reviewer(reviewer.id)
+    if not justification.strip():
+        raise ReviewError("a justification is required")
+    if bool(keep_record_id) == bool(non_overlapping_record_ids):
+        raise ReviewError("choose either keep_record_id or non_overlapping_record_ids")
+    if keep_record_id:
+        if not drop_record_ids or keep_record_id in drop_record_ids:
+            raise ReviewError("list the redundant reports to drop (not the kept one)")
+        for rid in drop_record_ids:
+            record_unavailability(
+                repo, project_id, rid, reviewer=reviewer, reason_code="overlapping_cohort",
+                reason=f"same cohort as {keep_record_id} (study {study_id}): {justification}",
+                outcome_id=outcome_id,
+            )  # fmt: skip
+        return
+    repo.save_contribution_decision(
+        project_id,
+        CohortContributionDecision(
+            study_id=study_id, outcome_id=outcome_id,
+            record_ids=list(non_overlapping_record_ids), justification=justification,
+            decided_by=reviewer.display_name, reviewer_id=reviewer.id,
+        ),
+    )  # fmt: skip
 
 
 EXPORT_FIELDS = (

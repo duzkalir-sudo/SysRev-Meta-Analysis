@@ -18,6 +18,7 @@ from src.core.enums import (
     ScreeningVerdict,
     SourceDatabase,
 )
+from src.core.exceptions import SysRevError
 from src.core.schemas import FullTextItem, PRISMACounts, ScreeningDecision
 from src.screening.deduplication import deduplicate
 from src.screening.prisma import PRISMATracker
@@ -225,9 +226,13 @@ def test_manifest_entry_unlocks_gate2_only_when_resolved(repo: Repository) -> No
     )
     assert violations(repo, *S3_TO_G2) == []
     assert any("still missing" in x for x in violations(repo, *G2_TO_S4))
+    upload = FullTextItem(record_id="a", title="T1", status=FullTextStatus.USER_UPLOADED,
+                          pdf_filename="a.pdf", pdf_sha256="a" * 64)  # fmt: skip
+    with pytest.raises(SysRevError, match="authenticated"):
+        repo.save_fulltext_item(PID, upload)  # an upload must name an enrolled reviewer
     repo.save_fulltext_item(
-        PID, FullTextItem(record_id="a", title="T1", status=FullTextStatus.USER_UPLOADED,
-                          pdf_filename="a.pdf", pdf_sha256="a" * 64),
+        PID, upload.model_copy(update={"recorded_by": "Dr Human",
+                                       "recorded_by_reviewer_id": HUMAN["id"]}),
     )  # fmt: skip
     assert violations(repo, *G2_TO_S4) == []
 
@@ -315,7 +320,7 @@ def test_unresolved_duplicate_candidate_blocks_and_resolution_merges(repo: Repos
 
     [cand] = repo.load_duplicate_candidates(PID)
     resolved = repo.resolve_duplicate_candidate(
-        PID, cand.candidate_id, resolution="duplicate_keep_a", resolved_by="Dr Human"
+        PID, cand.candidate_id, resolution="duplicate_keep_a", reviewer_id=HUMAN["id"]
     )
     assert resolved.is_resolved
     by_id = {r.record_id: r for r in repo.load_records(PID)}
@@ -338,11 +343,15 @@ def test_resolve_distinct_keeps_records_separate(repo: Repository) -> None:
     repo.save_records(PID, result.all_records)
     cand = result.possible_duplicates[0].to_candidate()
     repo.save_duplicate_candidate(PID, cand)
-    repo.resolve_duplicate_candidate(PID, cand.candidate_id, resolution="distinct", resolved_by="R")
+    repo.resolve_duplicate_candidate(
+        PID, cand.candidate_id, resolution="distinct", reviewer_id=HUMAN["id"]
+    )
     assert all(r.duplicate_of is None for r in repo.load_records(PID))
     assert repo.build_guard_context(PID).unresolved_duplicate_candidates == 0
     with pytest.raises(NotFoundError):
-        repo.resolve_duplicate_candidate(PID, "nope", resolution="distinct", resolved_by="R")
+        repo.resolve_duplicate_candidate(
+            PID, "nope", resolution="distinct", reviewer_id=HUMAN["id"]
+        )
 
 
 def test_resolution_repoints_existing_duplicates_of_dropped_cluster(repo: Repository) -> None:
@@ -360,7 +369,7 @@ def test_resolution_repoints_existing_duplicates_of_dropped_cluster(repo: Reposi
     c = cand.to_candidate()
     repo.save_duplicate_candidate(PID, c)
     repo.resolve_duplicate_candidate(
-        PID, c.candidate_id, resolution="duplicate_keep_a", resolved_by="R"
+        PID, c.candidate_id, resolution="duplicate_keep_a", reviewer_id=HUMAN["id"]
     )
     by_id = {r.record_id: r for r in repo.load_records(PID)}
     assert (by_id["b"].duplicate_of, by_id["c"].duplicate_of) == ("a", "a")

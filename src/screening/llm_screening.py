@@ -436,6 +436,7 @@ def adjudicate(
                 | {
                     "resolved_verdict": verdict,
                     "resolved_by": reviewer.display_name,
+                    "resolved_by_reviewer_id": reviewer.id,
                     "resolved_at": utc_now(),
                     "resolution_note": rationale,
                 }

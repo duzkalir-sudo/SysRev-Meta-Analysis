@@ -82,23 +82,59 @@ def detect_conflicts(
     return conflicts
 
 
+def _adjudications(
+    decisions: Sequence[ScreeningDecision], stage: ScreeningStage
+) -> dict[str, ScreeningDecision]:
+    """Definitive human adjudications per record (the only source of a human resolution)."""
+    return {
+        d.record_id: d
+        for d in decisions
+        if d.stage == stage
+        and d.reviewer == ReviewerRole.ADJUDICATOR
+        and d.is_human
+        and d.verdict != ScreeningVerdict.UNCERTAIN
+    }
+
+
+def _check_resolutions(
+    conflicts: Sequence[ScreeningConflict],
+    adjudications: dict[str, ScreeningDecision],
+    stage: ScreeningStage,
+) -> None:
+    for c in conflicts:
+        if c.stage != stage or c.resolved_verdict is None:
+            continue
+        adj = adjudications.get(c.record_id)
+        if adj is None or adj.verdict != c.resolved_verdict:
+            raise ValueError(
+                f"conflict for record {c.record_id} claims a resolution that no human "
+                "adjudication decision supports"
+            )
+
+
 def final_verdicts(
     decisions: Sequence[ScreeningDecision],
     conflicts: Sequence[ScreeningConflict],
     stage: ScreeningStage,
 ) -> dict[str, ScreeningVerdict]:
-    """Consensus verdict per record. Raises if any conflict is still unresolved."""
-    resolved = {c.record_id: c for c in conflicts if c.stage == stage}
+    """Consensus verdict per record. Raises if any conflict lacks a human adjudication.
+
+    A ``ScreeningConflict.resolved_verdict`` is only a mirror of a human ADJUDICATOR
+    decision; on its own it never decides a record, and a resolution that contradicts
+    (or lacks) the adjudication raises.
+    """
+    adjudications = _adjudications(decisions, stage)
+    _check_resolutions(conflicts, adjudications, stage)
     out: dict[str, ScreeningVerdict] = {}
     for rid, (d1, d2) in _pair_decisions(decisions, stage).items():
         needs_human = d1.verdict != d2.verdict or d1.verdict == ScreeningVerdict.UNCERTAIN
         if not needs_human:
             out[rid] = d1.verdict
             continue
-        conflict = resolved.get(rid)
-        if conflict is None or conflict.resolved_verdict is None:
+        adjudication = adjudications.get(rid)
+        if adjudication is None:
             raise ValueError(f"record {rid} has an unresolved screening conflict")
-        out[rid] = conflict.resolved_verdict
+        out[rid] = adjudication.verdict
     return out
 
 
@@ -131,29 +167,29 @@ def screening_status(
 ) -> ScreeningStatus:
     """Fail-closed status of ``stage`` for ``record_ids``; never raises on incomplete data.
 
-    Precedence: a human ADJUDICATOR decision, then a resolved ``ScreeningConflict``, then
-    agreement between Reviewer 1 and Reviewer 2 on a definitive verdict.
+    Precedence: a human ADJUDICATOR decision, then agreement between Reviewer 1 and
+    Reviewer 2 on a definitive verdict. A resolved ``ScreeningConflict`` row is *not* a
+    source of truth (it only mirrors an adjudication), so a fabricated or stale resolution
+    can never release a missing or conflicting record. ``conflicts`` is accepted for
+    signature compatibility.
     """
     by_record: dict[str, dict[ReviewerRole, ScreeningDecision]] = {}
     for d in decisions:
         if d.stage == stage:
             by_record.setdefault(d.record_id, {})[d.reviewer] = d
-    resolutions = {
-        c.record_id: c.resolved_verdict
-        for c in conflicts
-        if c.stage == stage and c.resolved_verdict is not None
-    }
+    del conflicts  # resolutions are derived from human adjudication decisions only
     final: dict[str, ScreeningVerdict] = {}
     missing: list[str] = []
     unresolved: list[str] = []
     for rid in sorted(set(record_ids)):
         roles = by_record.get(rid, {})
         adjudication = roles.get(ReviewerRole.ADJUDICATOR)
-        if adjudication is not None and adjudication.verdict != ScreeningVerdict.UNCERTAIN:
+        if (
+            adjudication is not None
+            and adjudication.is_human
+            and adjudication.verdict != ScreeningVerdict.UNCERTAIN
+        ):
             final[rid] = adjudication.verdict
-            continue
-        if rid in resolutions:
-            final[rid] = resolutions[rid]
             continue
         d1, d2 = roles.get(ReviewerRole.REVIEWER_1), roles.get(ReviewerRole.REVIEWER_2)
         if d1 is None or d2 is None:

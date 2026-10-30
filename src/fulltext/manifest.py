@@ -24,6 +24,7 @@ class ManifestRow:
     pmid: str | None
     pmcid: str | None
     status: str
+    usable_pdf: bool
     match_status: str | None
     last_attempt: str | None
     notes: str
@@ -58,6 +59,7 @@ def build_manifest(
                 pmid=record.pmid,
                 pmcid=record.pmcid or (item.pmcid if item else None),
                 status=item.status.value if item else "not_attempted",
+                usable_pdf=bool(item and item.has_usable_pdf),
                 match_status=item.match_status.value if item and item.match_status else None,
                 last_attempt=f"{last.service}: {last.outcome}" if last else None,
                 notes=" | ".join(item.match_notes) if item else "",
@@ -86,10 +88,15 @@ class ReportFlow:
 
     ``not_retrieved`` (sought but unobtainable) is kept separate from reports that were
     retrieved and then excluded at full-text eligibility (``excluded_by_reason``).
+    Retrieved reports are split into those with a usable (identity-confirmed) PDF and
+    those available only as structured XML, which cannot yet support page-grounded
+    numeric extraction.
     """
 
     sought: int
     not_retrieved: tuple[str, ...]
+    retrieved_with_pdf: tuple[str, ...]
+    retrieved_structured_text_only: tuple[str, ...]
     awaiting_retrieval: tuple[str, ...]
     assessed: int
     excluded_by_reason: dict[str, int]
@@ -122,6 +129,10 @@ def report_flow(repo: Repository, project_id: str) -> ReportFlow:
     studies = set(repo.study_ids(project_id, included).values())
     return ReportFlow(
         sought=len(sought),
+        retrieved_with_pdf=tuple(sorted(r for r in retrieved if items[r].has_usable_pdf)),
+        retrieved_structured_text_only=tuple(
+            sorted(r for r in retrieved if items[r].status.value == "oa_structured_text")
+        ),
         not_retrieved=tuple(sorted(unobtainable)),
         awaiting_retrieval=tuple(sorted(sought - retrieved - unobtainable)),
         assessed=len(retrieved),

@@ -308,6 +308,7 @@ def register_upload(
             "match_status": status,
             "match_notes": notes,
             "recorded_by": reviewer.display_name,
+            "recorded_by_reviewer_id": reviewer.id,
             "xml_filename": previous.xml_filename if previous else None,
             "xml_sha256": previous.xml_sha256 if previous else None,
         }
@@ -331,6 +332,7 @@ def confirm_pdf_match(
         | {
             "match_status": UploadMatchStatus.HUMAN_CONFIRMED,
             "confirmed_by": reviewer.display_name,
+            "confirmed_by_reviewer_id": reviewer.id,
             "match_notes": [*item.match_notes, f"confirmed by {reviewer.display_name}: {note}"],
         }
     )
@@ -353,7 +355,36 @@ def mark_unobtainable(
             "status": FullTextStatus.UNOBTAINABLE,
             "unobtainable_reason": reason,
             "recorded_by": reviewer.display_name,
+            "recorded_by_reviewer_id": reviewer.id,
         }
     )
     repo.save_fulltext_item(project_id, item)
     return item
+
+
+def acknowledge_xml_only(
+    repo: Repository, project_id: str, record_id: str, *, reviewer: ReviewerORM, note: str
+) -> FullTextItem:
+    """A human records that only structured XML is available (no usable PDF).
+
+    This releases Gate 2 for the report (it was retrieved and can be assessed for
+    eligibility), but it does not make the report extraction-ready: numeric evidence must
+    cite a physical PDF page, so until a PDF is uploaded the report blocks Gate 3 unless
+    it is recorded as unavailable for quantitative synthesis.
+    """
+    reviewer = repo.require_active_reviewer(reviewer.id)
+    if not note.strip():
+        raise ValueError("an acknowledgement note is required (e.g. which sources were tried)")
+    item = repo.get_fulltext_item(project_id, record_id)
+    if item is None or item.status != FullTextStatus.OA_STRUCTURED_TEXT:
+        raise SysRevError(f"record {record_id} is not an XML-only full-text item")
+    acknowledged = FullTextItem.model_validate(
+        item.model_dump()
+        | {
+            "xml_only_acknowledged_by": reviewer.display_name,
+            "xml_only_acknowledged_reviewer_id": reviewer.id,
+            "xml_only_note": note,
+        }
+    )
+    repo.save_fulltext_item(project_id, acknowledged)
+    return acknowledged

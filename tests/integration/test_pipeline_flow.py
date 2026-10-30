@@ -43,6 +43,7 @@ from src.core.schemas import (
     NumericClaimCheck,
     ScreeningDecision,
 )
+from src.extraction import record_unavailability
 from src.screening import (
     CohortOverlapDetector,
     Deduplicator,
@@ -51,6 +52,7 @@ from src.screening import (
     detect_conflicts,
     final_verdicts,
 )
+from src.screening.llm_screening import adjudicate
 from src.state.repository import Repository
 from tests.conftest import NOW, approved_rob, make_arm, make_protocol
 from tests.unit.test_api_clients import EPMC_RESULT, OPENALEX_WORK, esearch_json
@@ -227,27 +229,15 @@ async def test_full_pipeline(
     assert any("screening conflict" in v for v in info.value.violations)
     assert any("cohort-overlap" in v for v in info.value.violations)
 
+    human = repo.require_active_reviewer(REVIEWER["id"])
     for c in repo.load_conflicts(PID):
-        repo.save_conflict(
-            PID,
-            c.model_copy(
-                update={
-                    "resolved_verdict": ScreeningVerdict.INCLUDE,
-                    "resolved_by": "Dr Human Reviewer",
-                    "resolved_at": NOW,
-                }
-            ),
-        )
+        adjudicate(repo, PID, c.record_id, c.stage, verdict=ScreeningVerdict.INCLUDE,
+                   rationale="eligible on adjudication", reviewer=human)  # fmt: skip
     for w in repo.load_overlap_warnings(PID):
-        repo.save_overlap_warning(
-            PID,
-            w.model_copy(
-                update={
-                    "resolution": OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
-                    "resolved_by": "Dr Human Reviewer",
-                }
-            ),
-        )
+        repo.resolve_overlap_warning(
+            PID, w.warning_id, resolution=OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
+            reviewer_id=REVIEWER["id"], note="same cohort, different follow-up",
+        )  # fmt: skip
 
     verdicts = final_verdicts(
         repo.load_screening_decisions(PID), repo.load_conflicts(PID), ScreeningStage.TITLE_ABSTRACT
@@ -292,6 +282,8 @@ async def test_full_pipeline(
                 "status": FullTextStatus.USER_UPLOADED,
                 "pdf_filename": "followup.pdf",
                 "pdf_sha256": "f" * 64,
+                "recorded_by": "Dr Human Reviewer",
+                "recorded_by_reviewer_id": REVIEWER["id"],
             }
         ),
     )
@@ -348,6 +340,19 @@ async def test_full_pipeline(
     prisma.record_fulltext_decision(follow_id, include=True)
     prisma.set_studies_included(1)  # two reports of one cohort (overlap warning resolved)
     repo.save_prisma(PID, prisma.snapshot())
+    # Both reports of the same cohort carry arm data for the same outcome: blocked until a
+    # human chooses one report, so the cohort's patients are not pooled twice.
+    with pytest.raises(GuardViolationError, match="more than one report of the same cohort"):
+        decide(repo, gate(GateId.GATE_3))
+    record_unavailability(
+        repo,
+        PID,
+        follow_id,
+        reviewer=human,
+        reason_code="overlapping_cohort",
+        reason="follow-up report of the main cohort",
+        outcome_id="hba1c",
+    )
     decide(repo, gate(GateId.GATE_3))
     assert repo.get_project(PID).phase == Phase.STAGE5_META_ANALYSIS
 

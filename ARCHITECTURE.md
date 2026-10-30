@@ -103,9 +103,14 @@ persisted rows. Absent data (no PRISMA snapshot, no manifest rows, no decisions)
 reported as missing work, never as completion.
 
 Screening status is computed per record from the stored `ScreeningDecision`s
-(`screening_status()`): a record is *decided* only when a human adjudicator decided it,
-a stored conflict was resolved, or Reviewer 1 and Reviewer 2 agree on include/exclude.
-A disagreement counts as unresolved even if no `ScreeningConflict` row was ever saved.
+(`screening_status()`): a record is *decided* only when an authenticated human
+adjudicator decided it, or Reviewer 1 and Reviewer 2 agree on include/exclude. A
+`ScreeningConflict` resolution is never a source of truth: it is persisted only as a
+mirror of a matching human ADJUDICATOR decision by an active enrolled reviewer
+(`save_conflict()` also checks that the conflict matches the stored reviewer decisions),
+and the guards ignore conflict rows entirely, so an injected or fabricated resolution
+cannot release a missing or conflicting record. A disagreement counts as unresolved
+even if no `ScreeningConflict` row was ever saved.
 
 | Transition | Guard (all must hold) |
 |------------|------------------------|
@@ -113,9 +118,9 @@ A disagreement counts as unresolved even if no `ScreeningConflict` row was ever 
 | Stage 2 → Gate 1.5 | ≥1 stored record; **every unique (non-duplicate) record has title/abstract decisions from both reviewers**; PRISMA snapshot recorded, internally consistent and consistent with stored records |
 | Gate 1.5 → Stage 3 | As above, plus 0 unresolved title/abstract disagreements; 0 unresolved possible-duplicate pairs; 0 unresolved cohort-overlap warnings; PRISMA shows 0 records awaiting screening; ≥1 record included |
 | Stage 3 → Gate 2 | **Every title/abstract-included record has a full-text manifest entry** |
-| Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, structured-text-only, or `UNOBTAINABLE` with a reason; **no linked PDF has an uncertain or mismatched identity** unless a human confirmed it |
-| Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); **every full-text outcome resting only on automated passes is confirmed by an authenticated human**; ≥1 report included; every included report has ≥1 extracted arm, belongs to a study (§9.3) that has one, or is recorded as qualitative-only by a human; no arm belongs to a non-included report; 0 values without `SourceEvidence` |
-| Gate 3 → Stage 5 | As above, plus every arm approved by a human; **0 master-table items awaiting review; every included study has a human-approved risk-of-bias assessment**; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
+| Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, `UNOBTAINABLE` with a reason, or structured-text-only **with a human acknowledgement that no usable PDF is available**; **no linked PDF has an uncertain or mismatched identity** unless a human confirmed it |
+| Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); **every full-text outcome resting only on automated passes is confirmed by an authenticated human**; ≥1 report included; every included report has ≥1 extracted arm, belongs to a study (§9.3) that has one, or is recorded as qualitative-only by a human; **no included report lacking data is XML-only or without a confirmed PDF**; no arm belongs to a non-included report; 0 values without `SourceEvidence` |
+| Gate 3 → Stage 5 | As above, plus every arm approved by a human; **0 master-table items awaiting review; every included study has a human-approved risk-of-bias assessment; no outcome receives arm data from two reports of the same cohort without a documented human resolution (§9.3)**; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
 | Stage 5 → Stage 6 | `stats_output.json` produced (hash recorded) |
 | Stage 6 → Audit | Manuscript draft exists |
 | Audit → COMPLETED | Latest `AuditReport.passed is True` |
@@ -285,9 +290,11 @@ SQLAlchemy 2.0 typed ORM on SQLite (any SQLAlchemy URL works).
   uploader), `extraction_items` (the Master Extraction Table; a reviewed item can no
   longer be changed — corrections create a new version), `study_report_links`
   (report → study), `quantitative_unavailability` (qualitative-only inclusion).
-* Every *human* action persisted in Stages 2–4 (screening adjudication, PDF upload or
-  identity confirmation, unobtainable declaration, extraction review, arm approval,
-  study linking, risk-of-bias approval) passes `Repository.require_active_reviewer()`:
+* Every *human* action persisted in Stages 2–4 (screening adjudication and conflict
+  resolution, duplicate-candidate and cohort-overlap resolution, PDF upload or identity
+  confirmation, unobtainable / XML-only declarations, extraction review, arm approval,
+  study linking, double-counting resolution, risk-of-bias approval) records the reviewer
+  id and passes `Repository.require_active_reviewer()`:
   an unknown or revoked reviewer id is refused at the persistence layer, not only at the
   HTTP layer. `approve_extracted_arm()` now takes the authenticated `reviewer_id`.
 * `projects.version_id` provides optimistic concurrency; `record_transition()` also
@@ -484,8 +491,17 @@ fetched; no paywall or authentication is circumvented. Downloads are streamed wi
 byte limit, require a `%PDF-` header within the first 1 KiB, are opened with pypdf, and
 are moved atomically into a content-addressed store (`<sha256>.pdf`). Each attempt is
 recorded (`RetrievalAttempt`); failures leave the report `MISSING`, never excluded.
-XML-only reports are *retrieved* (`OA_STRUCTURED_TEXT`) but are retried for a PDF on later
-runs because numeric evidence must cite a physical PDF page. Every PDF (OA or uploaded)
+XML-only reports are *retrieved* for PRISMA (`OA_STRUCTURED_TEXT`) but are **not
+extraction-ready**: numeric evidence must cite a physical PDF page, so they are retried
+for a PDF on later runs, block Gate 2 until a reviewer calls `acknowledge_xml_only()`,
+and block Gate 3 while included without data unless a PDF is uploaded or the report is
+recorded as unavailable for quantitative synthesis. `report_flow()` separates reports
+retrieved with a usable PDF, retrieved as structured XML only, and not retrieved.
+**Download safety (SSRF):** every request target, including each redirect hop (followed
+manually, at most 5), must be http(s) without credentials and resolve only to globally
+routable addresses; loopback, private, link-local (incl. cloud metadata), CGNAT,
+multicast and reserved ranges are refused before any request is sent. DNS rebinding
+between the check and the connection is not prevented. Every PDF (OA or uploaded)
 is checked against its record (`assess_match`: DOI/PMID on page 1, fuzzy title,
 first-author surname; identical bytes linked to another record); uncertain or mismatched
 links block Gate 2 until `confirm_pdf_match()` by a reviewer. `mark_unobtainable()`
@@ -533,8 +549,13 @@ into human-approved `ExtractedStudyArm`s keyed by report, outcome, arm, timepoin
 estimator**, so crude proportions and KM/cumulative-incidence estimates are never merged;
 `analysis_compatibility()` states whether an arm can inform an outcome's summary measure
 without conversion. Reports are linked to studies (`link_reports_to_study`);
-`double_counting_risks()` flags the same outcome/arm/timepoint datum accepted from two
-reports of one study; `record_unavailability()` records an eligible study that is
+`double_counting_conflicts()` groups approved arms by cohort (study links plus
+cohort-overlap warnings a human resolved as overlapping), outcome, arm role, timepoint
+and estimator; a group fed by two or more reports blocks Gate 3 → Stage 5 until
+`resolve_double_counting()` records either "keep one report" (the others become
+`overlapping_cohort` unavailability for that outcome) or a reviewer-attested
+`CohortContributionDecision` that the reports contribute non-overlapping samples.
+Different outcomes, timepoints and estimators never collide; `record_unavailability()` records an eligible study that is
 available only for qualitative synthesis (or not for one outcome) with a reason.
 `export_rows()` → CSV/JSON with study and report ids, every evidence field, verification
 and review status.

@@ -87,12 +87,14 @@ class GuardContext:
     ft_included: int
     ft_awaiting_human_confirmation: int
     included_reports_without_extraction: int
+    included_reports_without_usable_pdf: int
     arms_for_non_included_reports: int
     extracted_values_without_evidence: int
     extraction_arms: int
     unapproved_extraction_arms: int
     extraction_items_pending: int
     included_studies_without_approved_rob: int
+    unresolved_double_counting: int
     # Stages 5-6
     stats_output_present: bool
     manuscript_present: bool
@@ -189,6 +191,12 @@ def _extraction_grounded(c: GuardContext) -> list[str]:
         v.append(
             f"{c.included_reports_without_extraction} included report(s) have no extracted data"
         )
+    if c.included_reports_without_usable_pdf:
+        v.append(
+            f"{c.included_reports_without_usable_pdf} included report(s) have no usable PDF "
+            "(structured XML only or unconfirmed identity): upload the PDF or record the "
+            "report as unavailable for quantitative synthesis"
+        )
     if c.arms_for_non_included_reports:
         v.append(
             f"{c.arms_for_non_included_reports} extracted arm(s) belong to reports not included "
@@ -205,6 +213,11 @@ def _extraction_approved(c: GuardContext) -> list[str]:
         v.append(f"{c.unapproved_extraction_arms} extraction arm(s) not approved by a human")
     if c.extraction_items_pending:
         v.append(f"{c.extraction_items_pending} master-table extraction item(s) await human review")
+    if c.unresolved_double_counting:
+        v.append(
+            f"{c.unresolved_double_counting} outcome(s) receive arm data from more than one "
+            "report of the same cohort: keep one report or document non-overlapping samples"
+        )
     if c.included_studies_without_approved_rob:
         v.append(
             f"{c.included_studies_without_approved_rob} included study(ies) lack a "

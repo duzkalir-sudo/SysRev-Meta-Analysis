@@ -19,6 +19,7 @@ from src.core.enums import (
     ReviewStatus,
     ScreeningStage,
     ScreeningVerdict,
+    UploadMatchStatus,
 )
 from src.core.exceptions import SysRevError
 from src.core.schemas import (
@@ -40,6 +41,7 @@ from src.core.schemas import (
 )
 from src.core.schemas.base import utc_now
 from src.core.schemas.master import (
+    CohortContributionDecision,
     ExtractionItem,
     ExtractionReviewEvent,
     QuantitativeUnavailability,
@@ -56,6 +58,7 @@ from src.core.security import (
 from src.screening.agreement import screening_status
 from src.state.db import (
     AuditReportORM,
+    CohortContributionDecisionORM,
     CohortOverlapWarningORM,
     DuplicateCandidateORM,
     ExtractedArmORM,
@@ -342,6 +345,13 @@ class Repository:
         return [ScreeningDecision.model_validate(r.payload) for r in rows]
 
     def save_conflict(self, project_id: str, conflict: ScreeningConflict) -> None:
+        """Persist a conflict that matches the stored reviewer decisions.
+
+        A *resolved* conflict is accepted only as a mirror of an existing human
+        ADJUDICATOR decision by an active, enrolled reviewer with the same verdict; a
+        stored resolution can never be changed or withdrawn.
+        """
+        self._validate_conflict(project_id, conflict)
         self.session.merge(
             ScreeningConflictORM(
                 id=conflict.conflict_id,
@@ -356,6 +366,49 @@ class Repository:
         )
         self.session.flush()
 
+    def _validate_conflict(self, project_id: str, conflict: ScreeningConflict) -> None:
+        stage = conflict.stage
+        existing = self.session.scalars(
+            select(ScreeningConflictORM).where(
+                ScreeningConflictORM.project_id == project_id,
+                ScreeningConflictORM.record_id == conflict.record_id,
+                ScreeningConflictORM.stage == stage.value,
+            )
+        ).first()
+        if existing is not None:
+            if existing.id != conflict.conflict_id:
+                raise SysRevError(f"a conflict for {conflict.record_id} at {stage} already exists")
+            if existing.resolved_verdict is not None:
+                raise SysRevError(f"conflict {conflict.conflict_id} is already resolved")
+        for role, claimed in (
+            (ReviewerRole.REVIEWER_1, conflict.reviewer_1_verdict),
+            (ReviewerRole.REVIEWER_2, conflict.reviewer_2_verdict),
+        ):
+            source = self.find_screening_decision(project_id, conflict.record_id, role, stage)
+            if source is None or source.verdict != claimed:
+                raise SysRevError(
+                    f"conflict for {conflict.record_id} does not match the stored {role} "
+                    f"decision at {stage}"
+                )
+        if conflict.resolved_verdict is None:
+            return
+        reviewer = self.require_active_reviewer(conflict.resolved_by_reviewer_id)
+        if conflict.resolved_by != reviewer.display_name:
+            raise SysRevError("resolved_by does not match the enrolled reviewer")
+        adjudication = self.find_screening_decision(
+            project_id, conflict.record_id, ReviewerRole.ADJUDICATOR, stage
+        )
+        if (
+            adjudication is None
+            or not adjudication.is_human
+            or adjudication.reviewer_id != reviewer.id
+            or adjudication.verdict != conflict.resolved_verdict
+        ):
+            raise SysRevError(
+                f"resolution of {conflict.record_id} is not backed by a matching human "
+                "adjudication decision"
+            )
+
     def load_conflicts(self, project_id: str) -> list[ScreeningConflict]:
         rows = self.session.scalars(
             select(ScreeningConflictORM).where(ScreeningConflictORM.project_id == project_id)
@@ -364,6 +417,10 @@ class Repository:
 
     # ------------------------------------------------------------------ duplicate candidates
     def save_duplicate_candidate(self, project_id: str, candidate: DuplicateCandidate) -> None:
+        if candidate.is_resolved:
+            reviewer = self.require_active_reviewer(candidate.resolved_by_reviewer_id)
+            if candidate.resolved_by != reviewer.display_name:
+                raise SysRevError("resolved_by does not match the enrolled reviewer")
         self.session.merge(
             DuplicateCandidateORM(
                 id=candidate.candidate_id,
@@ -390,7 +447,7 @@ class Repository:
         candidate_id: str,
         *,
         resolution: str,
-        resolved_by: str,
+        reviewer_id: str,
         note: str | None = None,
     ) -> DuplicateCandidate:
         """Record a human adjudication; ``duplicate_keep_*`` re-points the dropped cluster.
@@ -398,14 +455,18 @@ class Repository:
         The caller remains responsible for updating PRISMA ``duplicates_removed``; the guard
         cross-check rejects the PRISMA snapshot until it matches the stored records.
         """
+        reviewer = self.require_active_reviewer(reviewer_id)
         row = self.session.get(DuplicateCandidateORM, candidate_id)
         if row is None or row.project_id != project_id:
             raise NotFoundError(f"duplicate candidate {candidate_id} not found")
+        if row.resolution != "unresolved":
+            raise SysRevError(f"duplicate candidate {candidate_id} is already resolved")
         resolved = DuplicateCandidate.model_validate(
             row.payload
             | {
                 "resolution": resolution,
-                "resolved_by": resolved_by,
+                "resolved_by": reviewer.display_name,
+                "resolved_by_reviewer_id": reviewer.id,
                 "resolved_at": utc_now(),
                 "resolution_note": note,
             }
@@ -444,6 +505,10 @@ class Repository:
 
     # ------------------------------------------------------------------ cohort overlap
     def save_overlap_warning(self, project_id: str, warning: CohortOverlapWarning) -> None:
+        if warning.resolution != OverlapResolution.UNRESOLVED:
+            reviewer = self.require_active_reviewer(warning.resolved_by_reviewer_id)
+            if warning.resolved_by != reviewer.display_name:
+                raise SysRevError("resolved_by does not match the enrolled reviewer")
         self.session.merge(
             CohortOverlapWarningORM(
                 id=warning.warning_id,
@@ -458,6 +523,34 @@ class Repository:
         )
         self.session.flush()
 
+    def resolve_overlap_warning(
+        self,
+        project_id: str,
+        warning_id: str,
+        *,
+        resolution: OverlapResolution,
+        reviewer_id: str,
+        note: str | None = None,
+    ) -> CohortOverlapWarning:
+        """Record a human cohort-overlap decision on behalf of an enrolled reviewer."""
+        reviewer = self.require_active_reviewer(reviewer_id)
+        row = self.session.get(CohortOverlapWarningORM, warning_id)
+        if row is None or row.project_id != project_id:
+            raise NotFoundError(f"cohort-overlap warning {warning_id} not found")
+        if row.resolution != OverlapResolution.UNRESOLVED.value:
+            raise SysRevError(f"cohort-overlap warning {warning_id} is already resolved")
+        resolved = CohortOverlapWarning.model_validate(
+            row.payload
+            | {
+                "resolution": resolution,
+                "resolved_by": reviewer.display_name,
+                "resolved_by_reviewer_id": reviewer.id,
+                "resolution_note": note,
+            }
+        )
+        self.save_overlap_warning(project_id, resolved)
+        return resolved
+
     def load_overlap_warnings(self, project_id: str) -> list[CohortOverlapWarning]:
         rows = self.session.scalars(
             select(CohortOverlapWarningORM).where(CohortOverlapWarningORM.project_id == project_id)
@@ -466,6 +559,7 @@ class Repository:
 
     # ------------------------------------------------------------------ full text
     def save_fulltext_item(self, project_id: str, item: FullTextItem) -> None:
+        self._require_fulltext_humans(item)
         existing = self.session.scalars(
             select(FullTextItemORM).where(
                 FullTextItemORM.project_id == project_id,
@@ -479,6 +573,20 @@ class Repository:
         row.payload = item.model_dump(mode="json")
         self.session.add(row)
         self.session.flush()
+
+    def _require_fulltext_humans(self, item: FullTextItem) -> None:
+        """Human manifest decisions must name an active, enrolled reviewer."""
+        checks: list[tuple[str | None, str | None]] = []
+        if item.match_status == UploadMatchStatus.HUMAN_CONFIRMED:
+            checks.append((item.confirmed_by_reviewer_id, item.confirmed_by))
+        if item.status in (FullTextStatus.UNOBTAINABLE, FullTextStatus.USER_UPLOADED):
+            checks.append((item.recorded_by_reviewer_id, item.recorded_by))
+        if item.xml_only_acknowledged_by is not None:
+            checks.append((item.xml_only_acknowledged_reviewer_id, item.xml_only_acknowledged_by))
+        for reviewer_id, name in checks:
+            reviewer = self.require_active_reviewer(reviewer_id)
+            if name != reviewer.display_name:
+                raise SysRevError("recorded reviewer name does not match the enrolled reviewer")
 
     def missing_fulltext_manifest(self, project_id: str) -> list[FullTextItem]:
         rows = self.session.scalars(
@@ -861,6 +969,108 @@ class Repository:
         )  # fmt: skip
         self.session.flush()
 
+    def save_contribution_decision(
+        self, project_id: str, decision: CohortContributionDecision
+    ) -> None:
+        reviewer = self.require_active_reviewer(decision.reviewer_id)
+        if decision.decided_by != reviewer.display_name:
+            raise SysRevError("decided_by does not match the enrolled reviewer")
+        for rid in decision.record_ids:
+            self.get_record(project_id, rid)
+        self.session.add(
+            CohortContributionDecisionORM(
+                id=decision.decision_id, project_id=project_id, study_id=decision.study_id,
+                outcome_id=decision.outcome_id, payload=decision.model_dump(mode="json"),
+            )
+        )  # fmt: skip
+        self.session.flush()
+
+    def load_contribution_decisions(self, project_id: str) -> list[CohortContributionDecision]:
+        rows = self.session.scalars(
+            select(CohortContributionDecisionORM).where(
+                CohortContributionDecisionORM.project_id == project_id
+            )
+        ).all()
+        return [CohortContributionDecision.model_validate(r.payload) for r in rows]
+
+    def cohort_ids(self, project_id: str, record_ids: set[str]) -> dict[str, str]:
+        """``record_id -> cohort label``: reports linked to one study, or judged by a human
+        to share participants (cohort-overlap warnings resolved as overlapping), share a
+        label. Used to prevent the same patients from being pooled twice."""
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        studies = self.study_ids(project_id)
+        by_study: dict[str, list[str]] = {}
+        for rid, sid in studies.items():
+            by_study.setdefault(sid, []).append(rid)
+        for members in by_study.values():
+            for other in members[1:]:
+                union(members[0], other)
+        overlapping = {
+            OverlapResolution.OVERLAPPING_KEEP_A,
+            OverlapResolution.OVERLAPPING_KEEP_B,
+            OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
+        }
+        for w in self.load_overlap_warnings(project_id):
+            if w.resolution in overlapping:
+                union(w.record_id_a, w.record_id_b)
+        labels: dict[str, str] = {}
+        for rid in record_ids:
+            root = find(rid)
+            members = sorted(r for r in parent if find(r) == root) or [rid]
+            labels[rid] = next((studies[m] for m in members if m in studies), min(members))
+        return labels
+
+    def double_counting_conflicts(self, project_id: str) -> list[str]:
+        """Outcome data from more than one report of the same cohort, unresolved by a human.
+
+        Arms are grouped by cohort, outcome, arm role, timepoint and estimator. A group fed
+        by several reports is a conflict unless the redundant reports are recorded as
+        unavailable for that outcome (``overlapping_cohort``) or a human documented that
+        they contribute non-overlapping samples. Different outcomes, timepoints and
+        estimators never collide.
+        """
+        arms = self.load_extracted_arms(project_id)
+        excluded = {(u.record_id, u.outcome_id) for u in self.load_unavailability(project_id)}
+        arms = [
+            a
+            for a in arms
+            if (a.record_id, a.outcome_id) not in excluded and (a.record_id, None) not in excluded
+        ]
+        cohorts = self.cohort_ids(project_id, {a.record_id for a in arms})
+        groups: dict[tuple[str, str, str, str, str], set[str]] = {}
+        for a in arms:
+            key = (cohorts[a.record_id], a.outcome_id, a.arm_role.value, a.timepoint or "",
+                   a.estimate_type.value if a.estimate_type else "raw counts/summary")  # fmt: skip
+            groups.setdefault(key, set()).add(a.record_id)
+        declared = [
+            (d.outcome_id, set(d.record_ids)) for d in self.load_contribution_decisions(project_id)
+        ]
+        problems: list[str] = []
+        for key, records in sorted(groups.items()):
+            if len(records) < 2:
+                continue
+            if any(o == key[1] and records <= ids for o, ids in declared):
+                continue
+            problems.append(
+                f"study/cohort {key[0]}: outcome {key[1]} ({key[2]}, {key[3] or 'no timepoint'},"
+                f" {key[4]}) has arms from {len(records)} reports {sorted(records)} — keep one "
+                "report or document non-overlapping samples"
+            )
+        return problems
+
     def load_unavailability(self, project_id: str) -> list[QuantitativeUnavailability]:
         rows = self.session.scalars(
             select(QuantitativeUnavailabilityORM).where(
@@ -972,6 +1182,9 @@ class Repository:
             if a.approved_by_human
         }
         studies_without_rob = {studies[rid] for rid in ft_included} - approved_rob_studies
+        without_usable_pdf = {
+            rid for rid in without_extraction if rid not in items or not items[rid].has_usable_pdf
+        }
         pending_items = count(
             select(func.count())
             .select_from(ExtractionItemORM)
@@ -1050,12 +1263,14 @@ class Repository:
             ft_included=len(ft_included),
             ft_awaiting_human_confirmation=len(ft_unconfirmed),
             included_reports_without_extraction=len(without_extraction),
+            included_reports_without_usable_pdf=len(without_usable_pdf),
             arms_for_non_included_reports=sum(1 for rid, _ in arm_rows if rid not in ft_included),
             extracted_values_without_evidence=no_evidence,
             extraction_arms=len(arm_rows),
             unapproved_extraction_arms=sum(1 for _, approved in arm_rows if not approved),
             extraction_items_pending=pending_items,
             included_studies_without_approved_rob=len(studies_without_rob),
+            unresolved_double_counting=len(self.double_counting_conflicts(project_id)),
             stats_output_present=project.stats_output_sha256 is not None,
             manuscript_present=project.manuscript_version is not None,
             audit_passed=None if audit is None else audit.passed,
@@ -1067,15 +1282,16 @@ class Repository:
         decisions: list[ScreeningDecision],
         conflicts: list[ScreeningConflict],
     ) -> set[str]:
-        """Full-text outcomes not confirmed by any human (adjudication or human reviewers)."""
+        """Full-text outcomes not confirmed by any human (adjudication or human reviewers).
+
+        Conflict rows are ignored: only persisted, authenticated human decisions count.
+        """
+        del conflicts
         human: set[str] = set()
         by_record: dict[str, list[ScreeningDecision]] = {}
         for d in decisions:
             if d.stage == ScreeningStage.FULL_TEXT:
                 by_record.setdefault(d.record_id, []).append(d)
-        for c in conflicts:
-            if c.stage == ScreeningStage.FULL_TEXT and c.is_resolved:
-                human.add(c.record_id)
         for rid, ds in by_record.items():
             roles = {d.reviewer for d in ds if d.is_human}
             if (

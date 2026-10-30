@@ -13,6 +13,7 @@ from src.extraction.master_table import (
     link_reports_to_study,
     record_unavailability,
     reject_item,
+    resolve_double_counting,
     reverify_items,
     submit_proposals,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "proposal_to_item",
     "record_unavailability",
     "reject_item",
+    "resolve_double_counting",
     "reverify_items",
     "select_rob_tool",
     "submit_proposals",

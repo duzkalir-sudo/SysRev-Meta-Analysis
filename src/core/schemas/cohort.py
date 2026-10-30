@@ -42,6 +42,7 @@ class CohortOverlapWarning(StrictModel):
     created_at: AwareDatetime = Field(default_factory=utc_now)
     resolution: OverlapResolution = OverlapResolution.UNRESOLVED
     resolved_by: str | None = None
+    resolved_by_reviewer_id: Identifier | None = None
     resolution_note: str | None = None
 
     @model_validator(mode="after")

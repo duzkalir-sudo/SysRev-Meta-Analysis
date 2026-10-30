@@ -41,6 +41,7 @@ AttemptOutcome = Literal[
     "retrieved",
     "not_available",
     "invalid_url",
+    "blocked_url",
     "network_error",
     "http_error",
     "not_pdf",
@@ -96,9 +97,16 @@ class FullTextItem(StrictModel):
     match_status: UploadMatchStatus | None = None
     match_notes: list[str] = Field(default_factory=list)
     confirmed_by: str | None = None
+    confirmed_by_reviewer_id: Identifier | None = None
     recorded_by: str | None = Field(
         default=None, description="authenticated reviewer who uploaded / marked unobtainable"
     )
+    recorded_by_reviewer_id: Identifier | None = None
+    # XML-only full text: retrieved for PRISMA, but NOT usable for page-grounded extraction.
+    # Gate 2 stays blocked until a human acknowledges that no usable PDF is available.
+    xml_only_acknowledged_by: str | None = None
+    xml_only_acknowledged_reviewer_id: Identifier | None = None
+    xml_only_note: str | None = None
     attempts: list[RetrievalAttempt] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -121,6 +129,18 @@ class FullTextItem(StrictModel):
         return self.status in (*_PDF_STATUSES, FullTextStatus.OA_STRUCTURED_TEXT)
 
     @property
+    def has_usable_pdf(self) -> bool:
+        """A PDF exists and its identity is confirmed: the only basis for extraction."""
+        return self.status in _PDF_STATUSES and not self.match_unconfirmed
+
+    @property
+    def xml_only_unacknowledged(self) -> bool:
+        return (
+            self.status == FullTextStatus.OA_STRUCTURED_TEXT
+            and self.xml_only_acknowledged_by is None
+        )
+
+    @property
     def match_unconfirmed(self) -> bool:
         return self.status in _PDF_STATUSES and self.match_status in (
             UploadMatchStatus.UNCERTAIN,
@@ -132,6 +152,7 @@ class FullTextItem(StrictModel):
         return (
             self.status in (FullTextStatus.PENDING, FullTextStatus.MISSING)
             or self.match_unconfirmed
+            or self.xml_only_unacknowledged
         )
 
 

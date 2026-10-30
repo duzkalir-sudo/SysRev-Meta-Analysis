@@ -87,6 +87,9 @@ class ScreeningConflict(StrictModel):
     reviewer_2_verdict: ScreeningVerdict
     resolved_verdict: ScreeningVerdict | None = None
     resolved_by: str | None = None
+    resolved_by_reviewer_id: Identifier | None = Field(
+        default=None, description="enrolled reviewer whose adjudication resolved the conflict"
+    )
     resolved_at: AwareDatetime | None = None
     resolution_note: str | None = None
 
@@ -139,6 +142,7 @@ class DuplicateCandidate(StrictModel):
         "unresolved"
     )
     resolved_by: str | None = None
+    resolved_by_reviewer_id: Identifier | None = None
     resolved_at: AwareDatetime | None = None
     resolution_note: str | None = None
 

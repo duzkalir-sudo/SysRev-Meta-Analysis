@@ -108,7 +108,17 @@ def test_final_verdicts_require_resolution() -> None:
         c.model_copy(update={"resolved_verdict": INC, "resolved_by": "Dr R", "resolved_at": NOW})
         for c in conflicts
     ]
-    verdicts = final_verdicts(decisions, resolved, TA)
+    # a resolved conflict row alone is not a human decision
+    with pytest.raises(ValueError, match="no human adjudication"):
+        final_verdicts(decisions, resolved, TA)
+    adjudications = [
+        ScreeningDecision(
+            record_id=c.record_id, reviewer=ReviewerRole.ADJUDICATOR, reviewer_identity="Dr R",
+            is_human=True, stage=TA, verdict=INC, rationale="adjudicated",
+        )
+        for c in conflicts
+    ]  # fmt: skip
+    verdicts = final_verdicts([*decisions, *adjudications], resolved, TA)
     assert verdicts == {"a": INC, "b": EXC, "c": INC, "d": INC, "e": INC}
 
 

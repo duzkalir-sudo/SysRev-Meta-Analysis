@@ -234,3 +234,24 @@ class QuantitativeUnavailability(StrictModel):
     recorded_by: NonEmptyStr
     reviewer_id: Identifier
     recorded_at: AwareDatetime = Field(default_factory=utc_now)
+
+
+class CohortContributionDecision(StrictModel):
+    """A human decision that several reports of one study/cohort contribute *different*
+    participants to ``outcome_id`` (e.g. non-overlapping recruitment periods or centres),
+    so their arms may be pooled together without double-counting.
+
+    The alternative resolution — "use one report" — is recorded as
+    :class:`QuantitativeUnavailability` (``reason_code="overlapping_cohort"``) for every
+    redundant report.
+    """
+
+    decision_id: Identifier = Field(default_factory=new_id)
+    study_id: Identifier
+    outcome_id: Identifier
+    record_ids: list[Identifier] = Field(min_length=2)
+    decision: Literal["non_overlapping_samples"] = "non_overlapping_samples"
+    justification: NonEmptyStr
+    decided_by: NonEmptyStr
+    reviewer_id: Identifier
+    decided_at: AwareDatetime = Field(default_factory=utc_now)

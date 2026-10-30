@@ -449,7 +449,7 @@ def test_overlapping_reports_qualitative_only_and_export(project: Project) -> No
         note="same cohort, later follow-up",
     )
     risks = double_counting_risks(repo, PID)
-    assert len(risks) == 1 and "study S1" in risks[0] and "['r1', 'r2']" in risks[0]
+    assert len(risks) == 1 and "study/cohort S1" in risks[0] and "['r1', 'r2']" in risks[0]
 
     assert repo.build_guard_context(PID).included_reports_without_extraction == 1  # r3
     record_unavailability(

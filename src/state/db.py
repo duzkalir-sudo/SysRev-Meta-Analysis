@@ -373,6 +373,16 @@ class QuantitativeUnavailabilityORM(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class CohortContributionDecisionORM(Base):
+    __tablename__ = "cohort_contribution_decisions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    study_id: Mapped[str] = mapped_column(String(64))
+    outcome_id: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 class AuditReportORM(Base):
     __tablename__ = "audit_reports"
 
