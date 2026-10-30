@@ -91,6 +91,15 @@ class AckBody(_Body):
     note: str = Field(min_length=10)
 
 
+class BulkAckBody(AckBody):
+    finding_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class AttestBody(_Body):
+    confirmed: bool
+    basis: str = Field(min_length=10, description="what was compared with the confirmed PDF")
+
+
 class ApproveBody(_Body):
     statement: str = Field(min_length=10)
 
@@ -317,6 +326,52 @@ def build_manuscript_router() -> APIRouter:
             )
         )
         return ack.model_dump(mode="json")
+
+    @router.post("/audits/{report_id}/acknowledge")
+    def acknowledge_many(
+        project_id: str,
+        report_id: str,
+        body: BulkAckBody,
+        session: SessionDep,
+        reviewer: ReviewerDep,
+    ) -> list[dict[str, Any]]:
+        """Acknowledge several review findings with one assessment (each is recorded
+        individually; all-or-nothing: any refused finding refuses the request)."""
+        s = svc(session, project_id)
+        acks = []
+        for fid in body.finding_ids:
+            try:
+                acks.append(
+                    s.acknowledge(
+                        report_id,
+                        fid,
+                        decision=body.decision,
+                        note=body.note,
+                        reviewer_id=reviewer.id,
+                        reviewer_name=reviewer.display_name,
+                    )
+                )
+            except NotFoundError as exc:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+            except (SysRevError, ValueError) as exc:
+                raise HTTPException(status.HTTP_409_CONFLICT, f"{fid}: {exc}") from exc
+        return [a.model_dump(mode="json") for a in acks]
+
+    @router.post("/references/{ref_key}/attest")
+    def attest(
+        project_id: str, ref_key: str, body: AttestBody, session: SessionDep, reviewer: ReviewerDep
+    ) -> dict[str, Any]:
+        s = svc(session, project_id)
+        v = _call(
+            lambda: s.attest_reference(
+                ref_key,
+                confirmed=body.confirmed,
+                basis=body.basis,
+                reviewer_id=reviewer.id,
+                reviewer_name=reviewer.display_name,
+            )
+        )
+        return v.model_dump(mode="json")
 
     @router.post("/approve")
     def approve(

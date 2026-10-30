@@ -57,6 +57,7 @@ REQUIRED_SCOPES = frozenset(
         "claims",  # causal / overclaiming / recommendation language
         "citations",  # identifiers, numbering, bibliography, duplicates
         "claim_support",  # whether the cited source supports the sentence
+        "narrative",  # author statements without bindings/citations -> human review
     }
 )
 

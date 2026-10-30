@@ -33,6 +33,7 @@ from src.core.enums import (
     SearchRunKind,
     SearchRunStatus,
     SourceDatabase,
+    TimepointType,
 )
 from src.core.exceptions import SysRevError
 from src.core.schemas.extraction import RiskOfBiasAssessment
@@ -42,7 +43,8 @@ from src.core.schemas.manuscript import (
     ReferenceVerification,
     fingerprint_sha256,
 )
-from src.core.schemas.protocol import PICOProtocol
+from src.core.schemas.pipeline import PRISMACounts
+from src.core.schemas.protocol import FollowUpTimepoint, PICOProtocol
 from src.core.schemas.search import SearchRun
 from src.core.schemas.stats import AnalysisResult, PooledResult, StatsOutput, canonical_sha256
 from src.core.schemas.study import Author, StudyRecord
@@ -407,6 +409,7 @@ def build_evidence_package(repo: Repository, project_id: str) -> EvidencePackage
     prisma = repo.load_prisma(project_id)
     if prisma is None:
         raise SysRevError("no PRISMA snapshot recorded")
+    problems += prisma_consistency_problems(repo, project_id, prisma)
     plan = repo.latest_analysis_plan(project_id)
     if plan is None:
         raise SysRevError("no approved analysis plan")
@@ -688,6 +691,67 @@ def build_evidence_package(repo: Repository, project_id: str) -> EvidencePackage
         repo, project_id, package, plan.sha256(), prisma, runs, approved_rob
     )
     return package
+
+
+PRISMA_FIELDS = (
+    "identified_by_database",
+    "identified_from_registers",
+    "duplicates_removed",
+    "marked_ineligible_by_automation",
+    "removed_other_reasons",
+    "records_screened",
+    "records_excluded",
+    "records_awaiting_screening",
+    "reports_sought",
+    "reports_not_retrieved",
+    "reports_awaiting_retrieval",
+    "reports_assessed",
+    "reports_excluded_by_reason",
+    "reports_awaiting_assessment",
+    "reports_included",
+    "studies_included",
+)
+
+
+def prisma_consistency_problems(
+    repo: Repository, project_id: str, stored: PRISMACounts
+) -> list[str]:
+    """Compare the stored PRISMA snapshot with counts derived independently from the stored
+    records, decisions, manifest and study links. Differences are reported, never repaired:
+    the manuscript keeps showing the stored values and the audit blocks."""
+    from src.search.prisma_sync import derive_prisma
+
+    try:
+        derived = derive_prisma(repo, project_id)
+    except Exception as exc:  # inconsistent records: report, do not guess
+        return [f"PRISMA cannot be derived from the stored records: {exc}"]
+    problems = [f"PRISMA: {v}" for v in stored.invariant_violations()]
+    if not stored.is_final:
+        problems.append("PRISMA: the flow is not final (records/reports still awaiting a decision)")
+    # Studies: reports linked to one study count once; reports a human resolved as describing
+    # overlapping cohorts may or may not be one study, so any count between the number of
+    # distinct cohorts and the number of distinct linked studies is consistent.
+    included = repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
+    most = len(set(repo.study_ids(project_id, set(included)).values()))
+    least = len(set(repo.cohort_ids(project_id, set(included)).values()))
+    if not least <= stored.studies_included <= most:
+        problems.append(
+            f"PRISMA studies_included is {stored.studies_included} in the stored snapshot but the "
+            f"stored records imply between {least} (distinct cohorts) and {most} (linked studies)"
+        )
+    for name in PRISMA_FIELDS:
+        if name == "studies_included":
+            continue
+        mine, theirs = getattr(stored, name), getattr(derived, name)
+        if isinstance(mine, dict):
+            mine = {str(k): v for k, v in mine.items() if v}
+            theirs = {str(k): v for k, v in theirs.items() if v}
+        if mine != theirs:
+            problems.append(
+                f"PRISMA {name} is {mine} in the stored snapshot but the stored records imply "
+                f"{theirs}"
+            )
+    return problems
 
 
 def _date(d: date) -> str:
@@ -1279,18 +1343,77 @@ def _characteristics_table(
                     count_unit="participants",
                     role="count",
                 )
-            fu = f", {arm.follow_up.label}" if arm.follow_up else ""
-            cells.append(f"{arm.arm_label} ({arm.outcome_id}): {{{{{key}}}}}{fu}")
+            arm_key = f"extraction.{arm.arm_id}.arm"
+            b.add(
+                arm_key,
+                f"{arm.arm_label} ({arm.outcome_id})",
+                "arm label and outcome",
+                f"approved arm {arm.arm_id}",
+                "extraction",
+                record_ids=(arm.record_id,),
+            )
+            cell = f"{{{{{arm_key}}}}}: {{{{{key}}}}}"
+            if arm.follow_up is not None:
+                fu_key = f"extraction.{arm.arm_id}.follow_up"
+                text, numbers = _follow_up(arm.follow_up)
+                b.add(
+                    fu_key,
+                    text,
+                    f"follow-up timepoint of {arm.arm_label} ({arm.outcome_id}), "
+                    f"structured ({arm.follow_up.kind.value})",
+                    f"approved arm {arm.arm_id}: structured follow-up timepoint",
+                    "extraction",
+                    numbers,
+                    role="follow_up",
+                    record_ids=(arm.record_id,),
+                )
+                cell += f", {{{{{fu_key}}}}}"
+            cells.append(cell)
         judgements = [rob_of[r] for r in rids if r in rob_of]
         rob_text = (
             "; ".join(f"{ROB_LABEL[j.tool]}: {j.overall or 'not stated'}" for j in judgements)
             or "not assessed"
         )
+        b.add(
+            f"study.{sid}.outcomes",
+            ", ".join(sorted(outcomes)) or "none",
+            "outcomes with approved extracted data",
+            "approved arms",
+            "study",
+            record_ids=tuple(rids),
+        )
+        b.add(
+            f"study.{sid}.rob",
+            rob_text,
+            "overall risk-of-bias judgement(s)",
+            "approved risk-of-bias assessments",
+            "study",
+            record_ids=tuple(rids),
+        )
         rows.append(
-            f"| {{{{{label_key}}}}} [{cites}] | {', '.join(sorted(outcomes)) or 'none'} "
-            f"| {'<br>'.join(cells) or 'no arm-level data'} | {rob_text} |"
+            f"| {{{{{label_key}}}}} [{cites}] | {{{{study.{sid}.outcomes}}}} "
+            f"| {'<br>'.join(cells) or 'no arm-level data'} | {{{{study.{sid}.rob}}}} |"
         )
     return "\n".join(rows)
+
+
+def _num(v: float) -> tuple[str, DisplayNumber]:
+    text = f"{v:g}"
+    decimals = len(text.split(".")[1]) if "." in text else 0
+    return text, DisplayNumber("follow_up", v, decimals)
+
+
+def _follow_up(tp: FollowUpTimepoint) -> tuple[str, tuple[DisplayNumber, ...]]:
+    """A structured follow-up timepoint as text, with its source numbers and unit (no
+    conversion between units: "24 months" is never shown as "2 years")."""
+    if tp.kind == TimepointType.FIXED and tp.value is not None:
+        t, n = _num(tp.value)
+        return f"{t} {tp.unit}", (n,)
+    if tp.kind == TimepointType.WINDOW and tp.window_min is not None and tp.window_max is not None:
+        lo, nlo = _num(tp.window_min)
+        hi, nhi = _num(tp.window_max)
+        return f"{lo} to {hi} {tp.unit}", (nlo, nhi)
+    return "last follow-up", ()
 
 
 def _fingerprint(

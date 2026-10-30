@@ -30,6 +30,7 @@ from src.core.schemas.manuscript import (
     ManuscriptApproval,
     ManuscriptSection,
     ManuscriptVersion,
+    ReferenceVerification,
     StyleSettings,
     fingerprint_sha256,
 )
@@ -354,6 +355,26 @@ class ManuscriptService:
         )
         self.repo.save_acknowledgement(ack)
         return ack
+
+    def attest_reference(
+        self, ref_key: str, *, confirmed: bool, basis: str, reviewer_id: str, reviewer_name: str
+    ) -> ReferenceVerification:
+        """Human identity check of an included report that has no DOI/PMID (see
+        ``Repository._check_attestation`` for the preconditions)."""
+        state = self.package().references.get(ref_key)
+        if state is None:
+            raise SysRevError(f"reference {ref_key} is not in the registry")
+        v = ReferenceVerification(
+            ref_key=ref_key,
+            metadata_sha256=state.entry.metadata_sha256(),
+            source="human_attestation",
+            status="verified" if confirmed else "mismatch",
+            message=basis,
+            checked_by=reviewer_name,
+            reviewer_id=reviewer_id,
+        )
+        self.repo.save_reference_verification(self.project_id, v)
+        return v
 
     def approve(
         self, *, reviewer_id: str, reviewer_name: str, statement: str

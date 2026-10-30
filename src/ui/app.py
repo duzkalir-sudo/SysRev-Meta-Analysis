@@ -1160,6 +1160,22 @@ def page_manuscript(be: UIBackend) -> None:
                                  json={"pmid": pmid or None, "doi": doi or None}))  # fmt: skip
         if st.button("Verify all references live (PubMed/Crossref)"):
             show(be.api.post(f"/projects/{pid}/manuscript/references/verify", token=token()))
+        with st.form("ms_attest"):
+            st.caption(
+                "Identity attestation: only for included reports without DOI/PMID whose PDF "
+                "identity was confirmed. Compare title, authors, journal and year with the PDF."
+            )
+            akey = st.text_input("Reference key to attest")
+            confirmed = st.radio("Stored metadata matches the confirmed PDF?", ["yes", "no"])
+            basis = st.text_area("Basis (what you compared)")
+            if st.form_submit_button("Record attestation (authenticated)") and akey:
+                show(
+                    be.api.post(
+                        f"/projects/{pid}/manuscript/references/{akey}/attest",
+                        token=token(),
+                        json={"confirmed": confirmed == "yes", "basis": basis},
+                    )
+                )
         with st.form("ms_excerpt"):
             key = st.text_input("Reference key")
             text = st.text_area("Supporting passage, copied from the source")
@@ -1186,6 +1202,26 @@ def page_manuscript(be: UIBackend) -> None:
                 st.info(f"Advisory model review (not a human assessment): {adv['verdict']} — "
                         f"{adv['rationale']}")  # fmt: skip
             reviewable = [f["finding_id"] for f in open_ if f["status"] == "requires_human_review"]
+            with st.form("ms_ack_many"):
+                chosen_ids = st.multiselect("Findings to assess together", reviewable)
+                bulk_decision = st.radio(
+                    "Assessment (applies to each)",
+                    ["confirmed_supported", "accepted_as_author_statement"],
+                    key="bulk_decision",
+                )
+                bulk_note = st.text_area("Your reasoning (required)", key="bulk_note")
+                if st.form_submit_button("Acknowledge selected (authenticated)") and chosen_ids:
+                    show(
+                        be.api.post(
+                            f"/projects/{pid}/manuscript/audits/{r['report_id']}/acknowledge",
+                            token=token(),
+                            json={
+                                "finding_ids": chosen_ids,
+                                "decision": bulk_decision,
+                                "note": bulk_note,
+                            },
+                        )
+                    )
             with st.form("ms_ack"):
                 fid = st.selectbox("Finding requiring human review", reviewable or [""])
                 decision = st.radio("Assessment", ["confirmed_supported",

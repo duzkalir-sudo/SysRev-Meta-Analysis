@@ -69,8 +69,8 @@ def test_http_workflow_draft_audit_ack_sign_off(api: tuple[TestClient, dict[str,
     assert r.status_code == 200 and r.json()["version"] == 2
     assert "@@" in client.get(f"{BASE}/diff", params={"a": 1, "b": 2}).json()["diff"]
     audit = client.post(f"{BASE}/audit", headers=auth).json()
-    assert audit["passed"] and audit["requires_human_review"] == 1
-    review = next(f for f in audit["findings"] if f["status"] == "requires_human_review")
+    assert audit["passed"] and audit["requires_human_review"] >= 2
+    reviews = [f["finding_id"] for f in audit["findings"] if f["status"] == "requires_human_review"]
     # sign-off is refused in the drafting phase and before acknowledgement
     assert (
         client.post(
@@ -79,11 +79,32 @@ def test_http_workflow_draft_audit_ack_sign_off(api: tuple[TestClient, dict[str,
         == 409
     )
     ack = client.post(
-        f"{BASE}/audits/{audit['report_id']}/findings/{review['finding_id']}/acknowledge",
+        f"{BASE}/audits/{audit['report_id']}/findings/{reviews[0]}/acknowledge",
         json={"decision": "accepted_as_author_statement", "note": "supported by cited trials"},
         headers=auth,
     )
     assert ack.status_code == 200 and ack.json()["reviewer_name"] == "Dr Stats Reviewer"
+    verified_id = next(f["finding_id"] for f in audit["findings"] if f["status"] == "verified")
+    refused = client.post(  # all-or-nothing: a non-review finding refuses the whole request
+        f"{BASE}/audits/{audit['report_id']}/acknowledge",
+        json={
+            "finding_ids": [*reviews[1:], verified_id],
+            "decision": "confirmed_supported",
+            "note": "bulk assessment by the author",
+        },
+        headers=auth,
+    )
+    assert refused.status_code == 409
+    bulk = client.post(
+        f"{BASE}/audits/{audit['report_id']}/acknowledge",
+        json={
+            "finding_ids": reviews[1:],
+            "decision": "confirmed_supported",
+            "note": "author statements checked against the sources",
+        },
+        headers=auth,
+    )
+    assert bulk.status_code == 200 and len(bulk.json()) == len(reviews) - 1
     adv = client.post(
         "/projects/ms1/advance", json={"target": Phase.STAGE6_AUDIT.value}, headers=auth
     )

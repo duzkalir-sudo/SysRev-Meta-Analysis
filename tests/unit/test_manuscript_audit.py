@@ -603,14 +603,16 @@ def test_acknowledgement_and_sign_off_rules(ms: Ctx) -> None:
             reviewer_name=REVIEWER,
         )
     ok = ms.edit("discussion", " The pooled estimate was {{stats.nec.study.s1}}.", "")
-    assert ok.passed and ok.requires_human_review == 1
+    # the causal sentence plus every author-written sentence of the filled template
+    assert ok.passed and ok.requires_human_review >= 2
+    assert any(f.scope == "claims" and f.needs_human for f in ok.findings)
     project = ms.repo.get_project(ms.pid)
     with pytest.raises(SysRevError, match="audit phase"):
         ms.svc.approve(reviewer_id=ms.rid, reviewer_name=REVIEWER, statement="approve it now")
     project.phase = Phase.STAGE6_AUDIT.value
     with pytest.raises(SysRevError, match="not acknowledged"):
         ms.svc.approve(reviewer_id=ms.rid, reviewer_name=REVIEWER, statement="approve it now")
-    review = next(f for f in ok.findings if f.needs_human)
+    review = next(f for f in ok.findings if f.scope == "claims" and f.needs_human)
     with pytest.raises(SysRevError):  # an unknown (e.g. automated) identity cannot act
         ms.svc.acknowledge(
             ok.report_id,
@@ -620,14 +622,16 @@ def test_acknowledgement_and_sign_off_rules(ms: Ctx) -> None:
             reviewer_id="agent",
             reviewer_name="agent",
         )
-    ms.svc.acknowledge(
-        ok.report_id,
-        review.finding_id,
-        decision="accepted_as_author_statement",
-        note="causal wording reviewed: supported by RCT evidence cited",
-        reviewer_id=ms.rid,
-        reviewer_name=REVIEWER,
-    )
+    for f in ok.findings:
+        if f.needs_human:
+            ms.svc.acknowledge(
+                ok.report_id,
+                f.finding_id,
+                decision="accepted_as_author_statement",
+                note="statement reviewed against the sources by the author",
+                reviewer_id=ms.rid,
+                reviewer_name=REVIEWER,
+            )
     with pytest.raises(SysRevError):
         ms.svc.approve(reviewer_id="agent", reviewer_name="agent", statement="self-approval")
     ms.svc.approve(reviewer_id=ms.rid, reviewer_name=REVIEWER, statement="Approved version.")

@@ -41,7 +41,7 @@ from src.core.schemas.audit import (
     CoverageItem,
     NumericClaimCheck,
 )
-from src.core.schemas.manuscript import REQUIRED_SECTIONS, ManuscriptVersion
+from src.core.schemas.manuscript import REQUIRED_SECTIONS, ManuscriptVersion, ReferenceEntry
 from src.manuscript.document import AUTHOR_INPUT_RE, Rendered, RenderedSection, Span, render
 from src.manuscript.drafting import ALLOWED_LITERALS, AUTHOR_YEAR_RE, MANUAL_CITATION_RE
 from src.manuscript.evidence import (
@@ -49,9 +49,15 @@ from src.manuscript.evidence import (
     Fact,
     screening_is_automated,
 )
-from src.manuscript.formatting import DisplayNumber, FoundNumber, find_numbers, parse_number
+from src.manuscript.formatting import (
+    DisplayNumber,
+    FoundNumber,
+    find_numbers,
+    mask_identifiers,
+    parse_number,
+)
 
-AUDITOR_VERSION = "stage6-auditor-1.0.0"
+AUDITOR_VERSION = "stage6-auditor-1.1.0"
 ESTIMATE_ROLES = frozenset(
     {"pooled_estimate", "single_study_estimate", "study_estimate", "sensitivity_estimate"}
 )
@@ -187,7 +193,7 @@ NULL_CLAIM_RE = re.compile(
 )
 CLINICAL_RE = re.compile(r"clinically (important|meaningful|relevant|significant)", re.I)
 UNIT_CUES = [
-    ("studies", re.compile(r"^\s*(?:\w+\s+){0,2}?(studies|study|trials?|cohorts?)\b", re.I)),
+    ("studies", re.compile(r"^\s*(?:\w+\s+){0,2}?(studies|study|trials?|cohorts?|series)\b", re.I)),
     ("reports", re.compile(r"^\s*(?:\w+\s+){0,2}?(reports?|full[- ]text articles?)\b", re.I)),
     (
         "records",
@@ -248,6 +254,18 @@ class Sentence:
     start: int
     spans: list[Span]
     literal: str  # text with spans and markers blanked out
+    raw: str = ""  # unstripped text; span offsets refer to it
+
+    @property
+    def signature(self) -> str:
+        """The sentence with every fact/citation replaced by its key: identical for the same
+        wording whatever the current values or citation numbers are."""
+        out, pos = [], 0
+        for sp in sorted(self.spans, key=lambda x: x.start):
+            out += [self.raw[pos : sp.start], f"<{sp.kind}:{sp.key}>"]
+            pos = sp.end
+        out.append(self.raw[pos:])
+        return re.sub(r"\s+", " ", "".join(out)).strip()
 
     @property
     def location(self) -> str:
@@ -339,7 +357,7 @@ def _split(sec: RenderedSection) -> list[Sentence]:
             for i in range(s.start, min(s.end, len(chars))):
                 chars[i] = " "
         literal = AUTHOR_INPUT_RE.sub(lambda m: " " * len(m.group(0)), "".join(chars))
-        out.append(Sentence(sec.section_id, len(out), raw.strip(), a, spans, literal))
+        out.append(Sentence(sec.section_id, len(out), raw.strip(), a, spans, literal, raw))
     return out
 
 
@@ -370,6 +388,10 @@ def audit_manuscript(version: ManuscriptVersion, package: EvidencePackage) -> Au
     _consistency(a)
     _citations(a, sentences)
     _claim_support(a, sentences)
+    template = _template_signatures(package)
+    for s in sentences:  # last: only sentences nothing else has flagged
+        _narrative(a, s, template)
+    a.tick("narrative", 0)
     return AuditReport(
         project_id=package.project_id,
         manuscript_version=version.version,
@@ -392,6 +414,17 @@ def audit_manuscript(version: ManuscriptVersion, package: EvidencePackage) -> Au
 def _provenance(a: _Audit) -> None:
     v, p = a.version, a.package
     a.tick("provenance", len(p.fingerprint))
+    for problem in p.problems:
+        a.tick("provenance")
+        a.find(
+            "provenance",
+            CheckStatus.MISMATCH,
+            "whole manuscript",
+            f"the evidence package is inconsistent with the stored source records: {problem}",
+            "Correct the source records or recompute the snapshot from them (an authenticated "
+            "action), then re-render; the manuscript cannot rely on contradicted values.",
+            key="prisma" if problem.startswith("PRISMA") else None,
+        )
     for name, current in sorted(p.fingerprint.items()):
         old = v.evidence_fingerprint.get(name)
         if old != current:
@@ -692,25 +725,23 @@ def _role_of(literal: str, f: FoundNumber) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _same(dn: DisplayNumber, value: float) -> bool:
-    """Numbers inside descriptive text (versions, criteria) match only exactly; displayed
-    results match within their rounding tolerance."""
+def _same(dn: DisplayNumber, found: FoundNumber) -> bool:
+    """Numbers inside descriptive text (versions, criteria) match only exactly; results match
+    when the typed number is a correct rounding at the precision it is written."""
     if dn.role == "text":
-        return dn.value == value
-    return dn.relation == "eq" and dn.accepts(value)
+        return dn.value == found.value
+    return dn.relation == "eq" and dn.accepts_typed(found.value, found.decimals)
 
 
-def _matching_keys(a: _Audit, value: float, facts: list[Fact] | None = None) -> list[str]:
+def _matching_keys(a: _Audit, found: FoundNumber, facts: list[Fact] | None = None) -> list[str]:
     pool = facts if facts is not None else list(a.package.facts.values())
-    return [f.key for f in pool if any(_same(dn, value) for dn in f.numbers)]
+    return [f.key for f in pool if any(_same(dn, found) for dn in f.numbers)]
 
 
 def _literal_numbers(a: _Audit, s: Sentence) -> None:
     p = a.package
-    if s.section_id in ("title",):
-        return
-    literal = ALLOWED_LITERALS.sub(lambda m: " " * len(m.group(0)), s.literal)
-    found = find_numbers(literal)
+    literal = mask_identifiers(ALLOWED_LITERALS.sub(lambda m: " " * len(m.group(0)), s.literal))
+    found = sorted(find_numbers(literal) + _word_numbers(literal), key=lambda f: f.start)
     if not found:
         return
     analysis_id = _analysis_context(a, s)
@@ -820,7 +851,7 @@ def _literal_numbers(a: _Audit, s: Sentence) -> None:
             continue
         if target is not None:
             nums = [dn for x in target for dn in x.numbers if dn.role in roles]
-            if nums and any(dn.accepts(f.value) for dn in nums):
+            if nums and any(dn.accepts_typed(f.value, f.decimals) for dn in nums):
                 a.find(
                     "literal_numbers",
                     CheckStatus.REQUIRES_HUMAN_REVIEW,
@@ -831,11 +862,27 @@ def _literal_numbers(a: _Audit, s: Sentence) -> None:
                     key=", ".join(x.key for x in target)[:200],
                 )
                 continue
+            # a count in the title describes the review as a whole
+            if role == "count" and not TOTAL_CUE.search(literal) and s.section_id != "title":
+                # A count that is not presented as a review total may describe a subset
+                # ("two studies used ..."): it cannot be verified, so a human must check it.
+                a.find(
+                    "literal_numbers",
+                    CheckStatus.REQUIRES_HUMAN_REVIEW,
+                    s.location,
+                    f"typed count {f.text} {unit} matches no approved total; if it describes "
+                    "a subset it cannot be verified automatically",
+                    "Check it against the extracted data, or bind an approved count.",
+                    excerpt,
+                    key=", ".join(x.key for x in target)[:200],
+                )
+                continue
             if nums or role == "count":
                 expected = "; ".join(f"{x.description}: {x.text}" for x in target)[:300]
                 hint = ""
                 if unit == "studies" and any(
-                    x.count_unit == "reports" and any(dn.accepts(f.value) for dn in x.numbers)
+                    x.count_unit == "reports"
+                    and any(dn.accepts_typed(f.value, f.decimals) for dn in x.numbers)
                     for x in p.facts.values()
                 ):
                     hint = " (it equals a count of reports: reports are not studies)"
@@ -851,7 +898,7 @@ def _literal_numbers(a: _Audit, s: Sentence) -> None:
                     value=expected or "none",
                 )
                 continue
-        keys = _matching_keys(a, f.value)
+        keys = _matching_keys(a, f)
         if keys:
             a.find(
                 "literal_numbers",
@@ -881,6 +928,37 @@ def _literal_numbers(a: _Audit, s: Sentence) -> None:
                 "Remove it or use a {{key}} marker for an approved value.",
                 excerpt,
             )
+
+
+NUMBER_WORDS = {
+    w: i for i, w in enumerate(
+        ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+         "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+         "eighteen", "nineteen", "twenty"]
+    )
+} | {"thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+     "ninety": 90, "hundred": 100}  # fmt: skip
+WORD_NUMBER_RE = re.compile(
+    r"\b(" + "|".join(NUMBER_WORDS) + r")\b(?=\s+(?:per ?cent|percent)\b|"
+    r"\s+(?:[\w-]+\s+){0,2}?(?:studies|study|trials?|cohorts?|series|reports?|records?|"
+    r"patients?|participants?|subjects?|individuals?|events?|years?|months?|weeks?|days?)\b)",
+    re.IGNORECASE,
+)
+# Wording that presents a count as a total of the review (not a subset).
+TOTAL_CUE = re.compile(
+    r"\b(included|identified|screened|excluded|retrieved|assessed|sought|eligible|pooled|"
+    r"contribut\w*|in total|overall|meta-analy\w*|were found|yielded)\b",
+    re.IGNORECASE,
+)
+
+
+def _word_numbers(literal: str) -> list[FoundNumber]:
+    """Spelled-out numbers followed by a unit ("six studies", "five percent"), so a claim
+    cannot bypass the audit merely by being written in words."""
+    return [
+        FoundNumber(m.start(), m.end(), m.group(1), float(NUMBER_WORDS[m.group(1).lower()]), 0)
+        for m in WORD_NUMBER_RE.finditer(literal)
+    ]
 
 
 def _percent_arithmetic(a: _Audit, s: Sentence, literal: str) -> None:
@@ -1333,6 +1411,77 @@ def _claims(a: _Audit, s: Sentence) -> None:
         )
 
 
+# --------------------------------------------------------------------------- narrative
+
+NARRATIVE_SECTIONS = frozenset(
+    {"title", "abstract", "introduction", "methods", "results", "discussion", "limitations",
+     "conclusions"}
+)  # fmt: skip
+HEADING_RE = re.compile(r"\*\*[^*]{1,80}\*\*")
+# Only sentences that are reliably non-assertive are exempt: a pure pointer to a table or
+# figure, or "<summary noun> (of …) is/are shown in Table n". Anything else is reviewed.
+POINTER_RE = re.compile(
+    r"\(?\s*(?:see\s+)?(?:supplementary\s+)?(?:table|figure|file)s?\s+s?\d+\s*\)?\s*\.?|"
+    r"(?:the\s+)?(?:characteristics|details|results|data|summary|summaries|an?\s+overview|"
+    r"an?\s+summary)(?:\s+of\s+(?:the\s+)?(?:included\s+studies|studies|all\s+analyses|"
+    r"the\s+analyses|each\s+analysis|analyses))?\s+(?:is|are)\s+(?:shown|given|presented|"
+    r"summari[sz]ed|listed|provided|displayed)\s+in\s+(?:supplementary\s+)?(?:table|figure|"
+    r"file)s?\s+s?\d+\s*\.?",
+    re.IGNORECASE,
+)
+
+
+def _template_signatures(package: EvidencePackage) -> frozenset[str]:
+    """Signatures of the sentences the deterministic template writes from the evidence
+    package (author-input markers split sentences, as an author's text replaces them)."""
+    from src.manuscript.drafting import template_sections
+
+    sections = [
+        sec.model_copy(update={"source": AUTHOR_INPUT_RE.sub("\n", sec.source)})
+        for sec in template_sections(package)
+    ]
+    rendered = render(sections, package)
+    return frozenset(s.signature for rs in rendered.sections for s in _split(rs))
+
+
+def _narrative(a: _Audit, s: Sentence, template: frozenset[str]) -> None:
+    """Conservative claim review. A sentence that is not system text derived from the evidence
+    package carries an assertion the Auditor cannot verify semantically; unless another
+    finding already flags it, it requires an authenticated human's assessment."""
+    if s.section_id not in NARRATIVE_SECTIONS:
+        return
+    a.tick("narrative")
+    if s.signature in template:
+        return
+    content = HEADING_RE.sub(" ", s.literal)
+    if not re.search(r"[A-Za-z]{2,}", content):
+        return  # headings, bound facts and citations only
+    if POINTER_RE.fullmatch(content.strip()):
+        return
+    if any(
+        f.status != CheckStatus.VERIFIED
+        and (f.location == s.location or f.location.startswith(s.location + " "))
+        for f in a.findings
+    ):
+        return  # already routed to a human or blocking
+    if s.facts(a.package):
+        what = ("the inserted values are verified, but the wording around them is an author "
+                "statement that cannot be verified deterministically")  # fmt: skip
+    elif s.refs():
+        what = "the statement is attributed to a citation whose support was not established"
+    else:
+        what = ("substantive statement without an evidence binding or a citation; its "
+                "scientific support cannot be verified deterministically")  # fmt: skip
+    a.find(
+        "narrative",
+        CheckStatus.REQUIRES_HUMAN_REVIEW,
+        s.location,
+        what,
+        "Confirm that the statement is supported (or cite/bind its source), or revise it.",
+        s.text,
+    )
+
+
 # --------------------------------------------------------------------------- coverage
 
 
@@ -1469,7 +1618,22 @@ def _citations(a: _Audit, sentences: list[Sentence]) -> None:
             "mismatch": CheckStatus.MISMATCH,
             "not_found": CheckStatus.NOT_FOUND,
         }.get(state.identity_status, CheckStatus.NOT_CHECKED)
+        attested = [v for v in state.verifications if v.source == "human_attestation"]
         if status == CheckStatus.VERIFIED and not (e.pmid or e.doi):
+            if attested and attested[-1].status == "verified":
+                # No identifier exists to look up: identity rests on a human comparison with
+                # the report's identity-confirmed PDF (CitationCheck requires a PMID/DOI).
+                a.find(
+                    "citations",
+                    CheckStatus.VERIFIED,
+                    f"reference {n}",
+                    f"identity of reference {n} ({key}) attested by {attested[-1].checked_by} "
+                    f"against the identity-confirmed PDF: {attested[-1].message}",
+                    "None.",
+                    key=key,
+                )
+                _duplicates(a, n, key, e, seen)
+                continue
             status = CheckStatus.NOT_CHECKED
         a.citations.append(
             CitationCheck(
@@ -1495,25 +1659,29 @@ def _citations(a: _Audit, sentences: list[Sentence]) -> None:
                 else "Correct or replace the reference.",
                 key=key,
             )
-        for ident in filter(
-            None,
-            (
-                f"doi:{e.doi}" if e.doi else None,
-                f"pmid:{e.pmid}" if e.pmid else None,
-                f"title:{normalize_title(e.title)}:{e.year}",
-            ),
-        ):
-            if ident in seen and seen[ident] != key:
-                a.find(
-                    "citations",
-                    CheckStatus.MISMATCH,
-                    f"reference {n}",
-                    f"duplicate "
-                    f"reference: {key} and {seen[ident]} are the same work ({ident[:60]})",
-                    "Cite one registry entry only.",
-                    key=key,
-                )
-            seen.setdefault(ident, key)
+        _duplicates(a, n, key, e, seen)
+
+
+def _duplicates(a: _Audit, n: int, key: str, e: ReferenceEntry, seen: dict[str, str]) -> None:
+    """The same work cited under two registry keys (DOI, PMID or title + year)."""
+    for ident in filter(
+        None,
+        (
+            f"doi:{e.doi}" if e.doi else None,
+            f"pmid:{e.pmid}" if e.pmid else None,
+            f"title:{normalize_title(e.title)}:{e.year}",
+        ),
+    ):
+        if ident in seen and seen[ident] != key:
+            a.find(
+                "citations",
+                CheckStatus.MISMATCH,
+                f"reference {n}",
+                f"duplicate reference: {key} and {seen[ident]} are the same work ({ident[:60]})",
+                "Cite one registry entry only.",
+                key=key,
+            )
+        seen.setdefault(ident, key)
 
 
 def _content_words(text: str) -> set[str]:
@@ -1607,7 +1775,7 @@ def _claim_support(a: _Audit, sentences: list[Sentence]) -> None:
                 continue
             excerpt_text = " ".join(x.text for x in state.excerpts)
             exc_nums = [n.value for n in find_numbers(excerpt_text)]
-            lit = ALLOWED_LITERALS.sub(" ", s.literal)
+            lit = mask_identifiers(ALLOWED_LITERALS.sub(" ", s.literal))
             missing = [n.text for n in find_numbers(lit) if n.value not in exc_nums]
             words = _content_words(lit)
             overlap = len(words & _content_words(excerpt_text)) / max(1, len(words))

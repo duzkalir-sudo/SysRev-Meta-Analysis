@@ -29,13 +29,33 @@ from typing import Literal
 
 MINUS = "−"
 
-# A number as it can appear in manuscript text: optional minus (ASCII hyphen only when not
-# preceded by a word character, i.e. not part of a range "3-5"), grouped thousands, decimal
-# point or Lancet mid-dot.
+SUPERSCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺", "0123456789-+")
+
+# A number as it can appear in biomedical manuscript text:
+# * optional minus (Unicode minus, or an ASCII hyphen not preceded by a word character, so a
+#   range "3-5" is not read as 3 and -5);
+# * grouped thousands, decimal point or Lancet mid-dot, or a leading decimal (".032");
+# * an optional exponent: "3.2e-5", "3.2E−05", "3.2 × 10^-5", "3.2 × 10⁻⁵".
+# Digits that are part of a word or a hyphenated term ("HbA1c", "ICD-10", "COVID-19",
+# "SF-36", "IL-6") are not numbers.
 NUMBER_RE = re.compile(
-    r"(?<![\w.,·])(?P<sign>[\u2212-])?"
-    r"(?P<num>\d{1,3}(?:,\d{3})+(?:[.·]\d+)?|\d+(?:[.·]\d+)?)(?![\w])"
+    r"(?<![\w.,·/])(?<![A-Za-z][-‐])(?P<sign>[\u2212-])?"
+    r"(?P<num>\d{1,3}(?:,\d{3})+(?:[.·]\d+)?|\d+(?:[.·]\d+)?|[.·]\d+)"
+    r"(?P<exp>[eE][\u2212+-]?\d+|\s?[×x]\s?10(?:\^[\u2212+-]?\d+|[⁻⁺]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+))?"
+    r"(?![\w])"
 )
+# Identifiers that contain digits but are not numerical claims: DOIs, PMIDs/PMCIDs, URLs,
+# registration numbers and bracketed citation numbers (reported separately as citations).
+IDENTIFIER_RE = re.compile(
+    r"\b10\.\d{4,9}/\S+|\bdoi:\s*\S+|https?://\S+|www\.\S+|\bPMID:?\s*\d+|\bPMC\d+|"
+    r"\bCRD\d+|\bNCT\d+|\[\s*\d+(?:\s*[,–-]\s*\d+)*\s*\]",
+    re.IGNORECASE,
+)
+
+
+def mask_identifiers(text: str) -> str:
+    """Blank out identifiers (same length, so offsets are preserved)."""
+    return IDENTIFIER_RE.sub(lambda m: " " * len(m.group(0)), text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +82,17 @@ class DisplayNumber:
             return self.value < shown
         if self.relation == "gt":
             return self.value > shown
+        if self.role == "count":
+            return shown == self.value  # counts are integers: no rounding tolerance
         return abs(shown - self.value) <= self.tolerance
+
+    def accepts_typed(self, typed: float, typed_decimals: int) -> bool:
+        """Whether a number typed by a person (with its own precision) is a correct rounding
+        of this source value — e.g. "6%" or "5.9%" for 5.94%, but not "3.2e-5" for 0."""
+        if self.relation != "eq" or self.role == "count":
+            return self.accepts(typed)
+        tol = 0.5 * 10.0 ** (-typed_decimals) + 1e-9 * max(1.0, abs(self.value))
+        return abs(typed - self.value) <= tol
 
 
 def fmt(x: float, decimals: int) -> str:
@@ -102,13 +132,27 @@ class FoundNumber:
     decimals: int
 
 
+def _exponent(exp: str | None) -> int:
+    if not exp:
+        return 0
+    if exp[0] in "eE":
+        return int(exp[1:].replace(MINUS, "-"))
+    tail = exp.split("10", 1)[1].lstrip("^").translate(SUPERSCRIPTS).replace(MINUS, "-")
+    return int(tail)
+
+
 def find_numbers(text: str) -> list[FoundNumber]:
+    """Every number in ``text``. ``decimals`` is the precision of the represented value, so
+    "3.2e-5" has 6 decimals (tolerance 5e-7) and "4 × 10³" has −3."""
     out: list[FoundNumber] = []
     for m in NUMBER_RE.finditer(text):
-        raw = (m.group("sign") or "") + m.group("num")
-        frac = re.split(r"[.·]", m.group("num"))
+        num = m.group("num")
+        mantissa = parse_number((m.group("sign") or "") + ("0" + num if num[0] in ".·" else num))
+        frac = re.split(r"[.·]", num)
         decimals = len(frac[1]) if len(frac) == 2 else 0
-        out.append(FoundNumber(m.start(), m.end(), raw, parse_number(raw), decimals))
+        exp = _exponent(m.group("exp"))
+        value = float(f"{mantissa!r}e{exp}")  # exact decimal scaling, no binary drift
+        out.append(FoundNumber(m.start(), m.end(), m.group(0), value, decimals - exp))
     return out
 
 

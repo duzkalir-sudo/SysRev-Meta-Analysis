@@ -1663,11 +1663,36 @@ class Repository:
 
     def save_reference_verification(self, project_id: str, v: ReferenceVerification) -> None:
         self.get_project(project_id)
+        if v.source == "human_attestation":
+            self._check_attestation(project_id, v)
         self.session.add(ReferenceVerificationORM(
             id=v.verification_id, project_id=project_id, ref_key=v.ref_key, status=v.status,
             payload=v.model_dump(mode="json"),
         ))  # fmt: skip
         self.session.flush()
+
+    def _check_attestation(self, project_id: str, v: ReferenceVerification) -> None:
+        """Human identity attestation: only for an included report with no DOI/PMID, whose
+        linked PDF identity was confirmed, against the reference's current metadata."""
+        from src.manuscript.evidence import record_reference
+
+        reviewer = self.require_active_reviewer(v.reviewer_id)
+        if v.checked_by != reviewer.display_name:
+            raise SysRevError("checked_by does not match the enrolled reviewer")
+        included = self.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
+        rid = next((r for r in included if f"study-{r}"[:64] == v.ref_key), None)
+        if rid is None:
+            raise SysRevError("attestation is only for references of included reports")
+        record = self.get_record(project_id, rid)
+        if record.doi or record.pmid:
+            raise SysRevError("this reference has a DOI/PMID: verify it live (PubMed/Crossref)")
+        if v.metadata_sha256 != record_reference(record).metadata_sha256():
+            raise SysRevError("attestation does not match the reference's current metadata")
+        item = self.get_fulltext_item(project_id, rid)
+        if item is None or not item.has_usable_pdf:
+            raise SysRevError(
+                "the report has no PDF with a confirmed identity to attest the reference against"
+            )
 
     def load_reference_verifications(self, project_id: str) -> list[ReferenceVerification]:
         rows = self.session.scalars(

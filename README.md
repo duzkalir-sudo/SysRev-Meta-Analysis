@@ -318,5 +318,9 @@ the figure legends and submitted separately.
 * The Auditor's numerical checks of inserted values are exact (with stated rounding
   tolerances). Its checks of free prose (typed numbers, labels, claims, methods
   descriptions) are rule-based and incomplete; unresolved statements are routed to human
-  review, never marked verified. Whether a background reference supports a sentence is
+  review, never marked verified. Every author-written sentence (anything that is not text
+  the template derived from the evidence package) requires an authenticated human's
+  assessment before sign-off; several can be acknowledged together with one stated reason.
+* Included reports without DOI/PMID cannot be looked up; their identity is attested by a
+  reviewer against the identity-confirmed PDF (*References → attestation*). Whether a background reference supports a sentence is
   checked only lexically against human-entered excerpts.

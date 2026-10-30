@@ -902,6 +902,16 @@ p-values with 3 decimals or `p < 0.001`; Unicode minus; intervals "X to Y". Tole
 number shown with *d* decimals: |shown − source| ≤ 0.5·10⁻ᵈ (+1e-9 relative), counts exact,
 `p < 0.001` only if p < 0.001. Numbers inside descriptive text facts match only exactly.
 
+**Typed numbers** (review of PR #11). The parser recognises signed values (Unicode minus or
+a hyphen not preceded by a word character), grouped thousands, mid-dot decimals, leading
+decimals (`.032`), and scientific notation (`3.2e-5`, `3.2E−05`, `3.2 × 10^-5`, `3.2 × 10⁻⁵`),
+and the Auditor also reads spelled-out numbers followed by a unit ("seven studies", "five
+percent"). Digits inside words or hyphenated terms (HbA1c, ICD-10, COVID-19, SF-36, T2) and
+identifiers (DOIs, URLs, PMIDs/PMCIDs, NCT/CRD numbers, bracketed citation numbers) are not
+read as numbers. A typed number matches a source value only if it is a correct rounding at
+the precision it is written (scientific notation included: "3.2e-5" has tolerance 5·10⁻⁷);
+counts must match exactly. The title is audited like any other section.
+
 **Rendering** (`document.py`). `{{key}}` → fact text, `{{table:…}}`/`{{figure:forest:…}}`
 → templates whose cells are themselves markers, `[@ref]` → Vancouver numbers in order of
 first appearance (`[1]`, `[1,2]`, `[1–3]`); the bibliography uses stored fields only
@@ -918,12 +928,25 @@ PRISMA 2020, RoB 2, Table/Figure n), unknown keys or references, typed citation 
 `AuditedProvider`/`BudgetGuard` (exact model and effort, tokens, cost estimate, request
 id); only explicit user action starts them; the result is a new, unaudited version.
 
+**PRISMA consistency.** The evidence package re-derives the PRISMA counts from the stored
+records, decisions, manifest and study links (`derive_prisma`) and reports every difference
+from the stored snapshot (identification per source, duplicates, screening, retrieval,
+assessment, exclusion reasons, reports included; studies included must lie between the
+number of human-resolved cohorts and the number of linked studies), plus snapshot
+invariants and a non-final flow. Differences become blocking `provenance` findings; the
+stored values are shown as they are and never repaired.
+
 **References** (`references.py`). Included-study references are derived from stored
 records; background literature is imported by PMID (PubMed EFetch) or DOI (Crossref).
 Identity: a record retrieved by the PubMed E-utilities client counts as verified by
 provenance; otherwise a live lookup must agree on title (token-sort ≥ 90), year,
 first-author surname and DOI/PMID. Network/API failures are stored as `unavailable` and
 reported as `not_checked` (blocking). A failed lookup never erases an earlier decisive one.
+An included report with **neither DOI nor PMID** has nothing to look up; an active enrolled
+reviewer may record a `human_attestation` (confirmed or contradicted, with the basis),
+accepted only if the report's linked PDF has a confirmed identity and only for the
+reference's current metadata. A reference with an identifier can never be attested instead
+of verified live.
 
 **Audit scopes** (`auditor.py`):
 
@@ -932,13 +955,14 @@ reported as `not_checked` (blocking). A failed lookup never erases an earlier de
 | provenance | version fingerprint = current fingerprint; frozen re-render = stored text | mismatch |
 | structure | required sections, structured-abstract headings, author-input markers, unknown keys, Table/Figure references resolve and are cited, journal limits *if supplied with a source* | missing / not_found / mismatch |
 | numeric_bindings | every frozen binding re-resolved; each displayed number within its tolerance (`NumericClaimCheck`) | mismatch / not_found |
-| literal_numbers | typed numbers: role inferred from context (estimate, CI bound, I², p, τ², timepoint, count + unit) and compared with the fact of the analysis named in the sentence; "x of n (z%)" arithmetic; zero for an unavailable result | mismatch; a correct but unbound number → requires review; untraceable → unsupported; a number attributed to cited literature → requires review |
+| literal_numbers | typed numbers (all formats above, title included): role inferred from context (estimate, CI bound, I², p, τ², timepoint, count + unit) and compared with the fact of the analysis named in the sentence; "x of n (z%)" arithmetic; zero for an unavailable result | mismatch; a correct but unbound number → requires review; a count that matches no total and is not presented as a total (no "included/identified/pooled…" wording, not in the title) may describe a subset → requires review; untraceable → unsupported; a number attributed to cited literature → requires review |
 | semantic_labels | pooled vs single study; estimator; model; transformed scale; relative vs absolute; significance vs CI and null value; "no difference" and "clinically important" | mismatch / unsupported / requires review |
 | methods | human dual-screening or dual-extraction claims, registration, databases vs search log, analyses never performed (meta-regression, subgroups, publication-bias tests, trim-and-fill, leave-one-out, Bayesian, network, GRADE, mean/SD conversion, HR pooling, IPD), estimators/models not used, RoB tools not used; negated statements are not flagged | mismatch / unsupported |
 | claims | overclaiming, comparative claims in single-arm reviews; causal, recommendation and mechanistic language | unsupported / requires review |
 | coverage | every expected output bound in an allowed section; every included report cited | missing |
 | consistency | statistics in the abstract/conclusions also reported in Results/Tables | missing |
 | citations | registry membership, typed citation numbers, author attribution without citation, identity status, duplicates (DOI, PMID, title + year) | not_found / unsupported / not_checked / mismatch |
+| narrative | every prose sentence (title to conclusions) that is not system text written by the template from the evidence package (compared by wording with markers as keys) and not already flagged; exempt only: headings, sentences consisting of markers, pure table/figure pointers | requires review (assertions without a binding or citation, author wording around verified values, citations whose support is not established) |
 | claim_support | included study: sentence values belong to the cited report (else mismatch); listing sentences verified; background literature: numbers must appear in recorded excerpts and content-word overlap ≥ 25 % (else unsupported), otherwise requires review; no excerpt → requires review | as stated |
 
 **Versioning, acknowledgement, sign-off** (`service.py`, repository). Versions,
@@ -957,7 +981,9 @@ with excerpts only, a model judges from the excerpts alone; stored as `ClaimRevi
 (`is_human=False`), shown separately, never changes a finding or counts as an
 acknowledgement.
 
-**Known limits.** Sentence segmentation and cue lists are heuristic; prose that avoids the
+**Known limits.** No semantic verification of prose is claimed: the narrative scope only
+guarantees that author statements reach a human. Sentence segmentation and cue lists are
+heuristic; prose that avoids the
 cues (e.g. an unusual paraphrase of a causal claim, or an estimate described with wording
 the cue lists do not contain) is not detected, and the Auditor does not understand
 arbitrary text. It cannot verify that background literature supports a statement beyond a

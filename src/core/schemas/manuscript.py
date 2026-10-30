@@ -213,17 +213,34 @@ VerificationStatus = Literal["verified", "mismatch", "not_found", "unavailable"]
 
 class ReferenceVerification(FrozenModel):
     """Result of one *live* metadata lookup. ``unavailable`` means the lookup failed (no
-    network, API error) — it is never reported as a verification."""
+    network, API error) — it is never reported as a verification.
+
+    ``human_attestation`` exists only for included-study references that have neither a DOI
+    nor a PMID (nothing to look up): an authenticated reviewer compares the stored metadata
+    with the report's identity-confirmed PDF and states the basis. The repository enforces
+    those preconditions."""
 
     verification_id: Identifier = Field(default_factory=new_id)
     ref_key: Identifier
     metadata_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source: Literal["pubmed", "crossref"]
+    source: Literal["pubmed", "crossref", "human_attestation"]
     status: VerificationStatus
     field_results: dict[str, str] = Field(default_factory=dict)
     message: str = ""
     checked_at: AwareDatetime = Field(default_factory=utc_now)
     checked_by: NonEmptyStr
+    reviewer_id: Identifier | None = None
+
+    @model_validator(mode="after")
+    def _attestation(self) -> ReferenceVerification:
+        if self.source == "human_attestation":
+            if self.reviewer_id is None or len(self.message.strip()) < 10:
+                raise ValueError("an identity attestation needs the reviewer and its basis")
+            if self.status not in ("verified", "mismatch"):
+                raise ValueError("an attestation either confirms or contradicts the identity")
+        elif self.reviewer_id is not None:
+            raise ValueError("live lookups are not human attestations")
+        return self
 
 
 class EvidenceExcerpt(FrozenModel):

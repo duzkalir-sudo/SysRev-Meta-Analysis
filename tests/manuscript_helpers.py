@@ -30,6 +30,7 @@ from src.core.enums import (
     SearchRunKind,
     SourceDatabase,
     StudyDesign,
+    UploadMatchStatus,
 )
 from src.core.schemas import FullTextItem, ScreeningDecision, StudyRecord
 from src.core.schemas.search import SearchRun
@@ -120,6 +121,7 @@ def include_everywhere(
                 status=FullTextStatus.OA_DOWNLOADED,
                 pdf_filename=f"{rec.record_id}.pdf",
                 pdf_sha256="b" * 64,
+                match_status=UploadMatchStatus.CONFIRMED,
             ),
         )
 
@@ -149,7 +151,13 @@ def _search_run(repo: Repository, pid: str, reviewer_id: str, name: str) -> str:
     return run.run_id
 
 
-def single_arm_project(session: Session, pid: str = "ms1") -> tuple[Repository, str, str]:
+def single_arm_project(
+    session: Session,
+    pid: str = "ms1",
+    *,
+    extra_arms: list[Any] | None = None,
+    record_overrides: dict[str, dict[str, Any]] | None = None,
+) -> tuple[Repository, str, str]:
     """A single-arm review in Stage 6 with a verified statistics artifact.
 
     Returns (repository, reviewer_id, reviewer token)."""
@@ -171,8 +179,13 @@ def single_arm_project(session: Session, pid: str = "ms1") -> tuple[Repository, 
     repo.save_protocol(pid, protocol)
     run_id = _search_run(repo, pid, rid, REVIEWER)
     records = [pubmed_record(r, i, run_id) for i, (r, _, _) in enumerate(NECROSIS)]
+    records = [
+        rec.model_copy(update=(record_overrides or {}).get(rec.record_id, {})) for rec in records
+    ]
     repo.save_records(pid, records)
     include_everywhere(repo, pid, records, rid, REVIEWER)
+    for arm in extra_arms or []:
+        repo.save_extracted_arm(pid, arm)
     for r, x, n in NECROSIS:
         repo.save_extracted_arm(
             pid, stats_arm(r, "necrosis", follow_up=LAST_FU, events=x, n_analyzed=n)
