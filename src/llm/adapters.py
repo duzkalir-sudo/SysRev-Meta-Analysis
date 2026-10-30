@@ -27,11 +27,12 @@ Provider facts used here (verify when updating):
   ``cache_read_input_tokens``, ``cache_creation_input_tokens``; billing problems are
   reported as ``billing_error`` (402) or a "credit balance is too low" 400.
 * OpenAI: ``POST /v1/responses`` with ``instructions``, ``input``, ``max_output_tokens``,
-  ``reasoning.effort`` and ``store: false``; usage fields ``input_tokens`` (including
-  ``input_tokens_details.cached_tokens``), ``output_tokens`` (including
-  ``output_tokens_details.reasoning_tokens``); exhausted quota is a 429 with code
-  ``insufficient_quota``. These field names follow the Responses API as documented up to
-  2025; the official site could not be reached when this adapter was written, so the
+  ``reasoning.effort`` and ``store: false``; usage fields ``input_tokens`` (with the
+  breakdown ``input_tokens_details.cached_tokens`` / ``cache_write_tokens``),
+  ``output_tokens`` (with ``output_tokens_details.reasoning_tokens``) and
+  ``incomplete_details.reason`` — checked against the official "Create a response" API
+  reference on 2026-10-30. Exhausted quota as a 429 with code ``insufficient_quota``
+  follows OpenAI's documented error codes as known up to 2025 (not re-checked). The
   OpenAI path is validated against mocked responses only until a live check is run.
 """
 
@@ -411,7 +412,7 @@ class OpenAIResponsesProvider(_HTTPProvider):
             output_tokens=_int(raw.get("output_tokens")),
             reasoning_tokens=_int(out_details.get("reasoning_tokens")),
             cache_read_tokens=_int(in_details.get("cached_tokens")),
-            cache_write_tokens=None,
+            cache_write_tokens=_int(in_details.get("cache_write_tokens")),
         )
         settings = {
             "api": "openai.responses",

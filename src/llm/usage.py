@@ -79,9 +79,9 @@ class LLMCallRecord(StrictModel):
 
         The raw fields are kept exactly as reported; their meaning differs by provider:
 
-        * OpenAI Responses: ``input_tokens`` already *include* the cached tokens
-          (``cache_read_tokens``) and ``output_tokens`` include the reasoning tokens, so
-          the total is input + output.
+        * OpenAI Responses: ``input_tokens`` already *include* the cached and
+          cache-write tokens (``input_tokens_details`` is a breakdown of the input) and
+          ``output_tokens`` include the reasoning tokens, so the total is input + output.
         * Anthropic Messages: ``input_tokens``, ``cache_read_input_tokens`` and
           ``cache_creation_input_tokens`` are disjoint, so all three are added to output.
         * Any other provider: input + output (cache fields are not assumed to be disjoint).

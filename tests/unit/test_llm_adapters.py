@@ -54,7 +54,7 @@ def anthropic(effort: str | None = "high", model: str = "claude-opus-5-5", **kw:
 
 
 def openai(effort: str | None = "high", **kw: Any) -> Any:
-    cfg = LLMConfig(provider="openai", model_id="gpt-5.6", label="t", temperature=None,
+    cfg = LLMConfig(provider="openai", model_id="gpt-6-luna", label="t", temperature=None,
                     max_output_tokens=2048, effort=effort)  # fmt: skip
     sleeps: list[float] = []
     p = OpenAIResponsesProvider(cfg, CAT.validate(cfg), SecretStr(OPENAI_KEY),
@@ -75,11 +75,12 @@ def a_ok(text: str = '{"ok": true}', model: str = "claude-opus-5-5", **kw: Any) 
 def o_ok(text: str = '{"ok": true}', **kw: Any) -> dict[str, Any]:
     return {
         "id": "resp_1", "object": "response", "status": "completed",
-        "model": "gpt-5.6-2026-09-01", "reasoning": {"effort": "high"},
+        "model": "gpt-6-luna-2026-09-01", "reasoning": {"effort": "high"},
         "output": [{"type": "reasoning", "summary": []},
                    {"type": "message", "role": "assistant",
                     "content": [{"type": "output_text", "text": text}]}],
-        "usage": {"input_tokens": 2000, "input_tokens_details": {"cached_tokens": 500},
+        "usage": {"input_tokens": 2000,
+                  "input_tokens_details": {"cached_tokens": 500, "cache_write_tokens": 300},
                   "output_tokens": 800, "output_tokens_details": {"reasoning_tokens": 600}},
     } | kw  # fmt: skip
 
@@ -130,8 +131,8 @@ def test_openai_request_shape_usage_and_served_snapshot() -> None:
     assert body["reasoning"] == {"effort": "high"} and body["store"] is False
     assert body["instructions"] == "sys" and body["max_output_tokens"] == 2048
     assert "temperature" not in body
-    assert resp.model_id == "gpt-5.6-2026-09-01"  # actual served snapshot is recorded
-    assert resp.usage == TokenUsage(2000, 800, 600, 500, None)
+    assert resp.model_id == "gpt-6-luna-2026-09-01"  # a dated snapshot is recorded as served
+    assert resp.usage == TokenUsage(2000, 800, 600, 500, 300)
 
 
 # --------------------------------------------------------------------------- validation
@@ -157,7 +158,7 @@ def test_unsupported_effort_and_unknown_model_fail_before_any_call() -> None:
 
 
 def test_task_settings_never_send_temperature() -> None:
-    cfg = TaskModelSettings(provider="openai", model_id="gpt-5.6", effort="none").to_llm_config(
+    cfg = TaskModelSettings(provider="openai", model_id="gpt-6-luna", effort="none").to_llm_config(
         AITask.EXTRACTION
     )
     assert cfg.temperature is None and cfg.effort == "none" and cfg.label == "extraction"
@@ -241,7 +242,9 @@ def test_openai_insufficient_quota_is_not_a_retryable_rate_limit() -> None:
 def test_missing_key_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     creds = CredentialResolver(use_keyring=False, use_dotenv=False)
-    cfg = TaskModelSettings(provider="openai", model_id="gpt-5.6").to_llm_config(AITask.EXTRACTION)
+    cfg = TaskModelSettings(provider="openai", model_id="gpt-6-luna").to_llm_config(
+        AITask.EXTRACTION
+    )
     with pytest.raises(ProviderAccessError, match="no API key for openai"):
         build_api_provider(cfg, CAT, creds)
 
@@ -351,8 +354,20 @@ def test_cost_estimates_follow_each_providers_token_semantics() -> None:
     long_prompt = estimate_cost(haiku, TokenUsage(150_000, 1000, None, 0, 0))
     assert long_prompt.usd == pytest.approx((150_000 * 0.5 + 1000 * 2.5) / 1e6)
     assert "long-prompt" in long_prompt.basis
-    gpt = CAT.get("openai", "gpt-5.6")
-    assert estimate_cost(gpt, TokenUsage(2000, 800, 600, 500, None)).usd is None  # no price
+    luna = CAT.get("openai", "gpt-6-luna")
+    # OpenAI: cached and cache-write tokens are part of input_tokens
+    est = estimate_cost(luna, TokenUsage(2000, 800, 600, 500, 300))
+    assert est.usd == pytest.approx((1200 * 0.1 + 500 * 0.01 + 300 * 0.125 + 800 * 0.5) / 1e6)
+    sol61 = CAT.get("openai", "gpt-6.1-sol")
+    at_threshold = estimate_cost(sol61, TokenUsage(272_000, 1000, None, 0, None))
+    assert at_threshold.usd == pytest.approx((272_000 * 2 + 1000 * 10) / 1e6)  # not > 272K
+    long_req = estimate_cost(sol61, TokenUsage(300_000, 1000, None, 100_000, None))
+    assert long_req.usd == pytest.approx((200_000 * 4 + 100_000 * 0.2 + 1000 * 15) / 1e6)
+    sol56 = CAT.get("openai", "gpt-5.6-sol")
+    long56 = estimate_cost(sol56, TokenUsage(300_000, 1000, None, 100_000, None))
+    # long-tier cache price is not documented for GPT-5.6 Sol → priced at 2x input (bound)
+    assert long56.usd == pytest.approx((200_000 * 8 + 100_000 * 8 + 1000 * 30) / 1e6)
+    assert "upper bound" in long56.basis
     assert estimate_cost(opus, None).usd is None
 
 
@@ -417,8 +432,24 @@ def test_builtin_catalogue_is_internally_consistent() -> None:
         assert m.verified != m.source.startswith("UNVERIFIED")
         if m.pricing is not None:
             assert m.pricing.input > 0 and m.pricing.output > 0
-    # nothing from OpenAI is claimed as verified until checked against its documentation
-    assert all(not m.verified and m.pricing is None for m in CAT.models("openai"))
+    openai = {m.model_id: m for m in CAT.models("openai")}
+    # exact IDs from the official model pages; the routing alias "gpt-5.6" is not listed
+    assert set(openai) == {"gpt-5.6-sol", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"}
+    for m in openai.values():
+        assert m.verified and m.pricing is not None and m.max_output_tokens == 128000
+        assert m.pricing.long_prompt_threshold_tokens == 272000
+        assert m.pricing.long_prompt_input == 2 * m.pricing.input
+        assert m.pricing.long_prompt_output == pytest.approx(1.5 * m.pricing.output)
+    assert openai["gpt-6.1-sol"].efforts == ("low", "medium", "high", "xhigh", "max")
+    assert "none" in openai["gpt-6-luna"].efforts and "none" in openai["gpt-5.6-sol"].efforts
+    assert openai["gpt-6-astra"].provider_default_effort is None  # not documented
+    assert (openai["gpt-6-astra"].pricing.input, openai["gpt-6-astra"].pricing.output) == (10, 50)
+    alias = LLMConfig(provider="openai", model_id="gpt-5.6", label="x", temperature=None)
+    with pytest.raises(UnsupportedConfigurationError, match="not in the openai"):
+        CAT.validate(alias)
+    no_none = alias.model_copy(update={"model_id": "gpt-6.1-sol", "effort": "none"})
+    with pytest.raises(UnsupportedConfigurationError, match="supported values: low"):
+        CAT.validate(no_none)
 
 
 @pytest.mark.parametrize(
@@ -447,13 +478,13 @@ def test_local_override_adds_and_replaces_entries(tmp_path: Any) -> None:
     (tmp_path / "model_catalogue.json").write_text(json.dumps({"models": [
         _entry(model_id="gpt-local", efforts=["none", "low"], provider_default_effort="none",
                pricing={"input": 1.0, "output": 2.0}),
-        _entry(model_id="gpt-5.6", display_name="GPT-5.6", efforts=["low"],
+        _entry(model_id="gpt-6-luna", display_name="GPT-5.6", efforts=["low"],
                provider_default_effort="low"),
     ]}), encoding="utf-8")  # fmt: skip
     cat = ModelCatalogue.load(tmp_path)
     assert cat.get("openai", "gpt-local").pricing is not None
-    assert cat.get("openai", "gpt-5.6").efforts == ("low",)
-    cfg = LLMConfig(provider="openai", model_id="gpt-5.6", label="x", temperature=None,
+    assert cat.get("openai", "gpt-6-luna").efforts == ("low",)
+    cfg = LLMConfig(provider="openai", model_id="gpt-6-luna", label="x", temperature=None,
                     effort="high")  # fmt: skip
     with pytest.raises(UnsupportedConfigurationError, match="supported values: low"):
         cat.validate(cfg)  # never adjusted to another effort

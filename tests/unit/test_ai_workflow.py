@@ -185,12 +185,21 @@ def test_budget_stop_threshold_blocks_new_calls(session: Session, tmp_path: Path
 
 def test_cost_stop_threshold_requires_priced_model(session: Session, tmp_path: Path) -> None:
     repo, store = setup(session, tmp_path, Phase.STAGE2_SEARCH_SCREENING, stop_usd=1.0)
+    (tmp_path / "model_catalogue.json").write_text(json.dumps({"models": [{
+        "provider": "openai", "model_id": "local-unpriced", "efforts": ["low"],
+        "display_name": "Local (UNVERIFIED)", "source": "UNVERIFIED: local test entry",
+        "verified": False}]}), encoding="utf-8")  # fmt: skip
+    cat = ModelCatalogue.load(tmp_path)
+    unpriced = TaskModelSettings(provider="openai", model_id="local-unpriced")
     repo.save_ai_settings(PID, settings(stop_usd=1.0).model_copy(update={"tasks": {
-        AITask.SCREENING_REVIEWER_1: TaskModelSettings(provider="openai", model_id="gpt-5.6"),
-        AITask.SCREENING_REVIEWER_2: TaskModelSettings(provider="openai", model_id="gpt-5.6",
-                                                       effort="low")}}))  # fmt: skip
-    wf = AIWorkflow(repo, PID, catalogue=CAT, credentials=CREDS(),
-                    store=store, provider_builder=scripted_builder([]))  # fmt: skip
+        AITask.SCREENING_REVIEWER_1: unpriced,
+        AITask.SCREENING_REVIEWER_2: unpriced.model_copy(update={"effort": "low"})}}))  # fmt: skip
+
+    def build(cfg: LLMConfig) -> Any:
+        return ScriptedProvider(cfg.model_id, []), cat.validate(cfg)
+
+    wf = AIWorkflow(repo, PID, catalogue=cat, credentials=CREDS(), store=store,
+                    provider_builder=build)  # fmt: skip
     with pytest.raises(SysRevError, match="no list price"):
         wf.run_title_abstract_screening()
 
@@ -457,3 +466,23 @@ def test_identical_request_with_persisted_result_is_not_repeated(
     again = wf.run_extraction(["r1"])  # validated result saved: no second paid call
     assert repo.has_persisted_result(PID, repo.load_llm_calls(PID)[0].call_key)
     assert again.skipped and len(responses) == 1
+
+
+def test_empty_extraction_reply_is_not_a_completed_extraction(
+    session: Session, tmp_path: Path
+) -> None:
+    repo, store = stage4(session, tmp_path)
+    replies: list[Any] = [{"values": []}, EXTRACTION_REPLY]
+    wf = AIWorkflow(repo, PID, catalogue=CAT, credentials=CREDS(), store=store,
+                    provider_builder=scripted_builder(lambda _r: replies.pop(0)))  # fmt: skip
+    first = wf.run_extraction(["r1"])
+    assert not first.done and first.failed and "no values" in first.failed[0]
+    assert repo.load_extraction_items(PID) == []
+    [call] = repo.load_llm_calls(PID)
+    assert call.status == "ok" and call.input_tokens is None  # billed reply stays logged
+    assert not repo.has_persisted_result(PID, call.call_key)
+    second = wf.run_extraction(["r1"])  # ordinary retry, no force
+    assert second.done == ["r1: 1 proposal(s), pending human review"]
+    [item] = repo.load_extraction_items(PID)
+    assert item.review_status == ReviewStatus.PENDING
+    assert len(repo.load_llm_calls(PID)) == 2

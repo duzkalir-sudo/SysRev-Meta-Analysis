@@ -158,10 +158,13 @@ subscriptions cannot pay for these calls. Costs shown are estimates from list pr
 threshold is not a hard cap — set a spending limit in the provider console as well.
 
 **Models.** Only models in the capability catalogue can be selected. The Anthropic entries
-come from Anthropic's API reference (cached 2026-10-06). The OpenAI entry (`gpt-5.6`) is
-**unverified**: OpenAI's documentation could not be reached when it was written and no
-price is assumed. Check the provider documentation and add or correct entries in
-`<SYSREV_DATA_DIR>/model_catalogue.json` (same format).
+come from Anthropic's API reference (cached 2026-10-06). The OpenAI entries
+(`gpt-5.6-sol`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-astra`) were checked against the
+official OpenAI model pages on 2026-10-30, including Standard prices and the >272K-input
+long-context tier. The `gpt-5.6` alias, which routes to `gpt-5.6-sol`, is deliberately not
+offered, so the exact model is recorded. GPT-5.6 Sol's listed price is promotional (at
+least through 2026-11-21). Prices change: check the provider documentation and correct
+entries in `<SYSREV_DATA_DIR>/model_catalogue.json` (same format).
 
 **Validation status.** Both adapters are tested against mocked HTTP responses only. No
 live API call has been made; run a small screening batch with your own key and inspect

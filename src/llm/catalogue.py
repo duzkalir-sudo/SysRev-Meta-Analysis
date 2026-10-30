@@ -37,6 +37,8 @@ class Pricing(BaseModel):
     long_prompt_threshold_tokens: int | None = Field(default=None, gt=0)
     long_prompt_input: float | None = Field(default=None, ge=0)
     long_prompt_output: float | None = Field(default=None, ge=0)
+    long_prompt_cache_read: float | None = Field(default=None, ge=0)
+    long_prompt_cache_write: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _long_prompt_complete(self) -> Pricing:
@@ -153,8 +155,13 @@ def estimate_cost(cap: ModelCapability | None, usage: TokenUsage | None) -> Cost
     Token semantics differ by provider and are normalised here:
 
     * Anthropic ``input_tokens`` exclude cache reads/writes (reported separately);
-    * OpenAI ``input_tokens`` include ``cached_tokens``; reasoning tokens are part of
-      ``output_tokens`` (billed as output) on both.
+    * OpenAI ``input_tokens`` *include* ``cached_tokens`` and ``cache_write_tokens``
+      (``input_tokens_details`` is a breakdown of the input); reasoning tokens are part
+      of ``output_tokens`` (billed as output) on both.
+
+    A long-prompt tier applies to the whole request when the prompt exceeds the
+    threshold. Where the catalogue gives no long-tier cache price, cache tokens in that
+    tier are priced at the long-tier input rate (an upper bound, stated in the basis).
     """
     if usage is None or usage.input_tokens is None or usage.output_tokens is None:
         return CostEstimate(None, "token usage not reported by the provider")
@@ -165,25 +172,26 @@ def estimate_cost(cap: ModelCapability | None, usage: TokenUsage | None) -> Cost
     cache_write = usage.cache_write_tokens or 0
     uncached = usage.input_tokens
     if cap.provider == "openai":
-        uncached = max(usage.input_tokens - cache_read, 0)
+        uncached = max(usage.input_tokens - cache_read - cache_write, 0)
     total_prompt = uncached + cache_read + cache_write
-    in_rate, out_rate = p.input, p.output
     notes = [f"list price ({cap.source.split(';')[0]})"]
+    in_rate, out_rate = p.input, p.output
+    read_rate, write_rate = p.cache_read, p.cache_write
     if p.long_prompt_threshold_tokens and total_prompt > p.long_prompt_threshold_tokens:
-        in_rate = p.long_prompt_input if p.long_prompt_input is not None else in_rate
-        out_rate = p.long_prompt_output if p.long_prompt_output is not None else out_rate
+        assert p.long_prompt_input is not None
+        assert p.long_prompt_output is not None
+        in_rate, out_rate = p.long_prompt_input, p.long_prompt_output
+        read_rate, write_rate = p.long_prompt_cache_read, p.long_prompt_cache_write
         notes.append("long-prompt tier")
-    read_rate = p.cache_read if p.cache_read is not None else in_rate
-    write_rate = p.cache_write if p.cache_write is not None else in_rate
-    if (cache_read and p.cache_read is None) or (cache_write and p.cache_write is None):
+    if (cache_read and read_rate is None) or (cache_write and write_rate is None):
         notes.append("cache tokens priced at the input rate (upper bound)")
     usd = (
         uncached * in_rate
-        + cache_read * read_rate
-        + cache_write * write_rate
+        + cache_read * (read_rate if read_rate is not None else in_rate)
+        + cache_write * (write_rate if write_rate is not None else in_rate)
         + usage.output_tokens * out_rate
     ) / 1_000_000
-    return CostEstimate(round(usd, 6), "estimate: " + "; ".join(notes))
+    return CostEstimate(round(usd, 9), "estimate: " + "; ".join(notes))
 
 
 def rough_prompt_tokens(text: str) -> int:

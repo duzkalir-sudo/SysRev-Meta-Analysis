@@ -1186,7 +1186,7 @@ class Repository:
             "output_tokens": sum(c.output_tokens or 0 for c in calls),
             "reasoning_tokens": sum(c.reasoning_tokens or 0 for c in calls),
             "cache_read_tokens": sum(c.cache_read_tokens or 0 for c in calls),
-            "cost_usd_estimate": round(sum(c.cost_usd_estimate or 0.0 for c in calls), 6),
+            "cost_usd_estimate": round(sum(c.cost_usd_estimate or 0.0 for c in calls), 9),
             "unpriced_successful_calls": sum(c.cost_usd_estimate is None for c in ok),
         }
 

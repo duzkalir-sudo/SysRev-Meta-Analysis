@@ -25,7 +25,7 @@ from src.extraction.rob import LLMRoBDrafter
 from src.fulltext.storage import DocumentStore
 from src.llm.catalogue import ModelCapability, ModelCatalogue, rough_prompt_tokens
 from src.llm.credentials import CredentialResolver, redact
-from src.llm.provider import LLMConfig, LLMProvider, LLMRunHaltError
+from src.llm.provider import LLMConfig, LLMProvider, LLMResponseError, LLMRunHaltError
 from src.llm.tasks import AITask, ProjectAISettings, build_api_provider
 from src.llm.usage import AuditedProvider, BudgetGuard, RedundantCallError
 from src.pdf_extractor import parse_pdf
@@ -258,6 +258,14 @@ class AIWorkflow:
             try:
                 doc = self.document(record_id)
                 proposals = extractor.propose(protocol, doc)
+                if not proposals:
+                    # The prompt requires an explicit 'not_reported' entry for absent data,
+                    # so an empty list is a non-answer, not a completed extraction: nothing
+                    # is saved or linked, and the record can be retried normally.
+                    raise LLMResponseError(
+                        "the model returned no values (absent data must be reported as "
+                        "'not_reported'); nothing saved — retry, or extract manually"
+                    )
                 items = submit_proposals(
                     self.repo, self.project_id, record_id, doc, proposals,
                     proposed_by=ActorType.AGENT, proposer_identity=extractor.identity,
