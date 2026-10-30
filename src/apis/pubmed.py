@@ -13,8 +13,8 @@ from __future__ import annotations
 import contextlib
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -23,7 +23,12 @@ from lxml import etree
 from src.apis.base import BaseAPIClient
 from src.apis.rate_limit import AsyncRateLimiter
 from src.core.enums import SourceDatabase
-from src.core.exceptions import APIClientError, InvalidIdentifierError, SearchResultTooLargeError
+from src.core.exceptions import (
+    APIClientError,
+    InvalidIdentifierError,
+    SearchIncompleteError,
+    SearchResultTooLargeError,
+)
 from src.core.identifiers import extract_registry_ids, normalize_doi, normalize_pmcid
 from src.core.schemas.study import Author, SearchProvenance, StudyRecord
 
@@ -46,6 +51,46 @@ class ESearchResult:
     pmids: list[str]
     query_translation: str | None
     executed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ESearchCount:
+    """A count-only ESearch (retmax=0): what PubMed would return, and how it read the query."""
+
+    query: str
+    count: int
+    query_translation: str | None
+    errors: list[str]
+    warnings: list[str]
+    executed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionedSearch:
+    """All PMIDs of a search, retrieved in publication-date slices of <= 10,000 records."""
+
+    query: str
+    count: int
+    pmids: list[str]
+    query_translation: str | None
+    executed_at: datetime
+    partitions: list[tuple[str, str, int]] = field(default_factory=list)
+
+
+def _messages(result: dict[str, Any], key: str) -> list[str]:
+    """Flatten ESearch ``errorlist`` / ``warninglist`` entries into readable strings."""
+    out: list[str] = []
+    block = result.get(key) or {}
+    if isinstance(block, dict):
+        for kind, values in sorted(block.items()):
+            for value in values or []:
+                if value:
+                    out.append(f"{kind}: {value}")
+    return out
+
+
+def _edate(d: date) -> str:
+    return d.strftime("%Y/%m/%d")
 
 
 def _text(el: etree._Element | None) -> str | None:
@@ -138,6 +183,92 @@ class PubMedClient(BaseAPIClient):
         # Preserve order, drop any repeats that can appear if the index changes mid-paging.
         unique = list(dict.fromkeys(pmids))
         return ESearchResult(query, count, unique, translation, executed_at)
+
+    async def count(
+        self,
+        query: str,
+        *,
+        mindate: str | None = None,
+        maxdate: str | None = None,
+        datetype: str = "pdat",
+    ) -> ESearchCount:
+        """Count matches without retrieving them; reports PubMed's query errors/warnings."""
+        executed_at = datetime.now(UTC)
+        params: dict[str, Any] = {
+            **self._common(), "db": "pubmed", "term": query, "retmode": "json", "retmax": 0,
+        }  # fmt: skip
+        if mindate or maxdate:
+            params |= {"datetype": datetype, "mindate": mindate or "1800",
+                       "maxdate": maxdate or "3000"}  # fmt: skip
+        result = self._esearch_payload(await self._get_json("esearch.fcgi", params))
+        return ESearchCount(
+            query=query,
+            count=int(result["count"]),
+            query_translation=result.get("querytranslation"),
+            errors=_messages(result, "errorlist"),
+            warnings=_messages(result, "warninglist"),
+            executed_at=executed_at,
+        )
+
+    async def esearch_all(
+        self,
+        query: str,
+        *,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        default_start: date = date(1800, 1, 1),
+        default_end: date | None = None,
+    ) -> PartitionedSearch:
+        """All PMIDs of ``query``, partitioning by publication date when > 10,000 match.
+
+        Each slice is fetched with ESearch (inclusive ``mindate``/``maxdate``, ``pdat``).
+        The union of the slices must contain exactly the number of records PubMed reported
+        for the whole search; otherwise :class:`SearchIncompleteError` is raised and nothing
+        is returned, so a search is never silently truncated.
+        """
+        executed_at = datetime.now(UTC)
+        mindate = _edate(date_from) if date_from else None
+        maxdate = _edate(date_to) if date_to else None
+        total = await self.count(query, mindate=mindate, maxdate=maxdate)
+        if total.count <= PUBMED_MAX_RETRIEVABLE:
+            result = await self.esearch(query, mindate=mindate, maxdate=maxdate)
+            parts = [(mindate or "", maxdate or "", result.count)] if (mindate or maxdate) else []
+            return PartitionedSearch(
+                query, result.count, result.pmids, result.query_translation, executed_at, parts
+            )
+        start = date_from or default_start
+        end = date_to or default_end or date(datetime.now(UTC).year + 2, 12, 31)
+        slices: list[tuple[str, str, int]] = []
+        pmids: list[str] = []
+        pending = [(start, end)]
+        while pending:
+            lo, hi = pending.pop(0)
+            n = (await self.count(query, mindate=_edate(lo), maxdate=_edate(hi))).count
+            if n == 0:
+                continue
+            if n > PUBMED_MAX_RETRIEVABLE:
+                if lo == hi:
+                    raise SearchResultTooLargeError(
+                        f"{n} records share the publication date {_edate(lo)}; the search "
+                        "cannot be partitioned further by date. Narrow the query."
+                    )
+                mid = lo + timedelta(days=(hi - lo).days // 2)
+                pending[:0] = [(lo, mid), (mid + timedelta(days=1), hi)]
+                continue
+            part = await self.esearch(query, mindate=_edate(lo), maxdate=_edate(hi))
+            slices.append((_edate(lo), _edate(hi), part.count))
+            pmids.extend(part.pmids)
+        unique = list(dict.fromkeys(pmids))
+        if len(unique) != total.count:
+            raise SearchIncompleteError(
+                f"PubMed reported {total.count} records, but the publication-date partitions "
+                f"({_edate(start)}-{_edate(end)}) returned {len(unique)} distinct PMIDs "
+                "(records outside the date range, or the index changed during retrieval). "
+                "Nothing was saved; add explicit date limits or retry."
+            )
+        return PartitionedSearch(
+            query, total.count, unique, total.query_translation, executed_at, slices
+        )
 
     @staticmethod
     def _esearch_payload(data: Any) -> dict[str, Any]:

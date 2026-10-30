@@ -14,6 +14,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from src.core.enums import (
+    ActorType,
     FullTextStatus,
     OverlapResolution,
     Phase,
@@ -21,6 +22,7 @@ from src.core.enums import (
     ReviewStatus,
     ScreeningStage,
     ScreeningVerdict,
+    SearchRunKind,
     UploadMatchStatus,
 )
 from src.core.exceptions import SysRevError
@@ -50,6 +52,7 @@ from src.core.schemas.master import (
     QuantitativeUnavailability,
     StudyReportLink,
 )
+from src.core.schemas.search import ProtocolEvent, SearchRun
 from src.core.schemas.stats import AnalysisPlan, StatsOutput
 from src.core.security import (
     format_token,
@@ -80,12 +83,15 @@ from src.state.db import (
     LLMCallOutcomeORM,
     ProjectAISettingsORM,
     ProjectORM,
+    ProtocolEventORM,
     ProtocolORM,
     QuantitativeUnavailabilityORM,
     ReviewerORM,
     RiskOfBiasORM,
     ScreeningConflictORM,
     ScreeningDecisionORM,
+    SearchRawRecordORM,
+    SearchRunORM,
     SourceEvidenceORM,
     StateTransitionORM,
     StatsOutputORM,
@@ -276,6 +282,10 @@ class Repository:
 
     # ------------------------------------------------------------------ protocol
     def save_protocol(self, project_id: str, protocol: PICOProtocol) -> None:
+        if protocol.approved_reviewer_id is not None:
+            reviewer = self.require_active_reviewer(protocol.approved_reviewer_id)
+            if protocol.approved_by != reviewer.display_name:
+                raise SysRevError("approved_by does not match the enrolled reviewer")
         self.session.merge(
             ProtocolORM(
                 id=protocol.protocol_id,
@@ -297,6 +307,142 @@ class Repository:
             .limit(1)
         ).first()
         return None if row is None else PICOProtocol.model_validate(row.payload)
+
+    def list_protocols(self, project_id: str) -> list[PICOProtocol]:
+        rows = self.session.scalars(
+            select(ProtocolORM)
+            .where(ProtocolORM.project_id == project_id)
+            .order_by(ProtocolORM.version)
+        ).all()
+        return [PICOProtocol.model_validate(r.payload) for r in rows]
+
+    def supersede_older_protocols(self, project_id: str, version: int) -> None:
+        """Mark approved versions older than ``version`` as superseded."""
+        rows = self.session.scalars(
+            select(ProtocolORM).where(
+                ProtocolORM.project_id == project_id,
+                ProtocolORM.version < version,
+                ProtocolORM.status == "approved",
+            )
+        ).all()
+        for row in rows:
+            row.status = "superseded"
+            row.payload = PICOProtocol.model_validate(
+                row.payload | {"status": "superseded"}
+            ).model_dump(mode="json")
+        self.session.flush()
+
+    def add_protocol_event(
+        self, project_id: str, event: ProtocolEvent, protocol: PICOProtocol
+    ) -> None:
+        if event.actor_type == ActorType.HUMAN:
+            self.require_active_reviewer(event.reviewer_id)
+        self.session.add(
+            ProtocolEventORM(
+                id=event.event_id,
+                project_id=project_id,
+                protocol_version=event.protocol_version,
+                action=event.action,
+                reviewer_id=event.reviewer_id,
+                event=event.model_dump(mode="json"),
+                protocol_payload=protocol.model_dump(mode="json"),
+                created_at=event.occurred_at,
+            )
+        )
+        self.session.flush()
+
+    def list_protocol_events(self, project_id: str) -> list[tuple[ProtocolEvent, PICOProtocol]]:
+        rows = self.session.scalars(
+            select(ProtocolEventORM)
+            .where(ProtocolEventORM.project_id == project_id)
+            .order_by(ProtocolEventORM.seq)
+        ).all()
+        return [
+            (ProtocolEvent.model_validate(r.event), PICOProtocol.model_validate(r.protocol_payload))
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ search log (Session 5)
+    def add_search_run(self, project_id: str, run: SearchRun) -> None:
+        if run.reviewer_id is not None:
+            reviewer = self.require_active_reviewer(run.reviewer_id)
+            if run.actor != reviewer.display_name:
+                raise SysRevError("search-log actor does not match the enrolled reviewer")
+        self.session.add(
+            SearchRunORM(
+                id=run.run_id,
+                project_id=project_id,
+                kind=run.kind.value,
+                status=run.status.value,
+                database=run.database.value if run.database else None,
+                strategy_sha256=run.strategy_sha256,
+                reviewer_id=run.reviewer_id,
+                payload=run.model_dump(mode="json"),
+                created_at=run.executed_at,
+            )
+        )
+        self.session.flush()
+
+    def load_search_runs(
+        self, project_id: str, kind: SearchRunKind | None = None
+    ) -> list[SearchRun]:
+        """Search-log entries in the order they were written."""
+        stmt = select(SearchRunORM).where(SearchRunORM.project_id == project_id)
+        if kind is not None:
+            stmt = stmt.where(SearchRunORM.kind == kind.value)
+        rows = self.session.scalars(stmt.order_by(SearchRunORM.seq)).all()
+        return [SearchRun.model_validate(r.payload) for r in rows]
+
+    def add_raw_records(
+        self, project_id: str, run_id: str, rows: Sequence[tuple[str, int, dict[str, object]]]
+    ) -> None:
+        for record_id, position, raw in rows:
+            self.session.add(
+                SearchRawRecordORM(
+                    project_id=project_id, run_id=run_id, record_id=record_id,
+                    position=position, raw=raw,
+                )
+            )  # fmt: skip
+        self.session.flush()
+
+    def raw_record(self, project_id: str, record_id: str) -> dict[str, object] | None:
+        row = self.session.scalars(
+            select(SearchRawRecordORM).where(
+                SearchRawRecordORM.project_id == project_id,
+                SearchRawRecordORM.record_id == record_id,
+            )
+        ).first()
+        return None if row is None else dict(row.raw)
+
+    def search_identification_problems(self, project_id: str) -> list[str]:
+        """Why the identified records are not yet a complete, prepared screening pool.
+
+        Applies once the project uses the search log (Session 5); projects whose records were
+        stored directly through the library API are not affected.
+        """
+        from src.search.identification import identification_problems
+
+        payloads = self.session.scalars(
+            select(StudyRecordORM.payload).where(StudyRecordORM.project_id == project_id)
+        ).all()
+        unattributed = sum(
+            1 for p in payloads if not ((p.get("provenance") or {}).get("search_run_id"))
+        )
+        return identification_problems(
+            self.load_search_runs(project_id), self.latest_protocol(project_id), unattributed
+        )
+
+    def delete_unresolved_duplicate_candidates(self, project_id: str) -> int:
+        rows = self.session.scalars(
+            select(DuplicateCandidateORM).where(
+                DuplicateCandidateORM.project_id == project_id,
+                DuplicateCandidateORM.resolution == "unresolved",
+            )
+        ).all()
+        for row in rows:
+            self.session.delete(row)
+        self.session.flush()
+        return len(rows)
 
     # ------------------------------------------------------------------ records
     def save_records(self, project_id: str, records: list[StudyRecord]) -> None:
@@ -494,6 +640,17 @@ class Repository:
             self._merge_clusters(project_id, keep=keep, drop=drop)
         self.save_duplicate_candidate(project_id, resolved)
         return resolved
+
+    def reapply_duplicate_resolution(self, project_id: str, candidate: DuplicateCandidate) -> None:
+        """Re-apply a stored human decision after the deduplicator was re-run.
+
+        ``distinct`` needs no change (the pair stays separate); ``duplicate_keep_*`` re-links
+        the dropped cluster to the kept one. The decision row itself is not modified.
+        """
+        if candidate.resolution == "duplicate_keep_a":
+            self._merge_clusters(project_id, keep=candidate.record_id_a, drop=candidate.record_id_b)
+        elif candidate.resolution == "duplicate_keep_b":
+            self._merge_clusters(project_id, keep=candidate.record_id_b, drop=candidate.record_id_a)
 
     def _merge_clusters(self, project_id: str, *, keep: str, drop: str) -> None:
         def representative(record_id: str) -> str:
@@ -1429,6 +1586,11 @@ class Repository:
         protocol_blockers = (
             ("protocol not drafted",) if protocol is None else tuple(protocol.approval_blockers())
         )
+        if protocol is not None and not self._authenticated_approval(protocol):
+            protocol_blockers += (
+                "the current protocol version has not been approved by an authenticated, "
+                "enrolled reviewer",
+            )
 
         def count(stmt: Select[int]) -> int:
             return int(self.session.scalar(stmt) or 0)
@@ -1560,6 +1722,7 @@ class Repository:
         audit = self.latest_audit_report(project_id)
         return GuardContext(
             protocol_blockers=protocol_blockers,
+            search_problems=tuple(self.search_identification_problems(project_id)),
             records_identified=len(record_rows),
             records_unique=len(unique_ids),
             unresolved_duplicate_candidates=unresolved_duplicates,
@@ -1595,6 +1758,14 @@ class Repository:
             stats_output_problems=tuple(self.stats_output_problems(project_id)),
             manuscript_present=project.manuscript_version is not None,
             audit_passed=None if audit is None else audit.passed,
+        )
+
+    def _authenticated_approval(self, protocol: PICOProtocol) -> bool:
+        if protocol.status != "approved" or protocol.approved_reviewer_id is None:
+            return False
+        row = self.session.get(ReviewerORM, protocol.approved_reviewer_id)
+        return (
+            row is not None and row.revoked_at is None and row.display_name == protocol.approved_by
         )
 
     @staticmethod

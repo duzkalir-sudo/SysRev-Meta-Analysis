@@ -68,12 +68,25 @@ class SearchProvenance(FrozenModel):
     query: NonEmptyStr
     endpoint: NonEmptyStr
     executed_at: AwareDatetime
-    total_hits_reported: int = Field(ge=0)
+    # Count the database reported for the whole search; ``None`` when unknown (a manual
+    # export without a recorded total). Never substituted by the number of records stored.
+    total_hits_reported: int | None = Field(ge=0)
     source_record_id: NonEmptyStr
+    # Session 5: the search-log entry (execution or import) that produced the record, and
+    # the SHA-256 of the imported file. ``None`` for records stored before Session 5.
+    search_run_id: Identifier | None = None
+    source_file_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class StudyRecord(StrictModel):
-    """One bibliographic record (a *report* in PRISMA 2020 terminology)."""
+    """One bibliographic record as retrieved from a database or register.
+
+    PRISMA 2020 distinguishes *records* (titles/abstracts identified by a search), *reports*
+    (documents describing a study) and *studies* (the investigation and its participants).
+    A ``StudyRecord`` is a record; duplicate records of the same report are linked through
+    ``duplicate_of``; several reports of one study or cohort are linked later
+    (``StudyReportLink``, cohort-overlap warnings) and are never merged here.
+    """
 
     record_id: Identifier = Field(default_factory=new_id)
     source_database: SourceDatabase

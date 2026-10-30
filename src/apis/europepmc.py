@@ -80,6 +80,15 @@ class EuropePMCClient(BaseAPIClient):
                 return
             cursor = next_cursor
 
+    async def count(self, query: str) -> int:
+        """Europe PMC ``hitCount`` for ``query`` (one result requested)."""
+        data = await self._get_json(
+            "search", {"query": query, "format": "json", "resultType": "lite", "pageSize": 1}
+        )
+        if not isinstance(data, dict) or "hitCount" not in data:
+            raise APIClientError("unexpected Europe PMC response shape")
+        return int(data["hitCount"])
+
     async def search(
         self, query: str, *, max_records: int | None = None
     ) -> tuple[int, list[StudyRecord]]:

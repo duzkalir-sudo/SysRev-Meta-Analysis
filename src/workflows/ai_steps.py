@@ -199,6 +199,9 @@ class AIWorkflow:
     def run_title_abstract_screening(self, *, limit: int | None = None) -> ScreeningRunSummary:
         self._require_phase(Phase.STAGE2_SEARCH_SCREENING)
         protocol = self._protocol()
+        problems = self.repo.search_identification_problems(self.project_id)
+        if problems:
+            raise WorkflowStepError("identification is not complete: " + "; ".join(problems))
         budget = self.budget()
         decided = {
             (d.record_id, d.reviewer)

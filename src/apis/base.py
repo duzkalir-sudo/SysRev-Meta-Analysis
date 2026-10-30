@@ -72,6 +72,8 @@ class BaseAPIClient:
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
         self._sleep = sleep
+        # Called with every successful response; used to preserve raw API responses.
+        self.response_hook: Callable[[httpx.Response], None] | None = None
 
     async def __aenter__(self) -> Self:
         return self
@@ -137,6 +139,8 @@ class BaseAPIClient:
                 await self._sleep(delay)
                 continue
             if response.is_success:
+                if self.response_hook is not None:
+                    self.response_hook(response)
                 return response
             raise APIClientError(
                 f"{self.name} returned HTTP {response.status_code}: {response.text[:300]}",

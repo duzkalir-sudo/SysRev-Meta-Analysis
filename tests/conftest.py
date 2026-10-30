@@ -45,6 +45,7 @@ NOW = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
 # A guard context in which every precondition is satisfied (every field must be explicit).
 READY = GuardContext(
     protocol_blockers=(),
+    search_problems=(),
     records_identified=100,
     records_unique=80,
     unresolved_duplicate_candidates=0,
@@ -80,6 +81,7 @@ READY = GuardContext(
 # What the repository reports for a freshly created project: nothing recorded yet.
 EMPTY = GuardContext(
     protocol_blockers=("protocol not drafted",),
+    search_problems=(),
     records_identified=0,
     records_unique=0,
     unresolved_duplicate_candidates=0,
@@ -265,12 +267,21 @@ def make_protocol(**overrides: Any) -> PICOProtocol:
     return PICOProtocol(**data)
 
 
+def approved_by(
+    reviewer_id: str, name: str = "Dr Human Reviewer", **overrides: Any
+) -> PICOProtocol:
+    """A protocol approved by an enrolled reviewer (what the Gate 1 guard requires)."""
+    return make_protocol(status="approved", approved_by=name, approved_at=NOW,
+                         approved_reviewer_id=reviewer_id, **overrides)  # fmt: skip
+
+
 __all__ = [
     "EMPTY",
     "NOW",
     "READY",
     "FakeClock",
     "RecruitmentPeriod",
+    "approved_by",
     "approved_rob",
     "make_arm",
     "make_author",

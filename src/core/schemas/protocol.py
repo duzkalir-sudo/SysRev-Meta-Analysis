@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import date
 from typing import Literal
 
@@ -42,10 +44,24 @@ class MeSHTerm(StrictModel):
         return self
 
 
+# Fields that define what a strategy retrieves; any change makes it a different search.
+STRATEGY_EXECUTABLE_FIELDS = (
+    "database", "platform", "query", "date_from", "date_to", "languages", "filters",
+)  # fmt: skip
+
+
 class SearchStrategy(StrictModel):
-    """An executable, database-specific search string (PRISMA-S item 8)."""
+    """An executable, database-specific search string (PRISMA-S item 8).
+
+    ``syntax_validated`` is set only by the system: after a successful API preview of this
+    exact strategy, or after an authenticated human attests that it ran in the database's
+    own interface (subscription databases). The ``validation_*`` fields say which.
+    """
 
     database: SourceDatabase
+    platform: str | None = Field(
+        default=None, description='interface/vendor, e.g. "Embase.com", "Ovid", "PubMed"'
+    )
     query: NonEmptyStr
     date_from: date | None = None
     date_to: date | None = None
@@ -53,12 +69,25 @@ class SearchStrategy(StrictModel):
     filters: list[str] = Field(default_factory=list)
     generated_by: ActorType = ActorType.AGENT
     syntax_validated: bool = False
+    validation_method: Literal["api_preview", "api_accepted", "human_attestation"] | None = None
+    validated_by: str | None = None
+    validated_at: AwareDatetime | None = None
+    validation_note: str | None = None
 
     @model_validator(mode="after")
     def _date_order(self) -> SearchStrategy:
         if self.date_from and self.date_to and self.date_from > self.date_to:
             raise ValueError("date_from must not be after date_to")
+        if self.validation_method is not None and not self.syntax_validated:
+            raise ValueError("validation details given for a strategy that is not validated")
         return self
+
+    @property
+    def sha256(self) -> str:
+        """Content hash of the executable definition (stable across validation status)."""
+        data = self.model_dump(mode="json", include=set(STRATEGY_EXECUTABLE_FIELDS))
+        canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @field_validator("query")
     @classmethod
@@ -209,11 +238,17 @@ class PICOProtocol(StrictModel):
     inclusion_criteria: list[NonEmptyStr] = Field(min_length=1)
     exclusion_criteria: list[NonEmptyStr] = Field(min_length=1)
     mesh_terms: list[MeSHTerm] = Field(default_factory=list)
+    selected_databases: list[SourceDatabase] = Field(
+        default_factory=list, description="databases chosen at project setup (Session 5)"
+    )
     search_strategies: list[SearchStrategy] = Field(default_factory=list)
     prospero_id: str | None = Field(default=None, pattern=r"^CRD\d{11}$")
     status: Literal["draft", "approved", "superseded"] = "draft"
     approved_by: str | None = None
     approved_at: AwareDatetime | None = None
+    approved_reviewer_id: Identifier | None = Field(
+        default=None, description="enrolled reviewer who approved (authenticated approvals)"
+    )
 
     @model_validator(mode="after")
     def _consistency(self) -> PICOProtocol:
@@ -263,4 +298,17 @@ class PICOProtocol(StrictModel):
             problems.append("one or more search strategies are not syntax-validated")
         if any(not m.verified for m in self.mesh_terms):
             problems.append("one or more MeSH terms are not verified against NLM MeSH")
+        hashes = [s.sha256 for s in self.search_strategies]
+        if len(hashes) != len(set(hashes)):
+            problems.append("two search strategies are identical")
+        if self.selected_databases:
+            chosen = set(self.selected_databases)
+            with_strategy = {s.database for s in self.search_strategies}
+            for db in sorted(chosen - with_strategy):
+                problems.append(f"selected database {db} has no search strategy")
+            for db in sorted(with_strategy - chosen):
+                problems.append(f"search strategy for {db}, which is not a selected database")
         return problems
+
+    def strategy(self, sha256: str) -> SearchStrategy | None:
+        return next((s for s in self.search_strategies if s.sha256 == sha256), None)
