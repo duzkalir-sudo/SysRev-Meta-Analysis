@@ -1,0 +1,102 @@
+<?xml version="1.0" ?>
+<!-- SYNTHETIC test data shaped like an NCBI EFetch PubmedArticleSet response.
+     Records, authors and identifiers are invented; DOIs use the 10.5555 test prefix. -->
+<!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle, 1st January 2025//EN" "https://dtd.nlm.nih.gov/ncbi/pubmed/out/pubmed_250101.dtd">
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation Status="MEDLINE" Owner="NLM">
+      <PMID Version="1">90000001</PMID>
+      <Article PubModel="Print-Electronic">
+        <Journal>
+          <JournalIssue CitedMedium="Internet">
+            <Volume>12</Volume>
+            <PubDate><Year>2021</Year><Month>Mar</Month></PubDate>
+          </JournalIssue>
+          <Title>Journal of Synthetic Medicine</Title>
+        </Journal>
+        <ArticleTitle>Effect of drug <i>X</i> on HbA<sub>1c</sub>: a randomised controlled trial.</ArticleTitle>
+        <ELocationID EIdType="doi" ValidYN="Y">10.5555/SYNTH.0001</ELocationID>
+        <Abstract>
+          <AbstractText Label="BACKGROUND" NlmCategory="BACKGROUND">Drug X is a synthetic agent.</AbstractText>
+          <AbstractText Label="METHODS" NlmCategory="METHODS">Adults were randomised (NCT01234567).</AbstractText>
+          <AbstractText Label="RESULTS" NlmCategory="RESULTS">HbA<sub>1c</sub> fell by 0·5%.</AbstractText>
+        </Abstract>
+        <AuthorList CompleteYN="Y">
+          <Author ValidYN="Y">
+            <LastName>Synthetica</LastName>
+            <ForeName>Ana</ForeName>
+            <Initials>A</Initials>
+            <Identifier Source="ORCID">https://orcid.org/0000-0002-1825-009X</Identifier>
+            <AffiliationInfo><Affiliation>Department of Endocrinology, Fictional University Hospital, Exampleton, Testland.</Affiliation></AffiliationInfo>
+          </Author>
+          <Author ValidYN="Y">
+            <LastName>Placebo</LastName>
+            <ForeName>Bruno</ForeName>
+            <Initials>B</Initials>
+            <AffiliationInfo><Affiliation>Institute of Imaginary Research, Sampletown, Testland.</Affiliation></AffiliationInfo>
+          </Author>
+          <Author ValidYN="N">
+            <LastName>Invalid</LastName>
+            <ForeName>Iris</ForeName>
+          </Author>
+          <Author ValidYN="Y">
+            <CollectiveName>SYNTH-1 Trial Investigators</CollectiveName>
+          </Author>
+        </AuthorList>
+        <Language>eng</Language>
+        <DataBankList CompleteYN="Y">
+          <DataBank>
+            <DataBankName>ClinicalTrials.gov</DataBankName>
+            <AccessionNumberList><AccessionNumber>NCT07654321</AccessionNumber></AccessionNumberList>
+          </DataBank>
+        </DataBankList>
+        <PublicationTypeList>
+          <PublicationType UI="D016449">Randomized Controlled Trial</PublicationType>
+          <PublicationType UI="D016428">Journal Article</PublicationType>
+        </PublicationTypeList>
+      </Article>
+      <MeshHeadingList>
+        <MeshHeading><DescriptorName UI="D003924" MajorTopicYN="Y">Diabetes Mellitus, Type 2</DescriptorName></MeshHeading>
+        <MeshHeading><DescriptorName UI="D006442" MajorTopicYN="N">Glycated Hemoglobin</DescriptorName></MeshHeading>
+      </MeshHeadingList>
+      <KeywordList Owner="NOTNLM"><Keyword MajorTopicYN="N">synthetic</Keyword></KeywordList>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">90000001</ArticleId>
+        <ArticleId IdType="doi">10.5555/synth.0001</ArticleId>
+        <ArticleId IdType="pmc">PMC9000001</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation Status="PubMed-not-MEDLINE" Owner="NLM">
+      <PMID Version="1">90000002</PMID>
+      <Article PubModel="Print">
+        <Journal>
+          <JournalIssue CitedMedium="Print">
+            <PubDate><MedlineDate>2019 Nov-Dec</MedlineDate></PubDate>
+          </JournalIssue>
+          <Title>Annals of Placeholder Studies</Title>
+        </Journal>
+        <ArticleTitle>Long-term follow-up of a synthetic cohort.</ArticleTitle>
+        <AuthorList CompleteYN="Y">
+          <Author ValidYN="Y"><LastName>Synthetica</LastName><ForeName>Ana</ForeName><Initials>A</Initials></Author>
+        </AuthorList>
+        <Language>eng</Language>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">90000002</ArticleId>
+        <ArticleId IdType="doi">not a valid doi</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation Status="MEDLINE" Owner="NLM">
+      <PMID Version="1">90000003</PMID>
+      <Article PubModel="Print"><Journal><Title>No Title Journal</Title></Journal></Article>
+    </MedlineCitation>
+  </PubmedArticle>
+</PubmedArticleSet>
