@@ -26,7 +26,12 @@ of a review in the same interface: a protocol editor with NLM MeSH verification 
 authenticated approval, database selection, reproducible PubMed / Europe PMC / OpenAlex
 searches, RIS / BibTeX / CSV imports for subscription databases and registers, deterministic
 deduplication with human adjudication of ambiguous pairs, a PRISMA-S search log and
-derived PRISMA counts. **Not implemented yet:** GRADE, manuscript writer and Auditor.
+derived PRISMA counts. Session 6 adds evidence-grounded manuscript drafting (deterministic,
+with optional model-written prose that may not type numbers or citations), a reference
+registry with live PubMed/Crossref verification, an independent completeness-aware
+Auditor, manuscript versioning, human acknowledgement of unresolved findings and a human
+sign-off before a project can be completed. **Not implemented yet:** GRADE and the "Refresh
+Models" catalogue update (issue #9).
 
 ## Quick start
 
@@ -277,3 +282,41 @@ raises the NCBI limit from 3 to 10 requests per second. Linux/macOS: the same co
   reinterpreted.
 * The deduplication title floor for shared identifiers (token-sort similarity 60) is an
   engineering heuristic, not validated against a labelled corpus.
+
+## Session 6: evidence-grounded manuscript and independent audit
+
+Stage 6 starts once Stage 5 has recorded a verified `stats_output.json`. In the UI, open
+**Manuscript**:
+
+1. **Create draft from the evidence package** — a deterministic draft (no AI provider
+   needed). Every number and citation is a marker (`{{stats.nec.pooled_estimate}}`,
+   `[@study-…]`) resolved from approved records; content only an author can supply is left
+   as `[[AUTHOR INPUT: …]]`, which the audit reports as missing.
+2. **Edit** sections (each save is a new version; earlier versions are kept) or, after
+   authorising paid calls, let the configured `manuscript_drafting` model rewrite prose.
+   A model reply that types a digit, cites an unknown reference, names authors without a
+   registry citation or includes a DOI/URL is discarded.
+3. **References** — import background literature by PMID/DOI (live lookup), run live
+   verification, and record supporting excerpts. A failed lookup is shown as
+   *unavailable*, never as verified.
+4. **Audit** — the deterministic Auditor checks the stored version against the current
+   evidence (see ARCHITECTURE.md §9.8). Blocking findings must be fixed; findings that
+   require human review must be acknowledged by an authenticated reviewer with a reason.
+5. **Sign-off** — in the audit phase, an authenticated human signs off the exact version
+   and audit; only then does *Pipeline status → completed* succeed. Any later change to the
+   text or to the underlying evidence invalidates the audit and the sign-off.
+
+Exports: Markdown, editable Word (`pip install -e ".[manuscript]"` for `python-docx`), a
+provenance note and the audit report. Forest plots are the Stage 5 SVG files, referenced by
+the figure legends and submitted separately.
+
+### What is and is not validated (Session 6)
+
+* Tested with synthetic projects, mocked model replies (respx-mocked Anthropic HTTP) and
+  in-memory PubMed/Crossref fakes. **No live model call and no live PubMed/Crossref call
+  was made** during development; real-world manuscript quality is unvalidated.
+* The Auditor's numerical checks of inserted values are exact (with stated rounding
+  tolerances). Its checks of free prose (typed numbers, labels, claims, methods
+  descriptions) are rule-based and incomplete; unresolved statements are routed to human
+  review, never marked verified. Whether a background reference supports a sentence is
+  checked only lexically against human-entered excerpts.
