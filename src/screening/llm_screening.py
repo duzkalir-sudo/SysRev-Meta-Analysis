@@ -44,6 +44,7 @@ from src.llm.provider import (
     LLMProvider,
     LLMRequest,
     LLMResponseError,
+    LLMRunHaltError,
     parse_json_object,
 )
 from src.pdf_extractor.context import render_context, select_context
@@ -270,6 +271,7 @@ class ScreeningRunSummary:
     failures: list[str] = field(default_factory=list)
     conflicts_created: int = 0
     independence_note: str | None = None
+    halted: str | None = None
 
 
 class DualScreeningRunner:
@@ -313,6 +315,8 @@ class DualScreeningRunner:
                 "not independent assessors"
             )
         for source in sources:
+            if summary.halted:
+                break
             for screener in self.screeners:
                 existing = self.repo.find_screening_decision(
                     self.project_id, source.record_id, screener.role, stage
@@ -322,6 +326,10 @@ class DualScreeningRunner:
                     continue
                 try:
                     decision = screener.screen(self.protocol, source)
+                except LLMRunHaltError as exc:  # credentials/funds/config/budget: stop the run
+                    logger.warning("screening halted: %s", exc)
+                    summary.halted = str(exc)[:500]
+                    break
                 except Exception as exc:  # provider/transport failure: record nothing, retry later
                     logger.warning("screening %s failed: %s", source.record_id, exc)
                     summary.failures.append(f"{source.record_id}/{screener.role}: {exc}"[:300])

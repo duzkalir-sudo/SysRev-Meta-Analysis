@@ -428,6 +428,51 @@ class StatsOutputORM(Base):
     created_at: Mapped[datetime] = mapped_column(default=_now)
 
 
+class ProjectAISettingsORM(Base):
+    """Per-project model configuration per AI task (append-only versions; no secrets)."""
+
+    __tablename__ = "project_ai_settings"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class LLMCallORM(Base):
+    """Audit trail of every LLM call: model, effort, tokens, cost estimate (append-only)."""
+
+    __tablename__ = "llm_calls"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    task: Mapped[str] = mapped_column(String(64), index=True)
+    provider: Mapped[str] = mapped_column(String(32))
+    requested_model: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32))
+    call_key: Mapped[str] = mapped_column(String(64), index=True)
+    total_tokens: Mapped[int] = mapped_column(Integer)
+    cost_usd_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class AIVerificationORM(Base):
+    """Advisory second-model checks of extracted values (append-only; never approvals)."""
+
+    __tablename__ = "ai_verifications"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    item_id: Mapped[str] = mapped_column(String(64), index=True)
+    verdict: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
 APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     StateTransitionORM,
     GateDecisionORM,
@@ -435,6 +480,9 @@ APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     ExtractionReviewEventORM,
     AnalysisPlanORM,
     StatsOutputORM,
+    ProjectAISettingsORM,
+    LLMCallORM,
+    AIVerificationORM,
 )
 
 

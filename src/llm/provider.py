@@ -34,6 +34,46 @@ class LLMResponseError(SysRevError, ValueError):
     """A provider response could not be parsed into the expected structure."""
 
 
+class LLMRunHaltError(SysRevError):
+    """A failure that makes every further call of the run pointless (or unsafe).
+
+    Batch runners stop at the first one instead of recording a failure per record:
+    missing/invalid credentials, exhausted funds, an unsupported model/effort
+    combination, or a local budget pause. Nothing is recorded for the halted item.
+    """
+
+
+class ProviderAccessError(LLMRunHaltError):
+    """Credentials missing or rejected, no permission, or the model is not available."""
+
+
+class InsufficientFundsError(ProviderAccessError):
+    """The provider reports exhausted credit/quota for the API account (not retried)."""
+
+
+class UnsupportedConfigurationError(LLMRunHaltError, ProviderNotConfiguredError):
+    """The requested provider/model/effort/parameter combination is not supported.
+
+    Raised before any network call when the capability catalogue rules it out, and
+    after one when the provider rejects a parameter. Never answered by silently
+    switching to another model or effort.
+    """
+
+
+class BudgetPauseError(LLMRunHaltError):
+    """The project's locally configured stop threshold was reached; no call was made."""
+
+
+class ProviderUnavailableError(SysRevError):
+    """Transient provider failure (rate limit, overload, server/network error) that
+    persisted after the bounded retries. The item can be retried later."""
+
+
+class LLMOutputError(LLMResponseError):
+    """The provider answered without usable text: refusal, truncation at the output
+    token limit, or an empty/incomplete response."""
+
+
 class LLMConfig(StrictModel):
     """Which model performs a task. Kept separate from task logic and prompts."""
 
@@ -41,7 +81,12 @@ class LLMConfig(StrictModel):
     model_id: NonEmptyStr
     label: NonEmptyStr = Field(description='role label, e.g. "llm-pass-1"')
     temperature: float | None = Field(default=0.0, ge=0.0, le=2.0)
-    max_output_tokens: int = Field(default=1024, ge=16, le=32000)
+    max_output_tokens: int = Field(default=1024, ge=16, le=128000)
+    effort: str | None = Field(
+        default=None,
+        description="exact provider effort value (e.g. 'high'); None = do not send one "
+        "and let the provider apply its documented default",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,10 +108,25 @@ class LLMRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenUsage:
+    """Token counts exactly as reported by the provider (``None`` = not reported)."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LLMResponse:
     text: str
     provider: str
     model_id: str
+    usage: TokenUsage | None = None
+    effective_settings: dict[str, Any] = field(default_factory=dict)
+    provider_request_id: str | None = None
+    attempts: int = 1
 
     @property
     def sha256(self) -> str:
