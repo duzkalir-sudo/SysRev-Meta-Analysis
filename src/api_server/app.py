@@ -106,6 +106,7 @@ def create_app(
     *,
     search_clients: SearchClients | None = None,
 ) -> FastAPI:
+    from src.api_server.amendment_routes import build_amendment_router
     from src.api_server.manuscript_routes import build_manuscript_router
     from src.api_server.model_routes import build_model_router
     from src.api_server.reporting_routes import build_reporting_router
@@ -132,6 +133,7 @@ def create_app(
     app.state.search_clients = search_clients  # None: built from settings on first use
     app.include_router(build_review_router(store))
     app.include_router(build_search_router(DocumentStore(root / "searches")))
+    app.include_router(build_amendment_router(DocumentStore(root / "searches")))
     app.include_router(build_manuscript_router())
     app.include_router(build_reporting_router())
     app.state.base_catalogue = ModelCatalogue.load(root)  # built-in + local override file

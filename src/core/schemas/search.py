@@ -152,7 +152,12 @@ class ProtocolEvent(FrozenModel):
     protocol_id: Identifier
     protocol_version: int = Field(ge=1)
     action: Literal[
-        "draft_saved", "mesh_verified", "syntax_validated", "syntax_attested", "approved"
+        "draft_saved",
+        "mesh_verified",
+        "syntax_validated",
+        "syntax_attested",
+        "approved",
+        "amendment_approved",  # Session 8: protocol version n+1 from an approved amendment
     ]
     protocol_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     material_changes: dict[str, list[str]] = Field(default_factory=dict)

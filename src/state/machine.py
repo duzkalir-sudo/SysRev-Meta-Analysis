@@ -105,6 +105,9 @@ class GuardContext:
     # cover the current manuscript version and current evidence, have passed, have every
     # human-review finding acknowledged, and the version must be signed off by a human.
     audit_problems: tuple[str, ...]
+    # Session 8: an undecided protocol amendment, or work pending re-review after an approved
+    # amendment, blocks every forward transition (returning to drafting stays allowed).
+    amendment_problems: tuple[str, ...]
 
 
 Guard = Callable[[GuardContext], list[str]]
@@ -262,6 +265,18 @@ def _revision_allowed(c: GuardContext) -> list[str]:
     return []
 
 
+def _amendments_settled(c: GuardContext) -> list[str]:
+    return [f"amendment: {p}" for p in c.amendment_problems]
+
+
+def _with_amendments(guard: Guard) -> Guard:
+    def checked(c: GuardContext) -> list[str]:
+        return _amendments_settled(c) + guard(c)
+
+    checked.__doc__ = guard.__doc__
+    return checked
+
+
 GUARDS: dict[tuple[Phase, Phase], Guard] = {
     (Phase.GATE1_SEARCH_STRATEGY, Phase.STAGE2_SEARCH_SCREENING): _protocol_ready,
     (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS): _dual_screening_done,
@@ -274,6 +289,11 @@ GUARDS: dict[tuple[Phase, Phase], Guard] = {
     (Phase.STAGE6_MANUSCRIPT, Phase.STAGE6_AUDIT): _manuscript_present,
     (Phase.STAGE6_AUDIT, Phase.COMPLETED): _audit_passed,
     (Phase.STAGE6_AUDIT, Phase.STAGE6_MANUSCRIPT): _revision_allowed,
+}
+# Every forward step also requires settled amendments; returning to drafting never does.
+GUARDS = {
+    edge: guard if guard is _revision_allowed else _with_amendments(guard)
+    for edge, guard in GUARDS.items()
 }
 
 

@@ -35,6 +35,7 @@ from src.core.enums import ActorType, Phase, SearchRunKind, SearchRunStatus, Sou
 from src.core.exceptions import APIClientError, SysRevError
 from src.core.schemas.base import new_id
 from src.core.schemas.protocol import PICOProtocol, SearchStrategy
+from src.core.schemas.screening import DuplicateCandidate
 from src.core.schemas.search import DatePartition, SearchFileRef, SearchRun
 from src.core.schemas.study import SearchProvenance, StudyRecord
 from src.fulltext.storage import DocumentStore
@@ -213,11 +214,9 @@ class SearchService:
                 f"searches are executed and imported in {Phase.STAGE2_SEARCH_SCREENING}, after "
                 f"Gate 1 approved the protocol (project is in {phase})"
             )
-        if self.repo.load_screening_decisions(self.project_id):
-            raise SearchError(
-                "screening has started: adding or re-deduplicating records now would change "
-                "the screening pool (update searches are not supported yet)"
-            )
+        # Session 8: searches and imports after screening has begun are *update searches*.
+        # They are allowed in Stage 2; their records are prepared incrementally
+        # (:meth:`_prepare_update`), which never re-points or rewrites a screened record.
 
     def _approved_strategy(self, sha: str) -> tuple[PICOProtocol, SearchStrategy]:
         protocol = self.repo.latest_protocol(self.project_id)
@@ -253,10 +252,28 @@ class SearchService:
         }
 
     # ------------------------------------------------------------------ preview
-    async def preview(self, sha: str, *, reviewer: Reviewer) -> SearchRun:
-        """Count-only search. In Stage 1 a clean preview marks the strategy syntax-validated."""
+    async def preview(
+        self,
+        sha: str,
+        *,
+        reviewer: Reviewer,
+        amendment_id: str | None = None,
+        expected_amendment_sha256: str | None = None,
+    ) -> SearchRun:
+        """Count-only search. In Stage 1 a clean preview marks the strategy syntax-validated;
+        with ``amendment_id`` (Session 8, Stage 2) it validates a strategy of the open
+        protocol amendment instead (a new revision of the proposal)."""
+        from src.search import amendments
+
         phase = self._phase()
         protocol = self.repo.latest_protocol(self.project_id)
+        if amendment_id is not None:
+            pending = amendments.open_amendment(self.repo, self.project_id)
+            if pending is None or pending.amendment_id != amendment_id:
+                raise SearchError(f"amendment {amendment_id} is not open")
+            if pending.sha256 != expected_amendment_sha256:
+                raise SearchError("the amendment has changed since it was displayed; reload")
+            protocol = pending.protocol
         strategy = protocol.strategy(sha) if protocol else None
         if protocol is None or strategy is None:
             raise SearchError(f"strategy {sha[:12]} is not in the current protocol")
@@ -321,11 +338,17 @@ class SearchService:
             files=self._store_responses(capture),
         )
         self.repo.add_search_run(self.project_id, run)
-        if phase == Phase.STAGE1_PROTOCOL and protocol.status == "draft" and not errors:
-            method: Literal["api_preview", "api_accepted"] = (
-                "api_preview" if strategy.database == SourceDatabase.PUBMED else "api_accepted"
-            )
-            note = f"preview {run.run_id}: {count} records"
+        method: Literal["api_preview", "api_accepted"] = (
+            "api_preview" if strategy.database == SourceDatabase.PUBMED else "api_accepted"
+        )
+        note = f"preview {run.run_id}: {count} records"
+        if amendment_id is not None and not errors:
+            assert expected_amendment_sha256 is not None
+            amendments.record_strategy_validation(
+                self.repo, self.project_id, amendment_id, sha, method=method,
+                reviewer=reviewer, expected_sha256=expected_amendment_sha256, note=note,
+            )  # fmt: skip
+        elif phase == Phase.STAGE1_PROTOCOL and protocol.status == "draft" and not errors:
             record_strategy_validation(
                 self.repo, self.project_id, sha, method=method, reviewer=reviewer, note=note
             )
@@ -804,10 +827,15 @@ class SearchService:
 
     # ------------------------------------------------------------------ preparation
     def prepare_for_screening(self, *, reviewer: Reviewer) -> SearchRun:
-        """Deduplicate all identified records and record the PRISMA snapshot."""
+        """Deduplicate all identified records and record the PRISMA snapshot.
+
+        Once screening has begun, only the records of searches/imports logged after the last
+        preparation are deduplicated (update search, :meth:`_prepare_update`)."""
         self._require_identification_open()
         if not any(r.identifies_records for r in self.repo.load_search_runs(self.project_id)):
             raise SearchError("no executed or imported search yet")
+        if self.repo.load_screening_decisions(self.project_id):
+            return self._prepare_update(reviewer=reviewer)
         # Human adjudications survive re-preparation (e.g. after a further import): they are
         # kept and re-applied, and the same pair is never proposed again.
         resolved = [
@@ -860,12 +888,142 @@ class SearchService:
         self.repo.save_prisma(self.project_id, derive_prisma(self.repo, self.project_id))
         return run
 
+    def _prepare_update(self, *, reviewer: Reviewer) -> SearchRun:
+        """Incremental deduplication for an update search after screening has begun.
+
+        * Records prepared earlier (the screening pool) are *frozen*: their ``duplicate_of``,
+          identifiers and screening decisions are never changed.
+        * Each new record (from runs logged after the last preparation) is compared with the
+          frozen unique records and the other new records by the same deduplicator. A new
+          record matching exactly one frozen record becomes its duplicate (the screened record
+          is kept); new records matching only each other are merged among themselves; a new
+          record whose cluster would join two or more frozen records, and any conflicting
+          match, becomes a :class:`DuplicateCandidate` for a human, and stays unique (to be
+          screened) until decided.
+        * PRISMA is re-derived from the stored records, so the update search's records appear
+          in identification, duplicates removed and screening like every other search.
+        """
+        runs = self.repo.load_search_runs(self.project_id)
+        preps = [i for i, r in enumerate(runs) if r.kind == SearchRunKind.DEDUPLICATION]
+        if not preps:
+            raise SearchError(
+                "screening decisions exist but no earlier preparation is logged; the screening "
+                "pool cannot be identified, so an update search cannot be prepared"
+            )
+        last_prep = preps[-1]
+        new_runs = {r.run_id for r in runs[last_prep + 1 :] if r.identifies_records}
+        records = self.repo.load_records(self.project_id)
+        new = [
+            r for r in records
+            if r.provenance is not None and r.provenance.search_run_id in new_runs
+        ]  # fmt: skip
+        if not new:
+            raise SearchError("no search or import was logged since the last preparation")
+        new_ids = {r.record_id for r in new}
+        frozen_unique = [
+            r for r in records if r.record_id not in new_ids and r.duplicate_of is None
+        ]
+        dedup = Deduplicator(
+            title_threshold=self.dedup_title_threshold,
+            exact_match_title_floor=EXACT_MATCH_TITLE_FLOOR,
+        )
+        fresh = [r.model_copy(update={"duplicate_of": None}) for r in new]
+        result = dedup.deduplicate(frozen_unique + fresh)
+        clusters: dict[str, list[str]] = {}
+        for rid in [r.record_id for r in frozen_unique + fresh]:
+            rep = result.duplicate_of.get(rid, rid)
+            clusters.setdefault(rep, []).append(rid)
+        by_id = {r.record_id: r for r in fresh}
+        decided = {
+            frozenset((c.record_id_a, c.record_id_b))
+            for c in self.repo.load_duplicate_candidates(self.project_id)
+        }
+        to_save: list[StudyRecord] = []
+        candidates: list[DuplicateCandidate] = []
+        joined_frozen = joined_new = 0
+        for cluster_rep, members in clusters.items():
+            olds = sorted(m for m in members if m not in new_ids)
+            news = sorted(m for m in members if m in new_ids)
+            if not news:
+                continue
+            if len(olds) == 1:
+                for m in news:
+                    to_save.append(by_id[m].model_copy(update={"duplicate_of": olds[0]}))
+                joined_frozen += len(news)
+            elif not olds:  # the deduplicator's representative (most complete record)
+                rep = cluster_rep
+                for m in news:
+                    to_save.append(
+                        by_id[m].model_copy(update={"duplicate_of": None if m == rep else rep})
+                    )
+                joined_new += len(news) - 1
+            else:  # would join several frozen records: a human decides, nothing is merged
+                for m in news:
+                    to_save.append(by_id[m])
+                    for o in olds:
+                        if frozenset((m, o)) not in decided:
+                            candidates.append(DuplicateCandidate(
+                                record_id_a=min(m, o), record_id_b=max(m, o),
+                                match_basis="update search: matches several screened records",
+                                conflict="the deduplicator would merge records that were "
+                                "screened as distinct; not merged automatically",
+                            ))  # fmt: skip
+        for pd in result.possible_duplicates:
+            pair = frozenset((pd.record_id_a, pd.record_id_b))
+            if pair & new_ids and pair not in decided:
+                candidates.append(pd.to_candidate())
+        self.repo.save_records(self.project_id, to_save)
+        for c in {frozenset((c.record_id_a, c.record_id_b)): c for c in candidates}.values():
+            self.repo.save_duplicate_candidate(self.project_id, c)
+        unique_new = sum(1 for r in to_save if r.duplicate_of is None)
+        run = SearchRun(
+            **self._base(reviewer, kind=SearchRunKind.DEDUPLICATION),
+            records_saved=0,
+            summary={
+                "update_search": True,
+                "new_records": len(new),
+                "duplicates_of_screened_records": joined_frozen,
+                "duplicates_among_new_records": joined_new,
+                "new_unique_records_to_screen": unique_new,
+                "possible_duplicates_for_review": len(candidates),
+                "frozen_records_unchanged": len(records) - len(new),
+                "by_source": identification_by_source(self.repo, self.project_id),
+                "settings": {
+                    "title_threshold": dedup.title_threshold,
+                    "year_tolerance": dedup.year_tolerance,
+                    "exact_match_title_floor": dedup.exact_match_title_floor,
+                },
+            },
+        )
+        self.repo.add_search_run(self.project_id, run)
+        self.repo.save_prisma(self.project_id, derive_prisma(self.repo, self.project_id))
+        return run
+
     def resolve_duplicate(
         self, candidate_id: str, *, resolution: str, reviewer: Reviewer, note: str | None = None
     ) -> Any:
         phase = self._phase()
         if phase not in (Phase.STAGE2_SEARCH_SCREENING, Phase.GATE1_5_SCREENING_CONFLICTS):
             raise SearchError(f"duplicates are adjudicated in Stage 2 / Gate 1.5 (now {phase})")
+        if resolution in ("duplicate_keep_a", "duplicate_keep_b"):
+            pair = next(
+                (c for c in self.repo.load_duplicate_candidates(self.project_id)
+                 if c.candidate_id == candidate_id), None,
+            )  # fmt: skip
+            if pair is not None:
+                keep, drop = (
+                    (pair.record_id_a, pair.record_id_b)
+                    if resolution == "duplicate_keep_a"
+                    else (pair.record_id_b, pair.record_id_a)
+                )
+                screened = {
+                    d.record_id for d in self.repo.load_screening_decisions(self.project_id)
+                }
+                if drop in screened and keep not in screened:
+                    raise SearchError(
+                        f"{drop} has screening decisions and {keep} has none: keep the screened "
+                        "record (the other one is then removed as its duplicate)"
+                    )
         resolved = self.repo.resolve_duplicate_candidate(
             self.project_id,
             candidate_id,

@@ -132,6 +132,8 @@ from src.state.machine import GuardContext, PipelineStateMachine
 from src.stats_engine.engine import run_plan
 from src.stats_engine.inputs import AnalysisInputs
 
+_REVIEW_STAMPS = {"review_status", "reviewed_by", "reviewer_id", "reviewed_at", "review_note"}
+
 
 class NotFoundError(SysRevError, LookupError):
     pass
@@ -529,10 +531,41 @@ class Repository:
         self.session.flush()
 
     def load_screening_decisions(self, project_id: str) -> list[ScreeningDecision]:
+        """Stored decisions, followed by any verdict a human revised when re-reviewing a record
+        after a protocol amendment (Session 8). A revision is appended as a later human
+        ADJUDICATOR decision, so it is the effective one; the earlier rows are unchanged."""
         rows = self.session.scalars(
             select(ScreeningDecisionORM).where(ScreeningDecisionORM.project_id == project_id)
         ).all()
-        return [ScreeningDecision.model_validate(r.payload) for r in rows]
+        stored = [ScreeningDecision.model_validate(r.payload) for r in rows]
+        return stored + self._amendment_revisions(project_id)
+
+    def _amendment_revisions(self, project_id: str) -> list[ScreeningDecision]:
+        out = []
+        for res in self.governance_records(project_id, "amendment_resolution"):
+            if res.get("resolution") != "revised" or res.get("verdict") is None:
+                continue
+            out.append(
+                ScreeningDecision(
+                    decision_id=str(res["_record_id"]),
+                    record_id=str(res["subject"]),
+                    reviewer=ReviewerRole.ADJUDICATOR,
+                    reviewer_identity=str(res["resolved_by"]),
+                    reviewer_id=str(res["reviewer_id"]),
+                    is_human=True,
+                    stage=ScreeningStage(str(res["stage"])),
+                    verdict=ScreeningVerdict(str(res["verdict"])),
+                    exclusion_reason=(
+                        str(res["exclusion_reason"]) if res.get("exclusion_reason") else None
+                    ),
+                    rationale=(
+                        f"re-review after protocol amendment {str(res['amendment_id'])[:12]}: "
+                        f"{res['note']}"
+                    ),
+                    decided_at=res["resolved_at"],  # type: ignore[arg-type]
+                )
+            )
+        return out
 
     def save_conflict(self, project_id: str, conflict: ScreeningConflict) -> None:
         """Persist a conflict that matches the stored reviewer decisions.
@@ -857,12 +890,41 @@ class Repository:
         self.session.flush()
         return approved
 
-    def load_extracted_arms(self, project_id: str) -> list[ExtractedStudyArm]:
+    def invalidated_arm_ids(self, project_id: str) -> set[str]:
+        """Arms withdrawn after a correction of an accepted value (Session 8). The rows are
+        kept (write-once history); every reader ignores them and a rebuilt arm gets a new id."""
         rows = self.session.scalars(
-            select(ExtractedArmORM)
-            .where(ExtractedArmORM.project_id == project_id)
-            .order_by(ExtractedArmORM.id)
+            select(GovernanceRecordORM.subject).where(
+                GovernanceRecordORM.project_id == project_id,
+                GovernanceRecordORM.kind == "arm_invalidation",
+            )
         ).all()
+        return set(rows)
+
+    def invalidate_arm(
+        self, project_id: str, arm_id: str, *, reviewer_id: str, item_id: str, reason: str
+    ) -> None:
+        row = self.session.get(ExtractedArmORM, arm_id)
+        if row is None or row.project_id != project_id:
+            raise NotFoundError(f"arm {arm_id} not found")
+        if arm_id in self.invalidated_arm_ids(project_id):
+            return
+        self.add_governance_record(
+            project_id, "arm_invalidation", arm_id,
+            {"arm_id": arm_id, "record_id": row.record_id, "outcome_id": row.outcome_id,
+             "item_id": item_id, "reason": reason, "reviewer_id": reviewer_id},
+            reviewer_id=reviewer_id,
+        )  # fmt: skip
+
+    def load_extracted_arms(
+        self, project_id: str, *, include_invalidated: bool = False
+    ) -> list[ExtractedStudyArm]:
+        stmt = select(ExtractedArmORM).where(ExtractedArmORM.project_id == project_id)
+        if not include_invalidated:
+            invalid = self.invalidated_arm_ids(project_id)
+            if invalid:
+                stmt = stmt.where(ExtractedArmORM.id.notin_(invalid))
+        rows = self.session.scalars(stmt.order_by(ExtractedArmORM.id)).all()
         return [self._arm_from_row(r) for r in rows]
 
     def _get_or_add_evidence(self, evidence: SourceEvidence) -> SourceEvidenceORM:
@@ -1094,6 +1156,27 @@ class Repository:
         row.payload = item.model_dump(mode="json")
         self.session.flush()
 
+    def supersede_reviewed_item(self, project_id: str, superseded: ExtractionItem) -> None:
+        """Mark an accepted/rejected item superseded by a correction (Session 8). Only the
+        review status and its stamps change; the earlier payload is kept in the append-only
+        review event written by the caller."""
+        row = self.session.get(ExtractionItemORM, superseded.item_id)
+        if row is None or row.project_id != project_id:
+            raise NotFoundError(f"extraction item {superseded.item_id} not found")
+        if row.review_status not in (ReviewStatus.ACCEPTED.value, ReviewStatus.REJECTED.value):
+            raise SysRevError(f"item {superseded.item_id} is {row.review_status}")
+        if superseded.review_status != ReviewStatus.SUPERSEDED:
+            raise SysRevError("a reviewed item can only become superseded")
+        self.require_active_reviewer(superseded.reviewer_id)
+        before = ExtractionItem.model_validate(row.payload)
+        if superseded.model_dump(exclude=_REVIEW_STAMPS) != before.model_dump(
+            exclude=_REVIEW_STAMPS
+        ):
+            raise SysRevError("superseding may not change the item's content")
+        row.review_status = ReviewStatus.SUPERSEDED.value
+        row.payload = superseded.model_dump(mode="json")
+        self.session.flush()
+
     def get_extraction_item(self, project_id: str, item_id: str) -> ExtractionItem:
         row = self.session.get(ExtractionItemORM, item_id)
         if row is None or row.project_id != project_id:
@@ -1145,6 +1228,29 @@ class Repository:
         row.study_id = link.study_id
         row.payload = link.model_dump(mode="json")
         self.session.add(row)
+        self.session.flush()
+
+    def load_study_links(self, project_id: str) -> list[StudyReportLink]:
+        rows = self.session.scalars(
+            select(StudyReportLinkORM)
+            .where(StudyReportLinkORM.project_id == project_id)
+            .order_by(StudyReportLinkORM.record_id)
+        ).all()
+        return [StudyReportLink.model_validate(r.payload) for r in rows]
+
+    def remove_study_link(self, project_id: str, record_id: str, *, reviewer_id: str) -> None:
+        """The report becomes its own study again (Session 8). History is kept by the caller
+        in the append-only governance log."""
+        self.require_active_reviewer(reviewer_id)
+        row = self.session.scalars(
+            select(StudyReportLinkORM).where(
+                StudyReportLinkORM.project_id == project_id,
+                StudyReportLinkORM.record_id == record_id,
+            )
+        ).first()
+        if row is None:
+            raise NotFoundError(f"report {record_id} is not linked to a study")
+        self.session.delete(row)
         self.session.flush()
 
     def study_ids(self, project_id: str, record_ids: set[str] | None = None) -> dict[str, str]:
@@ -1360,7 +1466,7 @@ class Repository:
             is not None
         )
 
-    def llm_usage_totals(self, project_id: str) -> dict[str, float | int]:
+    def llm_usage_totals(self, project_id: str) -> dict[str, float | int | str]:
         """Project totals over successful and failed calls (estimates, not invoices)."""
         calls = self.load_llm_calls(project_id)
         ok = [c for c in calls if c.status == "ok"]
@@ -1373,8 +1479,19 @@ class Repository:
             "output_tokens": sum(c.output_tokens or 0 for c in calls),
             "reasoning_tokens": sum(c.reasoning_tokens or 0 for c in calls),
             "cache_read_tokens": sum(c.cache_read_tokens or 0 for c in calls),
+            "cache_write_tokens": sum(c.cache_write_tokens or 0 for c in calls),
             "cost_usd_estimate": round(sum(c.cost_usd_estimate or 0.0 for c in calls), 9),
             "unpriced_successful_calls": sum(c.cost_usd_estimate is None for c in ok),
+            # Session 8: never present an unknown price as zero
+            "cost_status": (
+                "no successful calls"
+                if not ok
+                else "unavailable (no call had a verified list price)"
+                if all(c.cost_usd_estimate is None for c in ok)
+                else "partial (lower bound: some calls had no list price)"
+                if any(c.cost_usd_estimate is None for c in ok)
+                else "complete estimate"
+            ),
         }
 
     def save_ai_verification(self, project_id: str, verification: AIVerification) -> None:
@@ -1401,8 +1518,18 @@ class Repository:
     def save_analysis_plan(self, project_id: str, plan: AnalysisPlan) -> None:
         """Append a plan version. Approval must come from an active enrolled reviewer, and an
         approved plan must be consistent with the protocol's outcomes."""
-        self.get_project(project_id)
+        project = self.get_project(project_id)
         if plan.status == "approved":
+            if project.phase in (
+                Phase.STAGE6_MANUSCRIPT.value,
+                Phase.STAGE6_AUDIT.value,
+                Phase.COMPLETED.value,
+            ):
+                raise SysRevError(
+                    f"a new analysis plan cannot be approved in {project.phase}: it would "
+                    "invalidate the statistics output, and the pipeline has no route back to "
+                    "Stage 5 to re-run them (Session 8 safeguard)"
+                )
             reviewer = self.require_active_reviewer(plan.approved_reviewer_id)
             if plan.approved_by != reviewer.display_name:
                 raise SysRevError("approved_by does not match the enrolled reviewer")
@@ -2206,9 +2333,11 @@ class Repository:
         # ---- Stage 4: full-text eligibility and extraction
         ft = screening_status(retrieved, decisions, conflicts, ScreeningStage.FULL_TEXT)
         ft_included = ft.ids_with(ScreeningVerdict.INCLUDE)
+        invalid_arms = self.invalidated_arm_ids(project_id)
         arm_rows = self.session.execute(
             select(ExtractedArmORM.record_id, ExtractedArmORM.approved_by_human).where(
-                ExtractedArmORM.project_id == project_id
+                ExtractedArmORM.project_id == project_id,
+                ExtractedArmORM.id.notin_(invalid_arms),
             )
         ).all()
         arm_records = {rid for rid, _ in arm_rows}
@@ -2249,6 +2378,7 @@ class Repository:
             .join(ExtractedArmORM)
             .where(
                 ExtractedArmORM.project_id == project_id,
+                ExtractedArmORM.id.notin_(invalid_arms),
                 ExtractedValueORM.evidence_id.is_(None),
             )
         )
@@ -2286,6 +2416,8 @@ class Repository:
                     "removals other than duplicates cannot yet be verified against persisted "
                     "records"
                 )
+
+        from src.search.amendments import amendment_problems
 
         audit = self.latest_audit_report(project_id)
         audit_problems: tuple[str, ...] = ()
@@ -2332,6 +2464,7 @@ class Repository:
             manuscript_present=project.manuscript_version is not None,
             audit_passed=None if audit is None else audit.passed,
             audit_problems=audit_problems,
+            amendment_problems=tuple(amendment_problems(self, project_id)),
         )
 
     def _authenticated_approval(self, protocol: PICOProtocol) -> bool:

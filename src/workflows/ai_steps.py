@@ -28,7 +28,7 @@ from src.llm.credentials import CredentialResolver, redact
 from src.llm.provider import LLMConfig, LLMProvider, LLMResponseError, LLMRunHaltError
 from src.llm.tasks import AITask, ProjectAISettings, build_api_provider
 from src.llm.usage import AuditedProvider, BudgetGuard, RedundantCallError
-from src.pdf_extractor import parse_pdf
+from src.pdf_extractor.cache import DEFAULT_CACHE
 from src.pdf_extractor.models import ParsedDocument
 from src.screening.llm_screening import (
     DualScreeningRunner,
@@ -194,7 +194,10 @@ class AIWorkflow:
         if item.match_unconfirmed:
             raise WorkflowStepError(f"the PDF of {record_id} has an unconfirmed identity")
         data = self.store.read_verified(item.pdf_filename, item.pdf_sha256)
-        return parse_pdf(data, filename=item.pdf_filename, expected_sha256=item.pdf_sha256)
+        # parsed once per (content hash, filename, parser version); bytes verified every time
+        return DEFAULT_CACHE.parse(
+            data, filename=item.pdf_filename, expected_sha256=item.pdf_sha256
+        )
 
     def _screeners(self, budget: BudgetGuard) -> list[LLMScreener]:
         from src.core.enums import ReviewerRole

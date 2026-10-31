@@ -30,6 +30,7 @@ from src.core.schemas.protocol import ALLOWED_MEASURES
 from src.llm.credentials import BILLING_NOTE, ENV_VARS, CredentialResolver, install_log_redaction
 from src.llm.tasks import TASK_LABELS, AITask, ProjectAISettings, TaskModelSettings
 from src.search.databases import DATABASES
+from src.ui import operations_pages as op
 from src.ui import protocol_form as pf
 from src.ui import reporting_pages as rp
 from src.ui.services import ApiResult, UIBackend
@@ -37,10 +38,11 @@ from src.ui.services import ApiResult, UIBackend
 PROVIDER_DEFAULT = "(provider default — not sent)"
 NOT_CONFIGURED = "— choose a model —"
 PAGES = (
-    "Projects", "Protocol", "Searches & import", "Pipeline status", "AI models & keys",
-    "Run AI steps", "Screening", "Full text & extraction", "Risk of bias", "Statistics",
-    "Manuscript", "PRISMA flow & checklists", "GRADE & Summary of Findings",
-    "Synthesis without MA & SWiM", "Usage & costs",
+    "Projects", "Protocol", "Protocol amendments", "Searches & import", "Pipeline status",
+    "AI models & keys", "Model catalogue (Refresh Models)", "Run AI steps", "Screening",
+    "Full text & extraction", "Corrections, links & double counting", "Risk of bias",
+    "Analysis plan", "Statistics", "Manuscript", "PRISMA flow & checklists",
+    "GRADE & Summary of Findings", "Synthesis without MA & SWiM", "Usage & costs",
 )  # fmt: skip
 
 
@@ -143,7 +145,8 @@ def page_protocol(be: UIBackend) -> None:
     if not editable:
         st.info(
             "The protocol can be edited only in Stage 1. After Gate 1 the approved version "
-            "is locked (amendments after Gate 1 are not supported yet)."
+            "is locked; changes go through the 'Protocol amendments' page (proposal, "
+            "authenticated approval, re-review of affected work)."
         )
     work = _work(pid, server)
 
@@ -802,20 +805,37 @@ def _task_editor(
         "Provider", providers, key=f"{task}_prov",
         index=providers.index(current.provider) if current else 0,
     )  # fmt: skip
-    models = be.catalogue.models(provider)
-    ids = [m.model_id for m in models]
+    catalogue = be.catalogue
+    models = catalogue.models(provider)
+    # Only executable entries are offered; a stored selection stays visible as stored (never
+    # silently replaced), with the reason it can no longer run.
+    ids = [m.model_id for m in models if not m.execution_problems()]
+    stored = current.model_id if current and current.provider == provider else None
+    if stored and stored not in ids:
+        ids.append(stored)
     if not ids:
-        st.warning(f"No {provider} models in the catalogue.")
+        st.warning(f"No executable {provider} models in the active catalogue.")
         return None
     options = [NOT_CONFIGURED, *ids]
     model_id = cols[1].selectbox(
         "Exact API model ID", options, key=f"{task}_model",
-        index=options.index(current.model_id) if current and current.model_id in ids else 0,
+        index=options.index(stored) if stored in ids else 0,
     )  # fmt: skip
     if model_id == NOT_CONFIGURED:
         st.caption("Not configured: this task cannot run until a model is chosen explicitly.")
         return None
-    cap = be.catalogue.get(provider, model_id)
+    try:
+        cap = catalogue.get(provider, model_id)
+    except Exception:
+        st.error(
+            f"The stored model {model_id!r} is not in the active catalogue; it cannot run "
+            "until it is verified and activated, or another model is chosen explicitly."
+        )
+        return current
+    for problem in cap.execution_problems():
+        st.error(problem)
+    for warning in cap.warnings():
+        st.warning(warning)
     efforts = [PROVIDER_DEFAULT, *cap.efforts]
     cur_effort = current.effort if current and current.effort in cap.efforts else None
     effort = cols[2].selectbox(
@@ -829,10 +849,19 @@ def _task_editor(
     if not cap.verified:
         st.warning(f"Unverified catalogue entry: {cap.source}")
     else:
-        st.caption(f"Catalogue source: {cap.source}")
+        st.caption(f"Capabilities: {cap.source} · prices: {cap.pricing_source or cap.source}")
+    caching = False
+    if provider == "anthropic":
+        caching = st.checkbox(
+            "Explicit prompt caching of the record-invariant prefix (opt-in; cache writes cost "
+            "1.25× input, reads less; savings are not assumed)",
+            value=bool(current and current.prompt_caching),
+            key=f"{task}_cache",
+        )
     return TaskModelSettings(
         provider=provider, model_id=model_id,
         effort=None if effort == PROVIDER_DEFAULT else effort, max_output_tokens=int(max_out),
+        prompt_caching=caching,
     )  # fmt: skip
 
 
@@ -886,6 +915,7 @@ def page_models(be: UIBackend) -> None:
             settings = ProjectAISettings(
                 tasks=tasks, warn_usd=warn_usd or None, stop_usd=stop_usd or None,
                 warn_tokens=int(warn_tok) or None, stop_tokens=int(stop_tok) or None,
+                catalogue_sha256=be.catalogue.sha256,
             )  # fmt: skip
             with be.repo() as repo:
                 version = repo.save_ai_settings(pid, settings)
@@ -914,6 +944,8 @@ def page_run(be: UIBackend) -> None:
             problems = wf.preflight(task)
             st.write(("✅ " if not problems else "⛔ ") + TASK_LABELS[task]
                      + (f" — {problems[0]}" if problems else ""))  # fmt: skip
+            for warning in wf.preflight_warnings(task):
+                st.caption(f"⚠ {warning}")
         if note := wf.screening_independence_note():
             st.warning(note)
         totals = repo.llm_usage_totals(pid)
@@ -1301,6 +1333,22 @@ def page_synthesis(be: UIBackend) -> None:
     rp.page_synthesis(be, require_project(), token(), show)
 
 
+def page_amendments(be: UIBackend) -> None:
+    op.page_amendments(be, require_project(), token(), show)
+
+
+def page_catalogue(be: UIBackend) -> None:
+    op.page_catalogue(be, require_project(), token(), show, credentials())
+
+
+def page_corrections(be: UIBackend) -> None:
+    op.page_corrections(be, require_project(), token(), show)
+
+
+def page_plan(be: UIBackend) -> None:
+    op.page_plan(be, require_project(), token(), show)
+
+
 def page_usage(be: UIBackend) -> None:
     pid = require_project()
     st.header("API usage and estimated costs")
@@ -1312,7 +1360,13 @@ def page_usage(be: UIBackend) -> None:
         return
     totals = usage.data["totals"]
     c = st.columns(4)
-    c[0].metric("Estimated cost (USD)", f"{totals['cost_usd_estimate']:.4f}")
+    status = str(totals.get("cost_status", ""))
+    cost = (
+        "unavailable" if status.startswith("unavailable")
+        else f"≥ {totals['cost_usd_estimate']:.4f}" if status.startswith("partial")
+        else f"{totals['cost_usd_estimate']:.4f}"
+    )  # fmt: skip
+    c[0].metric("Estimated cost (USD)", cost, help=status)
     c[1].metric("Tokens", totals["tokens"])
     c[2].metric("Calls", totals["calls"])
     c[3].metric("Failed calls", totals["failed_calls"])
@@ -1323,8 +1377,12 @@ def page_usage(be: UIBackend) -> None:
         {k: call.get(k) for k in ("created_at", "task", "provider", "requested_model",
                                   "served_model", "effort_requested", "effort_effective",
                                   "status", "input_tokens", "output_tokens", "reasoning_tokens",
-                                  "cache_read_tokens", "cost_usd_estimate", "attempts",
-                                  "error_message")}
+                                  "cache_read_tokens", "cache_write_tokens",
+                                  "cost_usd_estimate", "attempts", "error_message")}
+        | {"cost": "unavailable" if call.get("cost_usd_estimate") is None
+           else call["cost_usd_estimate"],
+           "catalogue": str((call.get("settings") or {}).get("catalogue_sha256", ""))[:12],
+           "prompt caching": (call.get("settings") or {}).get("prompt_caching")}
         for call in usage.data["calls"]
     ])  # fmt: skip
 
@@ -1349,6 +1407,8 @@ def main() -> None:
         "Risk of bias": page_rob, "Statistics": page_stats, "Manuscript": page_manuscript,
         "PRISMA flow & checklists": page_prisma, "GRADE & Summary of Findings": page_grade,
         "Synthesis without MA & SWiM": page_synthesis, "Usage & costs": page_usage,
+        "Protocol amendments": page_amendments, "Model catalogue (Refresh Models)": page_catalogue,
+        "Corrections, links & double counting": page_corrections, "Analysis plan": page_plan,
     }  # fmt: skip
     handlers[str(page)](be)
 

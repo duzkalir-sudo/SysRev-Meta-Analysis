@@ -15,7 +15,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Request, Response, s
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.api_server.app import ReviewerDep, SessionDep  # app.py imports this module lazily
-from src.core.enums import ScreeningStage, ScreeningVerdict
+from src.core.enums import ReviewStatus, ScreeningStage, ScreeningVerdict
 from src.core.exceptions import SysRevError
 from src.core.schemas.base import utc_now
 from src.core.schemas.stats import AnalysisPlan, AnalysisSpec
@@ -25,13 +25,18 @@ from src.extraction import (
     approve_rob,
     build_arms,
     correct_item,
+    double_counting_state_sha256,
     export_csv,
     export_json,
     export_rows,
+    item_state_sha256,
     link_reports_to_study,
+    links_state_sha256,
     record_unavailability,
     reject_item,
     resolve_double_counting,
+    revise_reviewed_item,
+    unlink_reports,
 )
 from src.fulltext import (
     DocumentStore,
@@ -45,10 +50,11 @@ from src.fulltext import (
     register_upload,
     report_flow,
 )
-from src.pdf_extractor import parse_pdf
+from src.pdf_extractor.cache import DEFAULT_CACHE
 from src.screening.llm_screening import adjudicate, agreement_summary
 from src.screening.reporting import methods_statement, screening_reporting_facts
 from src.state.repository import NotFoundError, Repository
+from src.stats_engine import plan_service
 
 T = TypeVar("T")
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -81,6 +87,9 @@ class CorrectionBody(_Body):
     correction: ProposedValue
     note: str = Field(min_length=1)
     attest_unverifiable: bool = False
+    # Session 8: hash of the item as displayed (``state_sha256`` of GET /extraction/items).
+    # Required to correct an already reviewed value; optional for pending items (legacy).
+    expected_state_sha256: str | None = None
 
 
 class StudyLinkBody(_Body):
@@ -88,6 +97,24 @@ class StudyLinkBody(_Body):
     study_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
     primary_record_id: str
     note: str = Field(min_length=1)
+    expected_state_sha256: str | None = None  # GET /studies ``state_sha256`` (Session 8)
+
+
+class UnlinkBody(_Body):
+    record_ids: list[str] = Field(min_length=1)
+    note: str = Field(min_length=1)
+    expected_state_sha256: str = Field(min_length=64, max_length=64)
+
+
+class PlanDraftBody(_Body):
+    analyses: list[AnalysisSpec] = Field(min_length=1)
+    rationale: str | None = None
+    expected_latest_sha256: str | None  # explicit null only when no plan exists yet
+
+
+class PlanApprovalBody(_Body):
+    expected_sha256: str = Field(min_length=64, max_length=64)
+    expected_latest_sha256: str = Field(min_length=64, max_length=64)
 
 
 class UnavailabilityBody(_Body):
@@ -104,6 +131,7 @@ class DoubleCountingBody(_Body):
     keep_record_id: str | None = None
     drop_record_ids: list[str] = Field(default_factory=list)
     non_overlapping_record_ids: list[str] = Field(default_factory=list)
+    expected_state_sha256: str | None = None  # GET /extraction/double-counting/state
 
 
 class RoBApprovalBody(_Body):
@@ -135,7 +163,9 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         if item is None or item.pdf_filename is None or item.pdf_sha256 is None:
             raise NotFoundError(f"record {record_id} has no linked PDF")
         data = store.read_verified(item.pdf_filename, item.pdf_sha256)
-        return parse_pdf(data, filename=item.pdf_filename, expected_sha256=item.pdf_sha256)
+        return DEFAULT_CACHE.parse(
+            data, filename=item.pdf_filename, expected_sha256=item.pdf_sha256
+        )
 
     # ------------------------------------------------------------------ screening
     @router.get("/screening/{stage}/summary")
@@ -258,7 +288,7 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         rows = Repository(session).load_extraction_items(
             project_id, include_superseded=include_superseded
         )
-        return [i.model_dump(mode="json") for i in rows]
+        return [i.model_dump(mode="json") | {"state_sha256": item_state_sha256(i)} for i in rows]
 
     @router.get("/extraction/items/{item_id}/history")
     def history(project_id: str, item_id: str, session: SessionDep) -> list[dict[str, Any]]:
@@ -289,12 +319,29 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         def run() -> Any:
             old = repo.get_extraction_item(project_id, item_id)
             doc = doc_for(repo, project_id, old.record_id)
-            return correct_item(
+            if old.review_status == ReviewStatus.PENDING:
+                return correct_item(
+                    repo, project_id, item_id, body.correction, doc, reviewer=reviewer,
+                    note=body.note, attest_unverifiable=body.attest_unverifiable,
+                    expected_state_sha256=body.expected_state_sha256,
+                )  # fmt: skip
+            if body.expected_state_sha256 is None:
+                raise ValueError(
+                    "correcting a reviewed value requires expected_state_sha256 (the state "
+                    "of the item as displayed)"
+                )
+            new, invalidated = revise_reviewed_item(
                 repo, project_id, item_id, body.correction, doc, reviewer=reviewer,
                 note=body.note, attest_unverifiable=body.attest_unverifiable,
+                expected_state_sha256=body.expected_state_sha256,
             )  # fmt: skip
+            return new, invalidated
 
-        return _call(run).model_dump(mode="json")  # type: ignore[no-any-return]
+        result = _call(run)
+        if isinstance(result, tuple):
+            item, invalidated = result
+            return item.model_dump(mode="json") | {"invalidated_arms": invalidated}  # type: ignore[no-any-return]
+        return result.model_dump(mode="json")  # type: ignore[no-any-return]
 
     @router.post("/extraction/records/{record_id}/arms", status_code=status.HTTP_201_CREATED)
     def arms(
@@ -325,13 +372,49 @@ def build_review_router(store: DocumentStore) -> APIRouter:
             lambda: link_reports_to_study(
                 repo, project_id, body.record_ids, study_id=body.study_id,
                 primary_record_id=body.primary_record_id, reviewer=reviewer, note=body.note,
+                expected_state_sha256=body.expected_state_sha256,
             )
         )  # fmt: skip
         return [x.model_dump(mode="json") for x in links]
 
+    @router.get("/studies")
+    def studies(project_id: str, session: SessionDep) -> dict[str, Any]:
+        """Report-to-study links, their append-only history and the state hash to send back."""
+        repo = Repository(session)
+        _call(lambda: repo.get_project(project_id))
+        included = sorted(repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT))
+        return {
+            "links": [x.model_dump(mode="json") for x in repo.load_study_links(project_id)],
+            "history": repo.governance_records(project_id, "study_link"),
+            "full_text_included": included,
+            "state_sha256": links_state_sha256(repo, project_id),
+        }
+
+    @router.post("/studies/unlink")
+    def unlink(project_id: str, body: UnlinkBody, session: SessionDep,
+               reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
+        repo = Repository(session)
+        _call(
+            lambda: unlink_reports(
+                repo, project_id, body.record_ids, reviewer=reviewer, note=body.note,
+                expected_state_sha256=body.expected_state_sha256,
+            )
+        )  # fmt: skip
+        return {"unlinked": body.record_ids, "state_sha256": links_state_sha256(repo, project_id)}
+
     @router.get("/extraction/double-counting")
     def double_counting(project_id: str, session: SessionDep) -> list[str]:
         return Repository(session).double_counting_conflicts(project_id)
+
+    @router.get("/extraction/double-counting/state")
+    def double_counting_state(project_id: str, session: SessionDep) -> dict[str, Any]:
+        repo = Repository(session)
+        _call(lambda: repo.get_project(project_id))
+        return {
+            "conflicts": repo.double_counting_conflicts(project_id),
+            "state_sha256": double_counting_state_sha256(repo, project_id),
+            "study_of": repo.study_ids(project_id),
+        }
 
     @router.post("/extraction/double-counting/resolve", status_code=status.HTTP_201_CREATED)
     def resolve_overlap(project_id: str, body: DoubleCountingBody, session: SessionDep,
@@ -343,6 +426,7 @@ def build_review_router(store: DocumentStore) -> APIRouter:
                 reviewer=reviewer, justification=body.justification,
                 keep_record_id=body.keep_record_id, drop_record_ids=body.drop_record_ids,
                 non_overlapping_record_ids=body.non_overlapping_record_ids,
+                expected_state_sha256=body.expected_state_sha256,
             )
         )  # fmt: skip
         return repo.double_counting_conflicts(project_id)
@@ -417,6 +501,46 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         )  # fmt: skip
         _call(lambda: repo.save_analysis_plan(project_id, plan))
         return plan.model_dump(mode="json")
+
+    @router.get("/stats/plans")
+    def get_plans(project_id: str, session: SessionDep) -> dict[str, Any]:
+        """Every stored plan version (drafts and approvals) and the hashes to send back."""
+        repo = Repository(session)
+        _call(lambda: repo.get_project(project_id))
+        return plan_service.plan_state(repo, project_id)
+
+    @router.post("/stats/plan/drafts", status_code=status.HTTP_201_CREATED)
+    def save_plan_draft(project_id: str, body: PlanDraftBody, session: SessionDep,
+                        reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
+        repo = Repository(session)
+        draft = _call(
+            lambda: plan_service.save_draft(
+                repo, project_id, body.analyses, rationale=body.rationale, reviewer=reviewer,
+                expected_latest_sha256=body.expected_latest_sha256,
+            )
+        )  # fmt: skip
+        return draft.model_dump(mode="json") | {
+            "sha256": draft.sha256(),
+            "problems": plan_service.plan_problems(repo, project_id, draft.analyses),
+        }
+
+    @router.post("/stats/plan/drafts/{plan_id}/approve", status_code=status.HTTP_201_CREATED)
+    def approve_plan_draft(
+        project_id: str,
+        plan_id: str,
+        body: PlanApprovalBody,
+        session: SessionDep,
+        reviewer: ReviewerDep,
+    ) -> dict[str, Any]:
+        repo = Repository(session)
+        plan = _call(
+            lambda: plan_service.approve_draft(
+                repo, project_id, plan_id, reviewer=reviewer,
+                expected_sha256=body.expected_sha256,
+                expected_latest_sha256=body.expected_latest_sha256,
+            )
+        )  # fmt: skip
+        return plan.model_dump(mode="json") | {"sha256": plan.sha256()}
 
     @router.get("/stats/plan")
     def get_plan(project_id: str, session: SessionDep) -> dict[str, Any]:
