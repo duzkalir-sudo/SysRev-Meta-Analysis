@@ -23,7 +23,7 @@ from src.core.schemas import (
     RiskOfBiasAssessment,
     parse_reported_number,
 )
-from src.core.schemas.audit import REQUIRED_SCOPES, CoverageItem
+from src.core.schemas.audit import CoverageItem, required_scopes
 from src.core.schemas.extraction import ROB2_DOMAINS, ROBINS_I_DOMAINS
 from tests.conftest import make_arm, make_evidence, make_value
 
@@ -293,7 +293,7 @@ def test_audit_report_passed_is_derived() -> None:
         update={
             "manuscript_sha256": "e" * 64,
             "evidence_fingerprint": {"stats_output_sha256": "c" * 64},
-            "scopes_checked": dict.fromkeys(REQUIRED_SCOPES, 1),
+            "scopes_checked": dict.fromkeys(required_scopes(None), 1),
             "coverage": [
                 CoverageItem(
                     key="k", description="d", required_in=["results"], status=CheckStatus.VERIFIED
@@ -303,7 +303,7 @@ def test_audit_report_passed_is_derived() -> None:
     )
     assert complete.complete and complete.passed
     one_scope_short = complete.model_copy(
-        update={"scopes_checked": dict.fromkeys(sorted(REQUIRED_SCOPES)[1:], 1)}
+        update={"scopes_checked": dict.fromkeys(sorted(required_scopes(None))[1:], 1)}
     )
     assert not one_scope_short.complete and not one_scope_short.passed
     missing = complete.model_copy(

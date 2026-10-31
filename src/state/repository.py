@@ -1890,18 +1890,38 @@ class Repository:
             raise SysRevError("the recorded name does not match the enrolled reviewer")
 
     def save_checklist_decision(self, decision: ChecklistDecision) -> None:
-        """A reviewer's decision on one checklist item, re-verified against the latest
-        manuscript version and the current evidence (basis hash recomputed)."""
+        self.save_checklist_decisions([decision])
+
+    def save_checklist_decisions(self, decisions: list[ChecklistDecision]) -> None:
+        """Reviewer decisions on checklist items, each re-verified against the latest
+        manuscript version and the current evidence (basis hash recomputed). All or none are
+        stored; a batch is verified against one evidence state."""
+        from src.manuscript.evidence import build_evidence_package
         from src.reporting.service import checklist_decision_problems
 
-        self._require_reporting_phase(decision.project_id)
-        self._require_named_reviewer(decision.reviewer_id, decision.reviewer_name)
-        problems = checklist_decision_problems(self, decision)
+        if not decisions:
+            return
+        pid = decisions[0].project_id
+        if any(d.project_id != pid for d in decisions):
+            raise SysRevError("a batch of checklist decisions belongs to one project")
+        self._require_reporting_phase(pid)
+        for d in decisions:
+            self._require_named_reviewer(d.reviewer_id, d.reviewer_name)
+        try:
+            package = build_evidence_package(self, pid)
+        except SysRevError as exc:
+            raise SysRevError(f"checklist decision refused: evidence unavailable: {exc}") from exc
+        problems = [
+            f"{d.checklist} {d.item_id}: {p}"
+            for d in decisions
+            for p in checklist_decision_problems(self, d, package)
+        ]
         if problems:
             raise SysRevError("checklist decision refused: " + "; ".join(problems))
-        self._add_reporting(decision.project_id, "checklist_decision", decision.decision_id,
-                            f"{decision.checklist}:{decision.item_id}", decision.reviewer_id,
-                            decision.model_dump(mode="json"))  # fmt: skip
+        for d in decisions:
+            self._add_reporting(pid, "checklist_decision", d.decision_id,
+                                f"{d.checklist}:{d.item_id}", d.reviewer_id,
+                                d.model_dump(mode="json"))  # fmt: skip
 
     def load_checklist_decisions(self, project_id: str) -> list[ChecklistDecision]:
         return [ChecklistDecision.model_validate(p)

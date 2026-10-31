@@ -266,7 +266,8 @@ def grade_inputs(
     rob = gr.latest_approved_rob(approved_rob, rids)
     outcome = next((o for o in protocol.outcomes if o.outcome_id == a.outcome_id), None)
     study_of = repo.study_ids(project_id, set(rids))
-    return gr.inputs_sha256(a, outcome, protocol.review_design.value, rob, study_of), rob
+    approved = [x for x in approved_rob if x.approved_by_human]
+    return gr.inputs_sha256(a, outcome, protocol.review_design.value, approved, study_of), rob
 
 
 def synthesis_entries(

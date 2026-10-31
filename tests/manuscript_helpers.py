@@ -315,11 +315,55 @@ def fill_author_input(source: str, replacement: str = "Synthetic author-written 
     return re.sub(r"\[\[AUTHOR INPUT:[^\]]*\]\]", replacement, source)
 
 
+def confirm_checklists(
+    repo: Repository,
+    pid: str,
+    rid: str,
+    checklists: tuple[str, ...] = (
+        "prisma_2020_main",
+        "prisma_2020_abstract",
+    ),
+) -> None:
+    """SYNTHETIC reviewer decisions on every checklist item of the latest version: an item with
+    a candidate location is recorded as reported there; any other as not applicable. (A real
+    reviewer reads each item; tests need a complete, current record.)"""
+    from src.reporting.service import ReportingService
+
+    rs = ReportingService(repo, pid)
+    name = repo.require_active_reviewer(rid).display_name
+    rows = []
+    for checklist in checklists:
+        for row in rs.checklist(checklist)["items"]:
+            if row["decided"]:
+                continue
+            if row["candidates"]:
+                section = row["candidates"][0].split(":", 1)[0]
+                status, sections, loc = "reported", [section], row["candidates"][0]
+            else:
+                status, sections, loc = "not_applicable", [], ""
+            rows.append(
+                {
+                    "checklist": checklist,
+                    "item_id": row["item_id"],
+                    "status": status,
+                    "section_ids": sections,
+                    "location": loc,
+                    "justification": "synthetic test decision",
+                }
+            )
+    if rows:
+        rs.decide_items(rows, reviewer_id=rid, reviewer_name=name)
+
+
 def complete_manuscript(svc: ManuscriptService, actor: Actor, **extra: str) -> Any:
-    """A template draft with every author-input marker filled (no other change)."""
+    """A template draft with every author-input marker filled (no other change), with every
+    PRISMA 2020 checklist item decided (synthetically) for that version."""
     latest = svc.repo.latest_manuscript_version(svc.project_id)
     if latest is None:
         latest = svc.create_template_draft(SYSTEM)
     changes = {s.section_id: fill_author_input(s.source) for s in latest.sections}
     changes.update(extra)
-    return svc.edit(actor, changes, "author input added")
+    version = svc.edit(actor, changes, "author input added")
+    assert actor.reviewer_id is not None
+    confirm_checklists(svc.repo, svc.project_id, actor.reviewer_id)
+    return version

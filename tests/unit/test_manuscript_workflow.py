@@ -372,7 +372,8 @@ def test_exports(session: Session) -> None:
     document = docx.Document(io.BytesIO(manuscript_docx(version)))
     text = "\n".join(p.text for p in document.paragraphs)
     assert "References" in text and "5.9% (95% CI" in text
-    assert len(document.tables) == 2
+    # Table 1 characteristics, Table 2 analyses, Table 3 single-group evidence summary
+    assert len(document.tables) == 3
     cells = [c.text for row in document.tables[1].rows for c in row.cells]
     assert "5.9% (95% CI 3.3% to 10.3%)" in cells  # identical to the stats-derived value
     report = svc.audit()

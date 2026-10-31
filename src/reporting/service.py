@@ -46,7 +46,9 @@ def _package(repo: Repository, project_id: str) -> Any:
 # --------------------------------------------------------------------------- verification
 
 
-def checklist_decision_problems(repo: Repository, d: ChecklistDecision) -> list[str]:
+def checklist_decision_problems(
+    repo: Repository, d: ChecklistDecision, package: Any = None
+) -> list[str]:
     try:
         it = item(d.checklist, d.item_id)
     except KeyError as exc:
@@ -64,10 +66,11 @@ def checklist_decision_problems(repo: Repository, d: ChecklistDecision) -> list[
         sec = version.section(sid)
         if sec is None or not sec.source.strip():
             problems.append(f"section {sid} does not exist or is empty in the manuscript")
-    try:
-        package = _package(repo, d.project_id)
-    except SysRevError as exc:
-        return [*problems, f"evidence package unavailable: {exc}"]
+    if package is None:
+        try:
+            package = _package(repo, d.project_id)
+        except SysRevError as exc:
+            return [*problems, f"evidence package unavailable: {exc}"]
     if d.evidence_sha256 != fingerprint_sha256(package.fingerprint):
         problems.append("the decision does not name the current evidence state")
     for k in d.evidence_keys:
@@ -266,31 +269,52 @@ class ReportingService:
         reviewer_id: str,
         reviewer_name: str,
     ) -> ChecklistDecision:
+        row = {
+            "checklist": checklist,
+            "item_id": item_id,
+            "status": status,
+            "section_ids": section_ids,
+            "location": location,
+            "justification": justification,
+            "evidence_keys": evidence_keys,
+        }
+        return self.decide_items([row], reviewer_id=reviewer_id, reviewer_name=reviewer_name)[0]
+
+    def decide_items(
+        self, rows: list[dict[str, Any]], *, reviewer_id: str, reviewer_name: str
+    ) -> list[ChecklistDecision]:
+        """Several item decisions by one reviewer, made on the same manuscript version and
+        evidence state (each still states its own status, location and justification)."""
         package = self.package()
         version = self._version()
-        it = item(checklist, item_id)
-        decision = ChecklistDecision.model_validate(
-            {
-                "project_id": self.project_id,
-                "checklist": checklist,
-                "item_id": item_id,
-                "status": status,
-                "section_ids": section_ids,
-                "location": location,
-                "justification": justification,
-                "evidence_keys": evidence_keys,
-                "manuscript_version": version.version,
-                "manuscript_sha256": version.content_sha256,
-                "evidence_sha256": fingerprint_sha256(package.fingerprint),
-                "basis_sha256": cl.decision_basis(
-                    it, version, section_ids, package.fingerprint, status
-                ),
-                "reviewer_id": reviewer_id,
-                "reviewer_name": reviewer_name,
-            }
-        )
-        self.repo.save_checklist_decision(decision)
-        return decision
+        decisions = []
+        for row in rows:
+            it = item(row["checklist"], row["item_id"])
+            sections = list(row.get("section_ids") or [])
+            decisions.append(
+                ChecklistDecision.model_validate(
+                    {
+                        "project_id": self.project_id,
+                        "checklist": row["checklist"],
+                        "item_id": row["item_id"],
+                        "status": row["status"],
+                        "section_ids": sections,
+                        "location": row.get("location") or "",
+                        "justification": row["justification"],
+                        "evidence_keys": list(row.get("evidence_keys") or []),
+                        "manuscript_version": version.version,
+                        "manuscript_sha256": version.content_sha256,
+                        "evidence_sha256": fingerprint_sha256(package.fingerprint),
+                        "basis_sha256": cl.decision_basis(
+                            it, version, sections, package.fingerprint, row["status"]
+                        ),
+                        "reviewer_id": reviewer_id,
+                        "reviewer_name": reviewer_name,
+                    }
+                )
+            )
+        self.repo.save_checklist_decisions(decisions)
+        return decisions
 
     # ---- GRADE and Summary of Findings
     def grade(self) -> list[dict[str, Any]]:

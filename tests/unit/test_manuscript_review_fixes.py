@@ -35,7 +35,13 @@ from src.manuscript.formatting import DisplayNumber, find_numbers, mask_identifi
 from src.manuscript.service import ManuscriptService, completion_problems
 from src.search.prisma_sync import derive_prisma
 from src.state.repository import Repository
-from tests.manuscript_helpers import REVIEWER, complete_manuscript, human, single_arm_project
+from tests.manuscript_helpers import (
+    REVIEWER,
+    complete_manuscript,
+    confirm_checklists,
+    human,
+    single_arm_project,
+)
 from tests.stats_helpers import LAST_FU, MONTHS_24, stats_arm
 from tests.unit.test_manuscript_audit import Ctx, _ctx, blocking, findings
 
@@ -264,6 +270,7 @@ def test_inconsistent_prisma_snapshot_blocks(ms: Ctx) -> None:
     assert wrong.invariant_violations() == []
     ms.repo.save_prisma(ms.pid, wrong)
     ms.svc.rerender(ms.actor)
+    confirm_checklists(ms.svc.repo, ms.svc.project_id, ms.rid)
     r = ms.svc.audit()
     problems = findings(r, CheckStatus.MISMATCH, "provenance")
     assert any("identified_by_database" in m for m in problems)
@@ -301,6 +308,7 @@ def test_reference_without_identifiers_can_be_attested(session: Session) -> None
         reviewer_name=REVIEWER,
     )
     svc.rerender(human(svc.repo, rid))
+    confirm_checklists(svc.repo, svc.project_id, rid)
     second = svc.audit()
     assert second.passed, blocking(second)
     assert any("attested by" in m for m in findings(second, CheckStatus.VERIFIED, "citations"))
@@ -356,6 +364,7 @@ def test_attested_mismatch_blocks(session: Session) -> None:
         reviewer_name=REVIEWER,
     )
     svc.rerender(human(svc.repo, rid))
+    confirm_checklists(svc.repo, svc.project_id, rid)
     r = svc.audit()
     assert findings(r, CheckStatus.MISMATCH, "citations") and not r.passed
 
@@ -433,6 +442,7 @@ def test_intermediate_study_count_blocks_the_audit(session: Session) -> None:
     )
     repo.save_prisma("ms1", derive_prisma(repo, "ms1"))
     svc.rerender(human(repo, rid))
+    confirm_checklists(svc.repo, svc.project_id, rid)
     assert svc.audit().passed
 
 
@@ -449,6 +459,7 @@ def _attested(session: Session) -> tuple[ManuscriptService, str]:
         reviewer_name=REVIEWER,
     )
     svc.rerender(human(svc.repo, rid))
+    confirm_checklists(svc.repo, svc.project_id, rid)
     return svc, rid
 
 
@@ -508,6 +519,7 @@ def test_replaced_pdf_invalidates_attestation_audit_and_approval(session: Sessio
     problems = completion_problems(svc.repo, "ms1")
     assert any("evidence changed" in p and "references_sha256" in p for p in problems)
     svc.rerender(human(svc.repo, rid))
+    confirm_checklists(svc.repo, svc.project_id, rid)
     r = svc.audit()
     stale = findings(r, CheckStatus.NOT_CHECKED, "citations")
     assert any("no longer valid" in m and "attest again" in m for m in stale) and not r.passed
@@ -534,6 +546,7 @@ def test_replaced_pdf_invalidates_attestation_audit_and_approval(session: Sessio
         reviewer_name=REVIEWER,
     )
     svc.rerender(human(svc.repo, rid))
+    confirm_checklists(svc.repo, svc.project_id, rid)
     assert svc.audit().passed
 
 
@@ -545,6 +558,7 @@ def test_revoked_pdf_identity_invalidates_attestation(session: Session) -> None:
     svc.repo.save_fulltext_item("ms1", item.model_copy(update={"match_status": None}))
     assert any("evidence changed" in p for p in completion_problems(svc.repo, "ms1"))
     svc.rerender(human(svc.repo, rid))
+    confirm_checklists(svc.repo, svc.project_id, rid)
     r = svc.audit()
     assert any(
         "confirmed PDF is now none" in m for m in findings(r, CheckStatus.NOT_CHECKED, "citations")

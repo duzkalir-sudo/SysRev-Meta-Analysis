@@ -68,10 +68,11 @@ def contributing_records(a: AnalysisResult) -> list[str]:
 def latest_approved_rob(
     assessments: list[RiskOfBiasAssessment], record_ids: list[str]
 ) -> dict[str, RiskOfBiasAssessment]:
+    """The most recently approved assessment per report (approval time, then id)."""
     out: dict[str, RiskOfBiasAssessment] = {}
-    for x in assessments:  # chronological: later approvals replace earlier ones
-        if x.approved_by_human and x.record_id in record_ids:
-            out[x.record_id] = x
+    approved = [x for x in assessments if x.approved_by_human and x.record_id in record_ids]
+    for x in sorted(approved, key=lambda x: (x.approved_at, x.assessment_id)):
+        out[x.record_id] = x
     return out
 
 
@@ -79,7 +80,7 @@ def inputs_sha256(
     a: AnalysisResult,
     outcome: OutcomeDefinition | None,
     review_design: str,
-    rob: dict[str, RiskOfBiasAssessment],
+    rob: list[RiskOfBiasAssessment],
     study_of: dict[str, str],
 ) -> str:
     """Everything an assessment for analysis ``a`` depends on. Any change (the analysis
@@ -91,7 +92,11 @@ def inputs_sha256(
             "analysis": a.model_dump(mode="json"),
             "outcome": outcome.model_dump(mode="json") if outcome else None,
             "review_design": review_design,
-            "rob": {r: rob[r].model_dump(mode="json") for r in sorted(rob)},
+            # every approved assessment of a contributing report: any new approval counts
+            "rob": sorted(
+                (x.model_dump(mode="json") for x in rob if x.record_id in rids),
+                key=lambda d: (d["record_id"], d["assessment_id"]),
+            ),
             "study_links": {r: study_of.get(r, r) for r in rids},
         }
     )

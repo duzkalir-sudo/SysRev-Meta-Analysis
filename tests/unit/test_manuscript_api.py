@@ -68,6 +68,29 @@ def test_http_workflow_draft_audit_ack_sign_off(api: tuple[TestClient, dict[str,
     )
     assert r.status_code == 200 and r.json()["version"] == 2
     assert "@@" in client.get(f"{BASE}/diff", params={"a": 1, "b": 2}).json()["diff"]
+    # Session 7: every PRISMA 2020 item needs a current human decision (via the reporting API)
+    for checklist in ("prisma_2020_main", "prisma_2020_abstract"):
+        rows = client.get(f"/projects/ms1/reporting/checklists/{checklist}").json()["items"]
+        decisions = [
+            {
+                "item_id": r["item_id"],
+                "status": "reported",
+                "section_ids": [r["candidates"][0].split(":")[0]],
+                "location": r["candidates"][0],
+                "justification": "synthetic test decision",
+            }
+            if r["candidates"]
+            else {
+                "item_id": r["item_id"],
+                "status": "not_applicable",
+                "justification": "synthetic test decision",
+            }
+            for r in rows
+        ]
+        url = f"/projects/ms1/reporting/checklists/{checklist}/items"
+        assert client.post(url, json={"decisions": decisions}).status_code == 401
+        ok = client.post(url, json={"decisions": decisions}, headers=auth)
+        assert ok.status_code == 200, ok.text
     audit = client.post(f"{BASE}/audit", headers=auth).json()
     assert audit["passed"] and audit["requires_human_review"] >= 2
     reviews = [f["finding_id"] for f in audit["findings"] if f["status"] == "requires_human_review"]
