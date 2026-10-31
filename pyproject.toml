@@ -35,6 +35,7 @@ ui = [
 orchestration = ["langgraph>=0.2"]
 manuscript = [
     "python-docx>=1.1",  # editable Word export of Stage 6 manuscripts (src.manuscript.export)
+    "openpyxl>=3.1",  # editable XLSX export of reporting checklists (src.reporting.export)
 ]
 dev = [
     "pytest>=8.2",
@@ -87,7 +88,7 @@ packages = ["src"]
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["rapidfuzz.*", "scipy.*", "docx.*", "docx"]
+module = ["rapidfuzz.*", "scipy.*", "docx.*", "docx", "openpyxl", "openpyxl.*"]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]

@@ -71,10 +71,17 @@ class ApiClient:
         resp = self._client.request(
             method, path, json=json, content=content, headers=hdrs, params=params
         )
-        try:
-            data: Any = resp.json()
-        except ValueError:
+        ctype = resp.headers.get("content-type", "")
+        data: Any
+        if "json" in ctype or not ctype:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = resp.text
+        elif ctype.startswith("text/") or "svg" in ctype:
             data = resp.text
+        else:  # binary exports (PNG, DOCX, XLSX) are returned unchanged
+            data = resp.content
         if resp.status_code >= 400:
             detail = data.get("detail", data) if isinstance(data, dict) else data
             return ApiResult(False, resp.status_code, data, redact(str(detail))[:2000])

@@ -240,7 +240,9 @@ def single_arm_project(
     return repo, rid, token
 
 
-def comparative_project(session: Session, pid: str = "mc1") -> tuple[Repository, str, str]:
+def comparative_project(
+    session: Session, pid: str = "mc1", *, study_links: list[list[str]] | None = None
+) -> tuple[Repository, str, str]:
     repo = Repository(session)
     repo.create_project(pid, "Synthetic comparative review")
     rid, token = repo.enroll_reviewer(REVIEWER)
@@ -277,6 +279,16 @@ def comparative_project(session: Session, pid: str = "mc1") -> tuple[Repository,
         )
     for rec in records:
         repo.save_rob(pid, approved_rob(rec.record_id, rid, name=REVIEWER))
+    for group in study_links or []:  # documented before Stage 5 (the links are an input)
+        link_reports_to_study(
+            repo,
+            pid,
+            group,
+            study_id=f"study-{group[0]}",
+            primary_record_id=group[0],
+            reviewer=repo.require_active_reviewer(rid),
+            note="synthetic: reports of one study",
+        )
     repo.save_prisma(pid, derive_prisma(repo, pid))
     _to_stage6(
         repo,
@@ -315,11 +327,118 @@ def fill_author_input(source: str, replacement: str = "Synthetic author-written 
     return re.sub(r"\[\[AUTHOR INPUT:[^\]]*\]\]", replacement, source)
 
 
+def confirm_checklists(
+    repo: Repository,
+    pid: str,
+    rid: str,
+    checklists: tuple[str, ...] = (
+        "prisma_2020_main",
+        "prisma_2020_abstract",
+    ),
+) -> None:
+    """SYNTHETIC reviewer decisions on every checklist item of the latest version: an item with
+    a candidate location is recorded as reported there; any other as not applicable. (A real
+    reviewer reads each item; tests need a complete, current record.)"""
+    from src.reporting.service import ReportingService
+
+    rs = ReportingService(repo, pid)
+    name = repo.require_active_reviewer(rid).display_name
+    for checklist in checklists:
+        screen = rs.checklist(checklist)  # decisions are made on this displayed state
+        rows = []
+        for row in screen["items"]:
+            if row["decided"]:
+                continue
+            if row["candidates"]:
+                section = row["candidates"][0].split(":", 1)[0]
+                status, sections, loc = "reported", [section], row["candidates"][0]
+            else:
+                status, sections, loc = "not_applicable", [], ""
+            rows.append(
+                {
+                    "checklist": checklist,
+                    "item_id": row["item_id"],
+                    "status": status,
+                    "section_ids": sections,
+                    "location": loc,
+                    "justification": "synthetic test decision",
+                    "based_on_decision_id": (row["decision"] or {}).get("decision_id"),
+                }
+            )
+        if rows:
+            rs.decide_items(rows, seen=seen(screen), reviewer_id=rid, reviewer_name=name)
+
+
+def seen(screen: dict[str, Any]) -> dict[str, Any]:
+    """The state identifiers a checklist screen displayed (sent back with a decision)."""
+    return {k: screen[k] for k in ("manuscript_version", "manuscript_sha256", "evidence_sha256")}
+
+
+def decide_item(rs: Any, checklist: str, item_id: str, rid: str, **kw: Any) -> Any:
+    """Read the checklist screen, then decide one item on that displayed state."""
+    screen = rs.checklist(checklist)
+    row = next(r for r in screen["items"] if r["item_id"] == item_id)
+    kw.setdefault("evidence_keys", [])
+    kw.setdefault("section_ids", [])
+    kw.setdefault("location", "")
+    return rs.decide_item(
+        checklist,
+        item_id,
+        **kw,
+        seen=seen(screen),
+        based_on_decision_id=(row["decision"] or {}).get("decision_id"),
+        reviewer_id=rid,
+        reviewer_name=rs.repo.require_active_reviewer(rid).display_name,
+    )
+
+
+def save_grade(rs: Any, analysis_id: str, body: dict[str, Any], rid: str) -> Any:
+    """Read the GRADE screen, then save on the displayed inputs and record."""
+    row = next(r for r in rs.grade() if r["analysis_id"] == analysis_id)
+    shown = {
+        "inputs_sha256": row["inputs_sha256"],
+        "based_on_assessment_id": row["based_on_assessment_id"],
+    }
+    return rs.save_grade(
+        analysis_id,
+        shown | body,
+        reviewer_id=rid,
+        reviewer_name=rs.repo.require_active_reviewer(rid).display_name,
+    )
+
+
+def save_group(rs: Any, body: dict[str, Any], rid: str) -> Any:
+    """Preview the group (the evidence a reviewer sees), then save on that state."""
+    preview = rs.preview_group(body)
+    shown = {k: preview[k] for k in ("inputs_sha256", "based_on_revision_id")}
+    return rs.save_group(
+        shown | body,
+        reviewer_id=rid,
+        reviewer_name=rs.repo.require_active_reviewer(rid).display_name,
+    )
+
+
+def decide_swim(rs: Any, applicability: str, rationale: str, rid: str) -> Any:
+    screen = rs.swim()
+    return rs.decide_swim(
+        applicability,
+        rationale,
+        synthesis_sha256=screen["synthesis_sha256"],
+        based_on_decision_id=screen["based_on_decision_id"],
+        reviewer_id=rid,
+        reviewer_name=rs.repo.require_active_reviewer(rid).display_name,
+    )
+
+
 def complete_manuscript(svc: ManuscriptService, actor: Actor, **extra: str) -> Any:
-    """A template draft with every author-input marker filled (no other change)."""
+    """A template draft with every author-input marker filled (no other change), with every
+    PRISMA 2020 checklist item decided (synthetically) for that version."""
     latest = svc.repo.latest_manuscript_version(svc.project_id)
     if latest is None:
         latest = svc.create_template_draft(SYSTEM)
     changes = {s.section_id: fill_author_input(s.source) for s in latest.sections}
     changes.update(extra)
-    return svc.edit(actor, changes, "author input added")
+    version = svc.edit(actor, changes, "author input added")
+    assert actor.reviewer_id is not None
+    confirm_checklists(svc.repo, svc.project_id, actor.reviewer_id)
+    return version

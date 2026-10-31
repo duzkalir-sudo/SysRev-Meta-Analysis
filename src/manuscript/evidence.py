@@ -56,6 +56,7 @@ from src.manuscript.formatting import (
     fmt_p,
     numbers_in_text,
 )
+from src.reporting.state import ReportingState, add_reporting_outputs, build_reporting_state
 from src.search.databases import DATABASES
 from src.state.repository import Repository
 
@@ -222,6 +223,10 @@ class EvidencePackage:
     expected: list[ExpectedOutput]
     problems: list[str]
     fingerprint: dict[str, str] = field(default_factory=dict)
+    # Session 7: the stored PRISMA snapshot and the reporting state (flow diagram, GRADE,
+    # syntheses without meta-analysis, SWiM, checklist decisions)
+    prisma: PRISMACounts | None = None
+    reporting: ReportingState | None = None
 
     @property
     def fingerprint_sha256(self) -> str:
@@ -694,6 +699,29 @@ def build_evidence_package(repo: Repository, project_id: str) -> EvidencePackage
         b, repo, project_id, records, included_ref_keys, study_of, approved_rob
     )
 
+    # ---- Session 7 reporting: PRISMA flow diagram, GRADE / SoF, synthesis without MA, SWiM
+    reporting = build_reporting_state(
+        repo,
+        project_id,
+        protocol=protocol,
+        stats=stats,
+        prisma=prisma,
+        prisma_problems=problems,
+        searched_sources=frozenset(searched),
+        approved_rob=approved_rob,
+    )
+    add_reporting_outputs(
+        b,
+        reporting,
+        protocol=protocol,
+        stats=stats,
+        expected=expected,
+        templates=templates,
+        included_ref_keys=included_ref_keys,
+        study_of=study_of,
+        performed=performed,
+    )
+
     package = EvidencePackage(
         project_id=project_id,
         review_design=protocol.review_design,
@@ -711,6 +739,8 @@ def build_evidence_package(repo: Repository, project_id: str) -> EvidencePackage
         automated_screening=automated,
         expected=expected,
         problems=problems,
+        prisma=prisma,
+        reporting=reporting,
     )
     package.fingerprint = _fingerprint(
         repo, project_id, package, plan.sha256(), prisma, runs, approved_rob
@@ -1481,7 +1511,22 @@ def _fingerprint(
         "references_sha256": canonical_sha256(refs),
         "facts_sha256": canonical_sha256({k: f.sha256() for k, f in sorted(package.facts.items())}),
         "templates_sha256": _sha_text(json.dumps(package.templates, sort_keys=True)),
+        # Session 7
+        "reporting_sha256": package.reporting.content_sha256 if package.reporting else "",
+        "reporting_decisions_sha256": (
+            package.reporting.decisions_sha256 if package.reporting else ""
+        ),
     }
+
+
+# Fingerprint components that never change the rendered manuscript (reporting-checklist
+# decisions). A manuscript version is not made stale by them, but an audit or sign-off made
+# before they changed is (the audit records the full fingerprint).
+AUDIT_ONLY_FINGERPRINT_KEYS = frozenset({"reporting_decisions_sha256"})
+
+
+def content_fingerprint(fingerprint: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in fingerprint.items() if k not in AUDIT_ONLY_FINGERPRINT_KEYS}
 
 
 def screening_is_automated(package: EvidencePackage) -> bool:
@@ -1493,6 +1538,7 @@ def comparative(package: EvidencePackage) -> bool:
 
 
 __all__ = [
+    "AUDIT_ONLY_FINGERPRINT_KEYS",
     "NEVER_PERFORMED",
     "EvidencePackage",
     "ExpectedOutput",

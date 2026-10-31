@@ -45,6 +45,7 @@ from src.core.schemas.manuscript import REQUIRED_SECTIONS, ManuscriptVersion, Re
 from src.manuscript.document import AUTHOR_INPUT_RE, Rendered, RenderedSection, Span, render
 from src.manuscript.drafting import ALLOWED_LITERALS, AUTHOR_YEAR_RE, MANUAL_CITATION_RE
 from src.manuscript.evidence import (
+    AUDIT_ONLY_FINGERPRINT_KEYS,
     EvidencePackage,
     Fact,
     screening_is_automated,
@@ -57,7 +58,7 @@ from src.manuscript.formatting import (
     parse_number,
 )
 
-AUDITOR_VERSION = "stage6-auditor-1.2.0"
+AUDITOR_VERSION = "stage6-auditor-1.3.0"
 ESTIMATE_ROLES = frozenset(
     {"pooled_estimate", "single_study_estimate", "study_estimate", "sensitivity_estimate"}
 )
@@ -380,6 +381,8 @@ def audit_manuscript(version: ManuscriptVersion, package: EvidencePackage) -> Au
         _labels(a, s)
         _methods(a, s)
         _claims(a, s)
+        _reporting_prose(a, s)
+    _reporting(a)
     a.tick("literal_numbers", 0)
     a.tick("semantic_labels", 0)
     a.tick("methods", 0)
@@ -426,6 +429,8 @@ def _provenance(a: _Audit) -> None:
             key="prisma" if problem.startswith("PRISMA") else None,
         )
     for name, current in sorted(p.fingerprint.items()):
+        if name in AUDIT_ONLY_FINGERPRINT_KEYS:
+            continue  # checklist decisions never change the rendered text (audited below)
         old = v.evidence_fingerprint.get(name)
         if old != current:
             a.find(
@@ -1348,6 +1353,113 @@ def _performed(p: EvidencePackage) -> set[str]:
             if "GLMM" in r.method:
                 done.add("glmm")
     return done
+
+
+# --------------------------------------------------------------------------- reporting
+
+COMPLIANCE_RE = re.compile(
+    r"\b(PRISMA|SWiM)[\w\s-]{0,12}?(compliant|compliance)\b|"
+    r"\b(complian\w*|accordance|conform\w*|adher\w*|consistent)\s+(with|to)\s+(the\s+)?"
+    r"(PRISMA|SWiM)\b|\b(according\s+to|following|followed|in\s+line\s+with)\s+(the\s+)?"
+    r"(PRISMA|SWiM)\b",
+    re.IGNORECASE,
+)
+CERTAINTY_RE = re.compile(
+    r"\b(very[- ]low|high|moderate|low)[- ](certainty|quality)\b|"
+    r"\bcertainty\b[^.;]{0,60}?\b(?:was|were|is|as|rated|judged|graded)\s+"
+    r"(?:rated\s+|judged\s+|graded\s+)?(?:as\s+)?(very[- ]low|high|moderate|low)\b",
+    re.IGNORECASE,
+)
+VOTE_SIGNIF_RE = re.compile(
+    r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|most|majority|half|none|all|few)"
+    r"\b[^.;]{0,40}\b(studies|trials|reports|series)\b[^.;]{0,60}\bsignifican",
+    re.IGNORECASE,
+)
+
+
+def _reporting(a: _Audit) -> None:
+    """Session 7: PRISMA flow diagram vs persisted counts; checklist decisions and their
+    currency; GRADE and Summary of Findings currency and recomputation; synthesis without
+    meta-analysis; SWiM applicability and checklist (``src.reporting.review``)."""
+    from src.reporting.review import reporting_checks
+
+    a.tick("reporting", 0)
+    for c in reporting_checks(a.version, a.package):
+        a.tick("reporting")
+        if c.status == CheckStatus.VERIFIED:
+            continue
+        a.find("reporting", c.status, c.location, c.message, c.action, key=c.key,
+               value=c.value)  # fmt: skip
+
+
+def _reporting_prose(a: _Audit, s: Sentence) -> None:
+    if s.section_id in ("tables", "figures"):
+        return
+    lit = s.literal
+    rs = a.package.reporting
+    m = COMPLIANCE_RE.search(lit)
+    if m and not _negated(lit) and rs is not None:
+        from src.reporting.review import checklist_complete
+
+        name = "swim" if "swim" in m.group(0).lower() else "prisma_2020_main"
+        done = checklist_complete(name, a.version, a.package) and (
+            name == "swim" or checklist_complete("prisma_2020_abstract", a.version, a.package)
+        )
+        a.find(
+            "reporting",
+            CheckStatus.REQUIRES_HUMAN_REVIEW if done else CheckStatus.UNSUPPORTED,
+            s.location,
+            (
+                "claims adherence to a reporting guideline; every checklist item has a current "
+                "human decision, but adherence is a judgement for the authors to confirm"
+            )
+            if done
+            else (
+                "claims adherence to a reporting guideline whose checklist is incomplete "
+                "(items without a current decision, stale or recorded as not reported)"
+            ),
+            "Confirm the claim, or describe the checklist instead (e.g. its location)."
+            if done
+            else "Remove the claim or complete the checklist.",
+            s.text,
+            key=name,
+        )
+    m = CERTAINTY_RE.search(lit)
+    if m and rs is not None and not _negated(lit):
+        level = next(g for g in m.groups()[::-1] if g and g.lower() not in
+                     ("certainty", "quality"))  # fmt: skip
+        level = level.lower().replace("-", " ").replace("very low", "very_low")
+        aid = _analysis_context(a, s)
+        approved = {k: e for k, e in rs.grade.items() if e.status == "approved"}
+        target = approved.get(aid) if aid else None
+        if not approved or (aid is not None and target is None):
+            a.find("reporting", CheckStatus.UNSUPPORTED, s.location,
+                   f"states a certainty of evidence ('{m.group(0)}') but no current, approved "
+                   "GRADE assessment exists for this outcome",
+                   "Remove the statement, or approve a GRADE assessment and bind "
+                   "{{grade.<analysis>.statement}}.", s.text, key="grade")  # fmt: skip
+        elif (
+            target is not None
+            and target.record is not None
+            and (target.record.final_certainty != level)
+        ):
+            a.find("reporting", CheckStatus.MISMATCH, s.location,
+                   f"states '{m.group(0)}' but the approved certainty for "
+                   f"{target.analysis.outcome_name} is "
+                   f"{str(target.record.final_certainty).replace('_', ' ')}",
+                   f"Bind {{{{grade.{aid}.statement}}}} instead of typing the rating.", s.text,
+                   key=f"grade.{aid}")  # fmt: skip
+        else:
+            a.find("reporting", CheckStatus.REQUIRES_HUMAN_REVIEW, s.location,
+                   "a typed certainty rating (not bound to an approved assessment marker)",
+                   "Bind the {{grade.<analysis>.statement}} marker, or confirm the wording.",
+                   s.text, key="grade")  # fmt: skip
+    if s.section_id != "methods" and VOTE_SIGNIF_RE.search(lit):
+        a.find("reporting", CheckStatus.UNSUPPORTED, s.location,
+               "counts studies by statistical significance (vote counting based on "
+               "significance is not an acceptable synthesis method)",
+               "Report the effect estimates, or the approved direction-of-effect tabulation.",
+               s.text, key="synthesis")  # fmt: skip
 
 
 # --------------------------------------------------------------------------- claims

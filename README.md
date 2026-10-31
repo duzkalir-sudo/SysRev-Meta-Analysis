@@ -30,8 +30,13 @@ derived PRISMA counts. Session 6 adds evidence-grounded manuscript drafting (det
 with optional model-written prose that may not type numbers or citations), a reference
 registry with live PubMed/Crossref verification, an independent completeness-aware
 Auditor, manuscript versioning, human acknowledgement of unresolved findings and a human
-sign-off before a project can be completed. **Not implemented yet:** GRADE and the "Refresh
-Models" catalogue update (issue #9).
+sign-off before a project can be completed. Session 7 adds deterministic PRISMA 2020 flow
+diagrams (SVG/PNG/JSON source), the PRISMA 2020 and PRISMA 2020 for Abstracts checklists
+with authenticated item-level decisions, human-supervised GRADE certainty assessments with
+Summary of Findings and single-group evidence-summary tables, structured synthesis without
+meta-analysis with SWiM reporting where a reviewer judges it applicable, and a new
+`reporting` scope of the Auditor. **Not implemented yet:** the "Refresh Models" catalogue
+update (issue #9).
 
 ## Quick start
 
@@ -324,3 +329,55 @@ the figure legends and submitted separately.
 * Included reports without DOI/PMID cannot be looked up; their identity is attested by a
   reviewer against the identity-confirmed PDF (*References → attestation*). Whether a background reference supports a sentence is
   checked only lexically against human-entered excerpts.
+
+## Session 7: PRISMA 2020, GRADE and synthesis without meta-analysis
+
+Three new pages in the UI (each decision needs the reviewer token, exactly like approvals):
+
+1. **PRISMA flow & checklists** — the PRISMA 2020 flow diagram for *new reviews with
+   searches of databases and registers*, generated from the stored PRISMA snapshot
+   (download SVG, PNG or the JSON source it is regenerated from). Inconsistent or non-final
+   snapshots are drawn with a visible red warning. Variants needing data the project does
+   not record (other methods; updated reviews) are refused with the list of unsupported
+   fields. Below it, the PRISMA 2020 (42 entries) and PRISMA 2020 for Abstracts (12)
+   checklists: the system only *suggests* candidate locations; you record for each item
+   *reported* (with section and precise location), *partially reported*, *missing* or
+   *not applicable* (with a justification). Exports: CSV, DOCX, XLSX.
+2. **GRADE & Summary of Findings** — per analysis: decision support (k, participants,
+   estimate and interval, I², risk-of-bias distribution; never pre-filled judgements), the
+   approaches that apply to the evidence, and a form for the five domains with rationales,
+   rating-up factors (non-randomised evidence only), final certainty, and optional assumed
+   comparator risks *with their source* for absolute effects. Single-group outcomes can be
+   rated only with the GRADE approach for overall prognosis and a documented rationale;
+   otherwise they stay *not assessed*. Preview and download the Summary of Findings
+   (Markdown/DOCX) with a source-key appendix.
+3. **Synthesis without MA & SWiM** — groups of studies synthesised without meta-analysis:
+   grouping and rationale, why not pooled, metric, method (structured tabulation or vote
+   counting on the *direction* of effect), source-linked study findings (approved arms /
+   accepted extraction items), directions with their basis, narrative and limitations. Once
+   a synthesis is approved, record whether SWiM applies; if it does, complete its checklist.
+
+The Stage 6 Auditor (version 1.3.0) checks all of this before sign-off: diagram counts
+against the persisted PRISMA facts, current human decisions for every checklist item,
+current GRADE records (recomputed absolute effects; certainty words typed in the text),
+current syntheses and the SWiM decision. Any relevant change to the manuscript sections or
+to the evidence makes the affected decisions stale; they are re-confirmed, never repaired.
+Each decision is tied to the screen you saw: if the manuscript, the evidence or the record
+changed after the page was loaded, the decision is refused and nothing is saved — reload,
+review and decide again. The pages keep the screen you loaded until you press "Reload the
+current state", so a submission always carries what you saw; a warning appears when the stored
+state has changed meanwhile. A synthesis is saved in two steps (preview the linked evidence,
+then save exactly what you previewed).
+
+### What is and is not validated (Session 7)
+
+* Checklist and SWiM item wording was reproduced from the primary publications (BMJ
+  2021;372:n71 and BMJ 2020;368:l6890, CC BY 4.0) retrieved from PubMed Central. The PRISMA
+  and Cochrane websites could not be reached from the build environment.
+* Tested on synthetic projects only. No real review, real literature or live API was used.
+* A complete checklist record means every item has a current human decision; the system
+  never claims that a review is PRISMA-compliant, and a typed compliance claim is routed to
+  human review (or blocked while the checklist is incomplete).
+* GRADE judgements are never computed from statistics. The tool enforces the structural
+  rules listed in ARCHITECTURE.md §9.9; it cannot judge whether a rationale is correct.
+

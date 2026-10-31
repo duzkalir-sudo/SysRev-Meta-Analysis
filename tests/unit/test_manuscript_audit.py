@@ -32,6 +32,7 @@ from tests.manuscript_helpers import (
     SYSTEM,
     comparative_project,
     complete_manuscript,
+    confirm_checklists,
     human,
     single_arm_project,
 )
@@ -357,6 +358,10 @@ def test_negated_methods_are_not_flagged(ms: Ctx) -> None:
         "Egger's test was not performed because too few studies were "
         "available, and no subgroup analyses were conducted.",
     )
+    # the edit made the checklist decisions located in the Methods stale: re-confirm them
+    assert any("stale" in m for m in findings(r, CheckStatus.MISSING, "reporting"))
+    confirm_checklists(ms.repo, ms.pid, ms.rid)
+    r = ms.svc.audit()
     assert not findings(r, CheckStatus.UNSUPPORTED, "methods") and r.passed, blocking(r)
 
 
@@ -478,6 +483,7 @@ def test_consistent_excerpt_still_needs_human_and_identity_check(ms: Ctx) -> Non
     # the evidence changed (verification recorded): the previous audit is stale
     assert any("evidence changed" in p for p in completion_problems(ms.repo, ms.pid))
     ms.svc.rerender(ms.actor)
+    confirm_checklists(ms.repo, ms.pid, ms.rid)  # the Introduction changed: re-confirm
     r2 = ms.svc.audit()
     assert r2.passed, blocking(r2)
     assert r2.requires_human_review >= 1
@@ -602,7 +608,9 @@ def test_acknowledgement_and_sign_off_rules(ms: Ctx) -> None:
             reviewer_id=ms.rid,
             reviewer_name=REVIEWER,
         )
-    ok = ms.edit("discussion", " The pooled estimate was {{stats.nec.study.s1}}.", "")
+    ms.edit("discussion", " The pooled estimate was {{stats.nec.study.s1}}.", "")
+    confirm_checklists(ms.repo, ms.pid, ms.rid)  # the Discussion changed: re-confirm
+    ok = ms.svc.audit()
     # the causal sentence plus every author-written sentence of the filled template
     assert ok.passed and ok.requires_human_review >= 2
     assert any(f.scope == "claims" and f.needs_human for f in ok.findings)

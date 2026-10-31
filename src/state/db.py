@@ -628,6 +628,23 @@ class ClaimReviewORM(Base):
     created_at: Mapped[datetime] = mapped_column(default=_now)
 
 
+class ReportingRecordORM(Base):
+    """Session 7 reporting records (append-only; the latest record per subject is current):
+    checklist decisions, GRADE assessments, synthesis groups and SWiM applicability."""
+
+    __tablename__ = "reporting_records"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    subject: Mapped[str] = mapped_column(String(128), index=True)
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("reviewers.id"), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
 APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     ProtocolEventORM,
     SearchRunORM,
@@ -650,6 +667,7 @@ APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     FindingAcknowledgementORM,
     ManuscriptApprovalORM,
     ClaimReviewORM,
+    ReportingRecordORM,
 )
 
 

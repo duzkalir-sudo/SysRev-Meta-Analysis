@@ -116,7 +116,8 @@ def _methods(p: EvidencePackage) -> str:
     return "\n\n".join(
         [
             "**Protocol and reporting.** The review followed a protocol approved before the "
-            "searches and is reported according to the PRISMA 2020 statement. " + reg,
+            "searches. The location of each PRISMA 2020 reporting item, with the reviewer's "
+            "decision on it, is given in the completed checklist (Supplementary File 3). " + reg,
             "**Eligibility criteria.** We included {{protocol.designs}} studies of "
             "{{protocol.population}} receiving {{protocol.intervention}}"
             + (" compared with {{protocol.comparator}}" if "protocol.comparator" in p.facts else "")
@@ -138,8 +139,36 @@ def _methods(p: EvidencePackage) -> str:
                 "recorded]]"
             ),
             "**Synthesis.** {{stats.methods}} {{stats.software}}",
+            *(
+                ["**Synthesis without meta-analysis.** {{synthesis.methods}}"]
+                if "synthesis.methods" in p.facts
+                else []
+            ),
+            "**Certainty of the evidence.** {{grade.methods}}",
         ]
     )
+
+
+def table_numbers(p: EvidencePackage) -> dict[str, int]:
+    """Table numbering shared by the Results text and the Tables section."""
+    names = ["table:study_characteristics", "table:results_summary"]
+    names += [n for n in ("table:sof", "table:evidence_summary", "table:synthesis")
+              if n in p.templates]  # fmt: skip
+    return {n: i + 1 for i, n in enumerate(names)}
+
+
+TABLE_CAPTIONS = {
+    "table:study_characteristics": "Characteristics of the included studies (reports of the "
+    "same study are grouped).",
+    "table:results_summary": "Summary of analyses.",
+    "table:sof": "Summary of Findings (GRADE) for comparative outcomes. Absolute effects are "
+    "shown only where an assumed comparator risk with a stated source was recorded.",
+    "table:evidence_summary": "Evidence summary for single-group outcomes. This is not a "
+    "comparative Summary of Findings table: there is no comparator, so no relative or absolute "
+    "effects are presented.",
+    "table:synthesis": "Study-level findings synthesised without meta-analysis, with the "
+    "reviewers' judgement of the direction of effect where a comparison exists.",
+}
 
 
 def _results(p: EvidencePackage) -> str:
@@ -153,11 +182,12 @@ def _results(p: EvidencePackage) -> str:
         "{{prisma.reports_excluded}} were excluded"
         + (" ({{prisma.exclusion_reasons}})" if "prisma.exclusion_reasons" in p.facts else "")
         + ". {{prisma.studies_included}} studies, described in {{prisma.reports_included}} "
-        f"reports, were included [{included}] (Table 1).",
+        f"reports, were included [{included}] (Figure 1; Table 1).",
     ]
+    tables = table_numbers(p)
     if "rob.summary" in p.facts:
         paras.append("**Risk of bias.** {{rob.summary}}.")
-    fig = 0
+    fig = 1  # Figure 1 is the PRISMA flow diagram
     for a in p.stats.analyses:
         k = f"stats.{a.analysis_id}"
         if a.status == "pooled":
@@ -197,8 +227,30 @@ def _results(p: EvidencePackage) -> str:
             s = f"**{{{{{k}.outcome}}}}.** {{{{{k}.status}}}}"
         if f"{k}.excluded" in p.facts:
             s += f" Studies not contributing: {{{{{k}.excluded}}}}."
+        if f"grade.{a.analysis_id}.statement" in p.facts:
+            s += f" {{{{grade.{a.analysis_id}.statement}}}}."
         paras.append(s)
-    paras.append("A summary of all analyses is given in Table 2.")
+    for g in p.reporting.approved_groups if p.reporting else []:
+        q = f"synthesis.{g.group_id}"
+        s = (
+            f"**Synthesis without meta-analysis: {{{{{q}.title}}}}.** {{{{{q}.contribution}}}} "
+            f"{{{{{q}.summary}}}}"
+        )
+        if f"{q}.direction" in p.facts:
+            s += f" {{{{{q}.direction}}}}."
+        s += f" Study-level findings are given in Table {tables['table:synthesis']}."
+        paras.append(s)
+    paras.append(f"A summary of all analyses is given in Table {tables['table:results_summary']}.")
+    if "table:sof" in tables:
+        paras.append(
+            "The Summary of Findings for comparative outcomes is given in Table "
+            f"{tables['table:sof']}."
+        )
+    if "table:evidence_summary" in tables:
+        paras.append(
+            "The evidence summary for single-group outcomes is given in Table "
+            f"{tables['table:evidence_summary']}."
+        )
     return "\n\n".join(paras)
 
 
@@ -250,15 +302,21 @@ def _limitations(p: EvidencePackage) -> str:
             "adjudication of disagreements; these passes are not equivalent to two "
             "independent human reviewers."
         )
+    if "grade.limitations" in p.facts:
+        text.append("{{grade.limitations}}")
+    for g in p.reporting.approved_groups if p.reporting else []:
+        text.append(
+            f"For the synthesis without meta-analysis {{{{synthesis.{g.group_id}.title}}}}: "
+            f"{{{{synthesis.{g.group_id}.limitations}}}}"
+        )
     text.append("[[AUTHOR INPUT: further limitations of the evidence and of the review]]")
     return "\n\n".join(text)
 
 
 def _tables(p: EvidencePackage) -> str:
-    return (
-        "**Table 1.** Characteristics of the included studies (reports of the same study "
-        "are grouped).\n\n{{table:study_characteristics}}\n\n**Table 2.** Summary of "
-        "analyses.\n\n{{table:results_summary}}"
+    return "\n\n".join(
+        f"**Table {n}.** {TABLE_CAPTIONS[name]}\n\n{{{{{name}}}}}"
+        for name, n in table_numbers(p).items()
     )
 
 
@@ -266,18 +324,27 @@ def _figures(p: EvidencePackage) -> str:
     keys = [k for k in p.templates if k.startswith("figure:forest:")]
     order = [a.analysis_id for a in p.stats.analyses]
     keys.sort(key=lambda k: order.index(k.rsplit(":", 1)[1]))
-    return (
-        "\n\n".join(f"**Figure {i + 1}.** {{{{{k}}}}}" for i, k in enumerate(keys))
-        or "No forest plots: no analysis produced a study-level or pooled estimate."
-    )
+    legends = ["**Figure 1.** {{figure:prisma}}"]
+    legends += [f"**Figure {i + 2}.** {{{{{k}}}}}" for i, k in enumerate(keys)]
+    if not keys:
+        legends.append("No forest plots: no analysis produced a study-level or pooled estimate.")
+    return "\n\n".join(legends)
 
 
 def _supplementary(p: EvidencePackage) -> str:
-    return (
-        "Supplementary File 1: PRISMA-S search report (search log export). Supplementary "
-        "File 2: statistics report, per-analysis tables and report ledgers "
-        "(stats_output.json and report.md)."
-    )
+    files = [
+        "PRISMA-S search report (search log export)",
+        "statistics report, per-analysis tables and report ledgers (stats_output.json and "
+        "report.md)",
+        "completed PRISMA 2020 checklist and PRISMA 2020 for Abstracts checklist, with the "
+        "location of each item and the reviewer's decision",
+        "PRISMA 2020 flow diagram source (prisma_flow.json) and figure files",
+    ]
+    if any(k in p.templates for k in ("table:sof", "table:evidence_summary")):
+        files.append("Summary of Findings and evidence-summary tables with source keys")
+    if p.reporting is not None and p.reporting.swim_checklist_required:
+        files.append("completed SWiM checklist")
+    return " ".join(f"Supplementary File {i + 1}: {f}." for i, f in enumerate(files))
 
 
 def template_sections(p: EvidencePackage) -> list[ManuscriptSection]:
