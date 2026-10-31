@@ -535,13 +535,15 @@ def test_activation_endpoint_requires_a_reviewer_and_the_previewed_hashes(
     with client:
         from src.state.db import make_engine, make_session_factory
 
-        with make_session_factory(make_engine(url))() as s:
+        engine = make_engine(url)
+        with make_session_factory(engine)() as s:
             repo = Repository(s)
             _, token = repo.enroll_reviewer("Dr Model Steward")
             snap = refresh_snapshot(client.app.state.base_catalogue, [], created_by="t")  # type: ignore[attr-defined]
             snap = snap.model_copy(update={"models": _discovered().models()})
             repo.save_catalogue_snapshot(snap)
             s.commit()
+        engine.dispose()
         view = client.get(f"/models/snapshots/{snap.snapshot_id}/preview").json()
         assert view["changes"]["added"] == ["anthropic/claude-opus-9-test"]
         body = {"expected_sha256": view["sha256"], "expected_active_sha256": "f" * 64}
