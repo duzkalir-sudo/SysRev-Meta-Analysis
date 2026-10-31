@@ -63,6 +63,12 @@ from src.core.schemas.master import (
     QuantitativeUnavailability,
     StudyReportLink,
 )
+from src.core.schemas.reporting import (
+    ChecklistDecision,
+    GradeAssessment,
+    SwimApplicability,
+    SynthesisGroup,
+)
 from src.core.schemas.search import ProtocolEvent, SearchRun
 from src.core.schemas.stats import AnalysisPlan, StatsOutput
 from src.core.security import (
@@ -104,6 +110,7 @@ from src.state.db import (
     QuantitativeUnavailabilityORM,
     ReferenceEntryORM,
     ReferenceVerificationORM,
+    ReportingRecordORM,
     ReviewerORM,
     RiskOfBiasORM,
     ScreeningConflictORM,
@@ -1840,6 +1847,117 @@ class Repository:
             .order_by(ClaimReviewORM.seq)
         )
         return [ClaimReview.model_validate(r.payload) for r in rows]
+
+    # ------------------------------------------------------------------ reporting (Session 7)
+    def _add_reporting(
+        self,
+        project_id: str,
+        kind: str,
+        record_id: str,
+        subject: str,
+        reviewer_id: str | None,
+        payload: dict[str, object],
+    ) -> None:
+        import json
+
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        self.session.add(ReportingRecordORM(
+            id=record_id, project_id=project_id, kind=kind, subject=subject[:128],
+            reviewer_id=reviewer_id, payload=payload,
+            payload_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ))  # fmt: skip
+        self.session.flush()
+
+    def _load_reporting(self, project_id: str, kind: str) -> list[dict[str, object]]:
+        rows = self.session.scalars(
+            select(ReportingRecordORM)
+            .where(ReportingRecordORM.project_id == project_id, ReportingRecordORM.kind == kind)
+            .order_by(ReportingRecordORM.seq)
+        )
+        return [r.payload for r in rows]
+
+    def _require_reporting_phase(self, project_id: str) -> None:
+        phase = self.get_project(project_id).phase
+        if phase not in self.STAGE6_EDITABLE:
+            raise SysRevError(
+                f"reporting decisions are recorded in Stage 6 (phase={phase}); they depend on "
+                "the verified statistics output and the manuscript"
+            )
+
+    def _require_named_reviewer(self, reviewer_id: str | None, name: str) -> None:
+        reviewer = self.require_active_reviewer(reviewer_id)
+        if reviewer.display_name != name:
+            raise SysRevError("the recorded name does not match the enrolled reviewer")
+
+    def save_checklist_decision(self, decision: ChecklistDecision) -> None:
+        """A reviewer's decision on one checklist item, re-verified against the latest
+        manuscript version and the current evidence (basis hash recomputed)."""
+        from src.reporting.service import checklist_decision_problems
+
+        self._require_reporting_phase(decision.project_id)
+        self._require_named_reviewer(decision.reviewer_id, decision.reviewer_name)
+        problems = checklist_decision_problems(self, decision)
+        if problems:
+            raise SysRevError("checklist decision refused: " + "; ".join(problems))
+        self._add_reporting(decision.project_id, "checklist_decision", decision.decision_id,
+                            f"{decision.checklist}:{decision.item_id}", decision.reviewer_id,
+                            decision.model_dump(mode="json"))  # fmt: skip
+
+    def load_checklist_decisions(self, project_id: str) -> list[ChecklistDecision]:
+        return [ChecklistDecision.model_validate(p)
+                for p in self._load_reporting(project_id, "checklist_decision")]  # fmt: skip
+
+    def save_grade_assessment(self, assessment: GradeAssessment) -> None:
+        """A GRADE record. Human statuses need an active enrolled reviewer; every record is
+        checked against the current analysis (input hash, applicability, baselines)."""
+        from src.reporting.service import grade_problems
+
+        self._require_reporting_phase(assessment.project_id)
+        if assessment.reviewer_id is not None or assessment.actor_type == ActorType.HUMAN:
+            self._require_named_reviewer(assessment.reviewer_id, assessment.created_by)
+        problems = grade_problems(self, assessment)
+        if problems:
+            raise SysRevError("GRADE record refused: " + "; ".join(problems))
+        self._add_reporting(assessment.project_id, "grade_assessment", assessment.assessment_id,
+                            assessment.analysis_id, assessment.reviewer_id,
+                            assessment.model_dump(mode="json"))  # fmt: skip
+
+    def load_grade_assessments(self, project_id: str) -> list[GradeAssessment]:
+        return [GradeAssessment.model_validate(p)
+                for p in self._load_reporting(project_id, "grade_assessment")]  # fmt: skip
+
+    def save_synthesis_group(self, group: SynthesisGroup) -> None:
+        from src.reporting.service import synthesis_problems
+
+        self._require_reporting_phase(group.project_id)
+        if group.reviewer_id is not None or group.actor_type == ActorType.HUMAN:
+            self._require_named_reviewer(group.reviewer_id, group.created_by)
+        problems = synthesis_problems(self, group)
+        if problems:
+            raise SysRevError("synthesis refused: " + "; ".join(problems))
+        self._add_reporting(group.project_id, "synthesis_group", uuid.uuid4().hex,
+                            group.group_id, group.reviewer_id,
+                            group.model_dump(mode="json"))  # fmt: skip
+
+    def load_synthesis_groups(self, project_id: str) -> list[SynthesisGroup]:
+        return [SynthesisGroup.model_validate(p)
+                for p in self._load_reporting(project_id, "synthesis_group")]  # fmt: skip
+
+    def save_swim_applicability(self, decision: SwimApplicability) -> None:
+        from src.reporting.service import swim_applicability_problems
+
+        self._require_reporting_phase(decision.project_id)
+        self._require_named_reviewer(decision.reviewer_id, decision.reviewer_name)
+        problems = swim_applicability_problems(self, decision)
+        if problems:
+            raise SysRevError("SWiM applicability decision refused: " + "; ".join(problems))
+        self._add_reporting(decision.project_id, "swim_applicability", decision.decision_id,
+                            "swim", decision.reviewer_id,
+                            decision.model_dump(mode="json"))  # fmt: skip
+
+    def load_swim_applicability(self, project_id: str) -> list[SwimApplicability]:
+        return [SwimApplicability.model_validate(p)
+                for p in self._load_reporting(project_id, "swim_applicability")]  # fmt: skip
 
     # ------------------------------------------------------------------ guards
     def build_guard_context(self, project_id: str) -> GuardContext:

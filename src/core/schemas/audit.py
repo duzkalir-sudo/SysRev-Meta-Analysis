@@ -62,6 +62,22 @@ REQUIRED_SCOPES = frozenset(
 )
 
 
+# Session 7 (Auditor 1.3.0) adds the reporting scope: PRISMA flow diagram and checklists,
+# GRADE and Summary of Findings, synthesis without meta-analysis and SWiM. Reports made by
+# earlier Auditor versions remain loadable with the scopes their version required; they can
+# no longer authorise completion (the completion guard requires the current Auditor).
+LEGACY_AUDITOR_VERSIONS = frozenset(
+    {"stage6-auditor-1.0.0", "stage6-auditor-1.1.0", "stage6-auditor-1.2.0"}
+)
+SESSION7_SCOPES = frozenset({"reporting"})
+
+
+def required_scopes(auditor_version: str | None) -> frozenset[str]:
+    if auditor_version in LEGACY_AUDITOR_VERSIONS:
+        return REQUIRED_SCOPES
+    return REQUIRED_SCOPES | SESSION7_SCOPES
+
+
 class NumericClaimCheck(StrictModel):
     """A number found in the manuscript, cross-checked against an approved source key."""
 
@@ -193,7 +209,7 @@ class AuditReport(StrictModel):
         return (
             self.manuscript_sha256 is not None
             and bool(self.evidence_fingerprint)
-            and set(self.scopes_checked) >= REQUIRED_SCOPES
+            and set(self.scopes_checked) >= required_scopes(self.auditor_version)
             and bool(self.coverage)
         )
 

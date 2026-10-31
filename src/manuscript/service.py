@@ -19,7 +19,7 @@ import difflib
 from dataclasses import dataclass
 from typing import Any, cast
 
-from src.auditor.auditor import audit_manuscript
+from src.auditor.auditor import AUDITOR_VERSION, audit_manuscript
 from src.core.enums import ActorType, CheckStatus, Phase
 from src.core.exceptions import SysRevError
 from src.core.schemas.audit import AuditReport
@@ -36,7 +36,11 @@ from src.core.schemas.manuscript import (
 )
 from src.manuscript.document import render
 from src.manuscript.drafting import HEADINGS, template_sections
-from src.manuscript.evidence import EvidencePackage, build_evidence_package
+from src.manuscript.evidence import (
+    EvidencePackage,
+    build_evidence_package,
+    content_fingerprint,
+)
 from src.state.repository import Repository
 
 
@@ -130,6 +134,11 @@ def completion_problems(repo: Repository, project_id: str) -> list[str]:
     problems, report = audit_currency_problems(repo, project_id)
     if report is None:
         return problems
+    if report.auditor_version != AUDITOR_VERSION:
+        problems.append(
+            f"the latest audit was made by {report.auditor_version}, not the current Auditor "
+            f"({AUDITOR_VERSION}): audit again"
+        )
     if not report.complete:
         problems.append("the latest audit is incomplete")
     if not report.passed:
@@ -168,6 +177,8 @@ def approval_blockers(repo: Repository, project_id: str, approval: ManuscriptApp
         or approval.evidence_sha256 != (fingerprint_sha256(report.evidence_fingerprint))
     ):
         problems.append("the sign-off does not name the current version, audit and evidence")
+    if report.auditor_version != AUDITOR_VERSION:
+        problems.append(f"the audit was made by {report.auditor_version}, not {AUDITOR_VERSION}")
     if not report.passed:
         problems.append(f"the audit has {report.failures} blocking finding(s)")
     pending = _pending_reviews(repo, report)
@@ -412,8 +423,9 @@ class ManuscriptService:
         try:
             package = self.package()
             out["evidence_fingerprint"] = package.fingerprint
-            out["evidence_current_for_latest_version"] = (
-                latest is not None and latest.evidence_fingerprint == package.fingerprint
+            out["evidence_current_for_latest_version"] = latest is not None and (
+                content_fingerprint(latest.evidence_fingerprint)
+                == content_fingerprint(package.fingerprint)
             )
             out["evidence_problems"] = []
         except SysRevError as exc:
