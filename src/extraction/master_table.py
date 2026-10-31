@@ -27,6 +27,7 @@ from src.core.enums import (
     EvidenceCheckStatus,
     Phase,
     ReviewStatus,
+    ScreeningStage,
 )
 from src.core.exceptions import SysRevError
 from src.core.schemas.base import utc_now
@@ -71,7 +72,37 @@ def state_sha256(data: Any) -> str:
 
 
 def item_state_sha256(item: ExtractionItem) -> str:
+    """Hash of the item alone (its content and review status)."""
     return state_sha256(item.model_dump(mode="json"))
+
+
+def source_state(repo: Repository, project_id: str, record_id: str) -> dict[str, Any]:
+    """The evidence source a correction screen shows: the report's linked PDF (content hash,
+    stored filename) and the state of its identity check and human confirmation."""
+    ft = repo.get_fulltext_item(project_id, record_id)
+    if ft is None:
+        return {"record_id": record_id, "linked_pdf": None}
+    return {
+        "record_id": record_id,
+        "pdf_filename": ft.pdf_filename,
+        "pdf_sha256": ft.pdf_sha256,
+        "match_status": ft.match_status.value if ft.match_status else None,
+        "match_notes": list(ft.match_notes),
+        "confirmed_by_reviewer_id": ft.confirmed_by_reviewer_id,
+        "match_unconfirmed": ft.match_unconfirmed,
+    }
+
+
+def correction_state_sha256(repo: Repository, project_id: str, item: ExtractionItem) -> str:
+    """What a correction decision is bound to (review of PR #13, finding 1): the item *and*
+    the linked PDF and identity confirmation displayed with it. A replaced PDF, a changed
+    identity check or a changed confirmation therefore makes an older screen stale."""
+    return state_sha256(
+        {
+            "item": item.model_dump(mode="json"),
+            "source": source_state(repo, project_id, item.record_id),
+        }
+    )
 
 
 def check_expected(actual: str, expected: str | None, what: str) -> None:
@@ -223,9 +254,9 @@ def correct_item(
         raise ReviewError("a correction needs a note")
     repo.lock_project(project_id)
     check_expected(
-        item_state_sha256(repo.get_extraction_item(project_id, item_id)),
+        correction_state_sha256(repo, project_id, repo.get_extraction_item(project_id, item_id)),
         expected_state_sha256,
-        f"item {item_id}",
+        f"item {item_id} or its linked PDF",
     )
     old = _pending(repo, project_id, item_id)
     _require_linked_document(repo, project_id, old.record_id, doc)
@@ -346,7 +377,11 @@ def revise_reviewed_item(
             "later phases have no route back to rebuild and re-approve the arms"
         )
     old = repo.get_extraction_item(project_id, item_id)
-    check_expected(item_state_sha256(old), expected_state_sha256, f"item {item_id}")
+    check_expected(
+        correction_state_sha256(repo, project_id, old),
+        expected_state_sha256,
+        f"item {item_id} or its linked PDF",
+    )
     if old.review_status == ReviewStatus.PENDING:
         raise ReviewError(f"item {item_id} is pending: use the ordinary correction")
     if old.review_status not in (ReviewStatus.ACCEPTED, ReviewStatus.REJECTED):
@@ -409,6 +444,13 @@ def build_arms(
 ) -> list[ExtractedStudyArm]:
     """Assemble accepted, verified arm-level items into approved ExtractedStudyArms."""
     reviewer = repo.require_active_reviewer(reviewer.id)
+    if record_id in repo.withdrawn_arm_records(project_id) and record_id not in (
+        repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
+    ):
+        raise ReviewError(
+            f"the arms of {record_id} were withdrawn because the report is not included at "
+            "full text; they are rebuilt only if it is included again"
+        )
     items = [
         i
         for i in repo.load_extraction_items(project_id)
@@ -506,6 +548,64 @@ def analysis_compatibility(arm: ExtractedStudyArm, outcome: OutcomeDefinition) -
 
 
 # --------------------------------------------------------------------------- studies, export
+
+
+def arms_state_sha256(repo: Repository, project_id: str, record_id: str) -> str:
+    """The active arms of one report and its full-text inclusion, as displayed."""
+    return state_sha256(
+        {
+            "arms": sorted(
+                a.arm_id for a in repo.load_extracted_arms(project_id) if a.record_id == record_id
+            ),
+            "included": record_id in repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT),
+        }
+    )
+
+
+def withdraw_arms(
+    repo: Repository,
+    project_id: str,
+    record_id: str,
+    *,
+    reviewer: ReviewerORM,
+    reason: str,
+    expected_state_sha256: str,
+) -> list[str]:
+    """Retire the active arms of a report that is **no longer included** at full text (e.g.
+    excluded on re-review after an eligibility amendment). Review of PR #13, finding 4.
+
+    The arms and their evidence stay stored; an append-only ``arm_invalidation`` record of kind
+    ``withdrawal`` names the reviewer and reason, and every reader ignores the arms from then
+    on. Data of an included report are never withdrawn here (correct them, or record them as
+    unavailable for an outcome). Allowed in Stage 4 and at Gate 3, where Gate 3 re-checks the
+    extraction state; refused (nothing written) if the displayed state changed.
+    """
+    reviewer = repo.require_active_reviewer(reviewer.id)
+    if not reason.strip():
+        raise ReviewError("a withdrawal needs a reason")
+    repo.lock_project(project_id)
+    phase = Phase(repo.get_project(project_id).phase)
+    if phase not in REVISION_PHASES:
+        raise ReviewError(
+            f"arms are withdrawn in Stage 4 or at Gate 3 (project is in {phase}); later phases "
+            "have no route back to re-check the extraction"
+        )
+    check_expected(arms_state_sha256(repo, project_id, record_id), expected_state_sha256,
+                   f"the arms or inclusion of {record_id}")  # fmt: skip
+    if record_id in repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT):
+        raise ReviewError(
+            f"{record_id} is included at full text: its data are corrected, or recorded as "
+            "unavailable for an outcome, not withdrawn"
+        )
+    arms = [a.arm_id for a in repo.load_extracted_arms(project_id) if a.record_id == record_id]
+    if not arms:
+        raise ReviewError(f"{record_id} has no active arms")
+    for arm_id in arms:
+        repo.invalidate_arm(
+            project_id, arm_id, reviewer_id=reviewer.id, item_id=None,
+            reason=f"withdrawn: report not included at full text — {reason}", kind="withdrawal",
+        )  # fmt: skip
+    return arms
 
 
 def link_reports_to_study(

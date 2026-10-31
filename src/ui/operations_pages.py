@@ -285,7 +285,11 @@ def page_corrections(be: UIBackend, pid: str, token: str | None, show: Show) -> 
         "data become stale automatically."
     )
     fz.flash()
-    tab1, tab2, tab3 = st.tabs(["Correct a value", "Report → study links", "Double counting"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Correct a value", "Report → study links", "Double counting", "Withdraw arms"]
+    )
+    with tab4:
+        _withdraw(be, pid, token, show)
     with tab1:
         _correction(be, pid, token, show)
     with tab2:
@@ -328,6 +332,8 @@ def _correction(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
             "location": ev.get("location_identifier"),
             "quote": ev.get("verbatim_quote"),
             "evidence check": (item.get("verification") or {}).get("status"),
+            "linked PDF now (decision bound to it)": (item.get("source") or {}).get("pdf_sha256"),
+            "PDF identity": (item.get("source") or {}).get("match_status"),
         }
     )
     hist = be.api.get(f"/projects/{pid}/extraction/items/{item['item_id']}/history")
@@ -390,6 +396,49 @@ def _correction(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
                     if invalid
                     else ""
                 ),
+            )
+
+
+def _withdraw(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
+    """Retire the arms of a report that is no longer included at full text."""
+    st.caption(
+        "For a report excluded at full text after its arms were built (e.g. on re-review after "
+        "an eligibility amendment). The arms and their evidence stay stored; the withdrawal is "
+        "recorded with your name and reason. Included reports are corrected instead."
+    )
+    rid = st.text_input("Report (record id)", key=fz.wkey("withdraw_rid", fz.key(fz.ARMS, pid)))
+    if not rid:
+        return
+    wk = fz.key(fz.ARMS, pid, rid)
+    view, error = fz.frozen(
+        wk, lambda: be.api.get(f"/projects/{pid}/extraction/records/{rid}/arms-state")
+    )
+    if view is None:
+        st.error(error)
+        return
+    live = be.api.get(f"/projects/{pid}/extraction/records/{rid}/arms-state")
+    if live.ok:
+        fz.warn_if_changed(live.data["state_sha256"], view["state_sha256"])
+    fz.reload_button(wk)
+    st.write({"included at full text": view["included"], "active arms": len(view["arms"])})
+    st.dataframe(
+        [
+            {k: a.get(k) for k in ("arm_id", "outcome_id", "arm_label", "timepoint")}
+            for a in view["arms"]
+        ]
+    )
+    with st.form(fz.wkey("withdraw", wk)):
+        reason = st.text_area("Reason for the withdrawal (required)")
+        if st.form_submit_button("Withdraw these arms (authenticated)"):
+            fz.submit(
+                be.api.post(
+                    f"/projects/{pid}/extraction/records/{rid}/withdraw-arms",
+                    token=token,
+                    json={"reason": reason, "expected_state_sha256": view["state_sha256"]},
+                ),
+                show,
+                [wk],
+                "Arms withdrawn.",
             )
 
 
@@ -519,8 +568,19 @@ def page_plan(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
         return
     live = be.api.get(f"/projects/{pid}/stats/plans")
     if live.ok:
-        fz.warn_if_changed(live.data["latest_sha256"], view["latest_sha256"])
+        fz.warn_if_changed(
+            (live.data["latest_sha256"], live.data["protocol_sha256"]),
+            (view["latest_sha256"], view["protocol_sha256"]),
+        )
     fz.reload_button(pk, fz.key(fz.PLAN_WORK, pid))
+    # The outcome definitions shown are those of the frozen screen; every save or approval
+    # sends their protocol hash and is refused if an amendment changed them meanwhile.
+    st.caption(
+        f"Composed against protocol version {view['protocol_version']} "
+        f"({(view['protocol_sha256'] or '')[:12]})."
+    )
+    with st.expander("Outcome definitions of this protocol version"):
+        st.json(view["outcomes"])
     st.dataframe(
         [
             {
@@ -550,14 +610,14 @@ def page_plan(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
                         json={
                             "expected_sha256": latest["sha256"],
                             "expected_latest_sha256": view["latest_sha256"],
+                            "expected_protocol_sha256": view["protocol_sha256"],
                         },
                     ),
                     show,
                     [pk],
                     "Plan approved.",
                 )
-    protocol = (be.api.get(f"/projects/{pid}/protocol").data or {}).get("protocol") or {}
-    outcomes = {o["outcome_id"]: o for o in protocol.get("outcomes", [])}
+    outcomes = {o["outcome_id"]: o for o in view["outcomes"]}
     st.subheader("Compose a new draft version")
     wk = fz.key(fz.PLAN_WORK, pid)
     work: list[dict[str, Any]] = fz.store().setdefault(
@@ -621,6 +681,7 @@ def page_plan(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
                         "analyses": work,
                         "rationale": rationale or None,
                         "expected_latest_sha256": view["latest_sha256"],
+                        "expected_protocol_sha256": view["protocol_sha256"],
                     },
                 ),
                 show,
@@ -896,7 +957,11 @@ def _obligations(
     with st.form(fz.wkey("resolve", ak)):
         choice = st.selectbox("Item", list(labels))
         resolution = st.radio(
-            "Resolution", ["confirmed", "revised", "not_applicable"], horizontal=True
+            "Resolution",
+            ["confirmed", "revised", "not_applicable", "withdrawn"],
+            horizontal=True,
+            help="withdrawn: extraction data that do not meet an amended outcome definition "
+            "are recorded as unavailable for that outcome (data and evidence stay stored)",
         )
         verdict = st.selectbox(
             "Revised screening verdict (screening items only)", ["", "include", "exclude"]

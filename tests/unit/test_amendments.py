@@ -384,9 +384,15 @@ def test_outcome_amendment_requires_extraction_and_plan_rereview(session: Sessio
         comments="ok",
         expected_sha256=p.sha256,
     )
-    rows = {o["area"]: o for o in amendments.obligation_status(repo, "mc1")}
+    obligations = amendments.obligation_status(repo, "mc1")
+    rows = {o["area"]: o for o in obligations}
     assert set(rows) == {"extraction", "analysis_plans"}
-    assert rows["extraction"]["subject"] == "t1|complication"
+    # one per report whose data (item t1, approved arms t1-t3) use the changed outcome
+    assert sorted(o["subject"] for o in obligations if o["area"] == "extraction") == [
+        "t1|complication",
+        "t2|complication",
+        "t3|complication",
+    ]
     with pytest.raises(AmendmentError, match="contradicts the amended protocol"):
         amendments.resolve(
             repo,
@@ -404,6 +410,7 @@ def test_outcome_amendment_requires_extraction_and_plan_rereview(session: Sessio
         rationale="re-specified after the amendment",
         reviewer=reviewer,
         expected_latest_sha256=state["latest_sha256"],
+        expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
     )
     plan_service.approve_draft(
         repo,
@@ -412,17 +419,51 @@ def test_outcome_amendment_requires_extraction_and_plan_rereview(session: Sessio
         reviewer=reviewer,
         expected_sha256=draft.sha256(),
         expected_latest_sha256=draft.sha256(),
+        expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
     )
-    rows = {o["area"]: o for o in amendments.obligation_status(repo, "mc1")}
-    assert rows["analysis_plans"]["state"] == "resolved"  # resolved by the newer approval
-    assert rows["extraction"]["state"] == "open"
+    obligations = amendments.obligation_status(repo, "mc1")
+    plan_row = next(o for o in obligations if o["area"] == "analysis_plans")
+    assert plan_row["state"] == "resolved"  # approved from a screen bound to version 2
+    ex = {o["subject"]: o for o in obligations if o["area"] == "extraction"}
+    assert {o["state"] for o in ex.values()} == {"open"}  # the plan never substitutes for data
+    assert repo.build_guard_context("mc1").amendment_problems
     amendments.resolve(
         repo,
         "mc1",
-        rows["extraction"]["obligation_id"],
+        ex["t1|complication"]["obligation_id"],
         "confirmed",
         reviewer=reviewer,
         note="not reported under either definition",
+    )
+    with pytest.raises(AmendmentError, match="predate the amendment"):
+        amendments.resolve(
+            repo,
+            "mc1",
+            ex["t2|complication"]["obligation_id"],
+            "revised",
+            reviewer=reviewer,
+            note="nothing was corrected",
+        )
+    amendments.resolve(
+        repo,
+        "mc1",
+        ex["t2|complication"]["obligation_id"],
+        "withdrawn",
+        reviewer=reviewer,
+        note="counts include minor complications",
+    )
+    assert any(
+        u.record_id == "t2" and u.outcome_id == "complication"
+        for u in repo.load_unavailability("mc1")
+    )
+    assert repo.build_guard_context("mc1").amendment_problems  # t3 still pending
+    amendments.resolve(
+        repo,
+        "mc1",
+        ex["t3|complication"]["obligation_id"],
+        "confirmed",
+        reviewer=reviewer,
+        note="only serious events reported",
     )
     assert not repo.build_guard_context("mc1").amendment_problems
     assert any("re-run Stage 5" in x or "plan" in x for x in repo.stats_output_problems("mc1"))

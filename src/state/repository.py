@@ -508,6 +508,8 @@ class Repository:
 
     # ------------------------------------------------------------------ screening
     def save_screening_decision(self, project_id: str, decision: ScreeningDecision) -> None:
+        if decision.stage == ScreeningStage.FULL_TEXT:
+            self.require_stats_inputs_open(project_id, "a full-text eligibility decision")
         if decision.is_human:
             reviewer = self.require_active_reviewer(decision.reviewer_id)
             if decision.reviewer_identity != reviewer.display_name:
@@ -767,6 +769,7 @@ class Repository:
         note: str | None = None,
     ) -> CohortOverlapWarning:
         """Record a human cohort-overlap decision on behalf of an enrolled reviewer."""
+        self.require_stats_inputs_open(project_id, "resolving a cohort-overlap warning")
         reviewer = self.require_active_reviewer(reviewer_id)
         row = self.session.get(CohortOverlapWarningORM, warning_id)
         if row is None or row.project_id != project_id:
@@ -835,6 +838,7 @@ class Repository:
 
     # ------------------------------------------------------------------ extraction
     def save_extracted_arm(self, project_id: str, arm: ExtractedStudyArm) -> None:
+        self.require_stats_inputs_open(project_id, "adding an extracted arm")
         if self.session.get(ExtractedArmORM, arm.arm_id) is not None:
             raise SysRevError(
                 f"arm {arm.arm_id} already exists; corrections create a new arm version"
@@ -875,6 +879,7 @@ class Repository:
         row = self.session.get(ExtractedArmORM, arm_id)
         if row is None:
             raise NotFoundError(f"arm {arm_id} not found")
+        self.require_stats_inputs_open(row.project_id, "approving an extracted arm")
         arm = self._arm_from_row(row)
         approved = arm.model_copy(
             update={
@@ -902,19 +907,53 @@ class Repository:
         return set(rows)
 
     def invalidate_arm(
-        self, project_id: str, arm_id: str, *, reviewer_id: str, item_id: str, reason: str
+        self,
+        project_id: str,
+        arm_id: str,
+        *,
+        reviewer_id: str,
+        item_id: str | None,
+        reason: str,
+        kind: str = "correction",
     ) -> None:
+        """``kind``: ``correction`` (a value was corrected; the arm is rebuilt) or
+        ``withdrawal`` (the report is no longer included; nothing is rebuilt)."""
         row = self.session.get(ExtractedArmORM, arm_id)
         if row is None or row.project_id != project_id:
             raise NotFoundError(f"arm {arm_id} not found")
         if arm_id in self.invalidated_arm_ids(project_id):
             return
+        self.require_stats_inputs_open(project_id, "invalidating an extracted arm")
         self.add_governance_record(
             project_id, "arm_invalidation", arm_id,
             {"arm_id": arm_id, "record_id": row.record_id, "outcome_id": row.outcome_id,
-             "item_id": item_id, "reason": reason, "reviewer_id": reviewer_id},
+             "item_id": item_id, "reason": reason, "reviewer_id": reviewer_id, "kind": kind},
             reviewer_id=reviewer_id,
         )  # fmt: skip
+
+    def withdrawn_arm_records(self, project_id: str) -> set[str]:
+        return {
+            str(r["record_id"])
+            for r in self.governance_records(project_id, "arm_invalidation")
+            if r.get("kind") == "withdrawal"
+        }
+
+    STATS_INPUTS_FROZEN = (
+        Phase.STAGE6_MANUSCRIPT.value,
+        Phase.STAGE6_AUDIT.value,
+        Phase.COMPLETED.value,
+    )
+
+    def require_stats_inputs_open(self, project_id: str, what: str) -> None:
+        """Review of PR #13, finding 5: from Stage 6 on, the verified statistics cannot be
+        recomputed (the state machine has no route back to Stage 5 and ``run_stage5`` refuses),
+        so a change to any Stage 5 input is refused *before anything is written*."""
+        phase = self.get_project(project_id).phase
+        if phase in self.STATS_INPUTS_FROZEN:
+            raise SysRevError(
+                f"{what} would change the inputs of the verified statistics, which cannot be "
+                f"recomputed in {phase} (no route back to Stage 5); nothing was changed"
+            )
 
     def load_extracted_arms(
         self, project_id: str, *, include_invalidated: bool = False
@@ -1217,6 +1256,7 @@ class Repository:
 
     # report → study mapping and qualitative-only inclusion
     def save_study_link(self, project_id: str, link: StudyReportLink) -> None:
+        self.require_stats_inputs_open(project_id, "linking a report to a study")
         self.require_active_reviewer(link.reviewer_id)
         self.get_record(project_id, link.record_id)
         row = self.session.scalars(
@@ -1241,6 +1281,7 @@ class Repository:
     def remove_study_link(self, project_id: str, record_id: str, *, reviewer_id: str) -> None:
         """The report becomes its own study again (Session 8). History is kept by the caller
         in the append-only governance log."""
+        self.require_stats_inputs_open(project_id, "unlinking a report from its study")
         self.require_active_reviewer(reviewer_id)
         row = self.session.scalars(
             select(StudyReportLinkORM).where(
@@ -1266,6 +1307,7 @@ class Repository:
         return {rid: links.get(rid, rid) for rid in ids}
 
     def save_unavailability(self, project_id: str, entry: QuantitativeUnavailability) -> None:
+        self.require_stats_inputs_open(project_id, "recording data as unavailable")
         self.require_active_reviewer(entry.reviewer_id)
         self.get_record(project_id, entry.record_id)
         self.session.merge(
@@ -1279,6 +1321,7 @@ class Repository:
     def save_contribution_decision(
         self, project_id: str, decision: CohortContributionDecision
     ) -> None:
+        self.require_stats_inputs_open(project_id, "a double-counting (contribution) decision")
         reviewer = self.require_active_reviewer(decision.reviewer_id)
         if decision.decided_by != reviewer.display_name:
             raise SysRevError("decided_by does not match the enrolled reviewer")

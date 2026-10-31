@@ -13,7 +13,8 @@ DOIs use the 10.5555 test prefix and PMIDs are invented (9xxxxxxx).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import date
 from typing import Any
 
@@ -308,6 +309,23 @@ def _to_stage6(repo: Repository, pid: str, rid: str, specs: list[AnalysisSpec]) 
     repo.record_stats_output(pid, output)
     project.phase = Phase.STAGE6_MANUSCRIPT.value
     repo.session.flush()
+
+
+@contextmanager
+def out_of_band(repo: Repository, pid: str) -> Iterator[None]:
+    """Simulate a change to Stage 5 inputs made *outside* the application in Stage 6 (e.g. a
+    direct database write, which the threat model does not exclude). Since the review of
+    PR #13 (finding 5) the application refuses such changes from Stage 6 on; the tests using
+    this helper check that the audit, the evidence package and syntheses still *detect* them."""
+    project = repo.get_project(pid)
+    phase = project.phase
+    project.phase = Phase.STAGE5_META_ANALYSIS.value
+    repo.session.flush()
+    try:
+        yield
+    finally:
+        project.phase = phase
+        repo.session.flush()
 
 
 def human(repo: Repository, rid: str) -> Actor:

@@ -44,6 +44,7 @@ from tests.manuscript_helpers import (
     decide_item,
     decide_swim,
     human,
+    out_of_band,
     save_grade,
     save_group,
     seen,
@@ -179,15 +180,16 @@ def test_synthesis_saved_on_outdated_evidence_is_refused(session: Session) -> No
     rs = ReportingService(repo, "mc1")
     body = _group(repo, rid)
     preview = rs.preview_group(body)  # what the reviewer saw
-    link_reports_to_study(
-        repo,
-        "mc1",
-        ["t1", "t2"],
-        study_id="study-t1",
-        primary_record_id="t1",
-        reviewer=repo.require_active_reviewer(rid),
-        note="synthetic: changed after the preview",
-    )
+    with out_of_band(repo, "mc1"):
+        link_reports_to_study(
+            repo,
+            "mc1",
+            ["t1", "t2"],
+            study_id="study-t1",
+            primary_record_id="t1",
+            reviewer=repo.require_active_reviewer(rid),
+            note="synthetic: changed after the preview",
+        )
     shown = {k: preview[k] for k in ("inputs_sha256", "based_on_revision_id")}
     with pytest.raises(SysRevError, match=STALE):
         rs.save_group(shown | body, reviewer_id=rid, reviewer_name=REVIEWER)
@@ -336,13 +338,14 @@ def test_participant_overlap_makes_studies_one_voting_unit(session: Session) -> 
         signals=[OverlapSignal(kind="coauthor_overlap", score=0.8, detail="synthetic")],
     )
     repo.save_overlap_warning("mc1", warning)
-    repo.resolve_overlap_warning(
-        "mc1",
-        warning.warning_id,
-        resolution=OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
-        reviewer_id=rid,
-        note="synthetic: shared participants",
-    )
+    with out_of_band(repo, "mc1"):
+        repo.resolve_overlap_warning(
+            "mc1",
+            warning.warning_id,
+            resolution=OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
+            reviewer_id=rid,
+            note="synthetic: shared participants",
+        )
     rs = ReportingService(repo, "mc1")
     body = _group(repo, rid, summary="The trials favoured the intervention.")
     body["findings"].append(_second_finding(repo, "t3"))

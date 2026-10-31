@@ -155,6 +155,9 @@ def test_refresh_preview_and_stale_activation_is_refused(env: Env) -> None:
 
 # --------------------------------------------------------------------------- study links
 def test_study_link_from_an_old_screen_is_refused(env: Env) -> None:
+    with env.other() as s:  # links are Stage 5 inputs: changeable while Stage 5 can re-run
+        Repository(s).get_project(PID).phase = Phase.STAGE5_META_ANALYSIS.value
+        s.commit()
     at = env.app("Corrections, links & double counting")
     widget(at, "multiselect", "Reports of one study").set_value(["t1", "t2"])
     widget(at, "text_input", "Study id (letters, digits, . _ : -)").input("S-one")
@@ -216,6 +219,7 @@ def test_plan_draft_and_approval_from_the_displayed_draft_only(env: Env) -> None
             rationale="other tab",
             reviewer=repo.require_active_reviewer(env.rid),
             expected_latest_sha256=state["latest_sha256"],
+            expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
         )
         s.commit()
     click(at, "Approve this draft (authenticated)")
@@ -366,7 +370,7 @@ def _fill_correction(at: Any) -> None:
 def test_value_correction_with_evidence_invalidates_the_arm_and_refuses_stale_screens(
     stage4: Env,
 ) -> None:
-    from src.extraction import item_state_sha256, revise_reviewed_item
+    from src.extraction import correction_state_sha256, revise_reviewed_item
     from tests.unit.test_master_table import km
 
     at = stage4.app("Corrections, links & double counting")
@@ -393,7 +397,7 @@ def test_value_correction_with_evidence_invalidates_the_arm_and_refuses_stale_sc
             doc,
             reviewer=repo.require_active_reviewer(stage4.rid),
             note="reverted after discussion",
-            expected_state_sha256=item_state_sha256(current),
+            expected_state_sha256=correction_state_sha256(repo, PID, current),
         )
         s.commit()
         versions = len(repo.load_extraction_items(PID, include_superseded=True))
@@ -402,3 +406,72 @@ def test_value_correction_with_evidence_invalidates_the_arm_and_refuses_stale_sc
     assert any("has changed" in e for e in errors(at)), errors(at)
     with stage4.other() as s:
         assert len(Repository(s).load_extraction_items(PID, include_superseded=True)) == versions
+
+
+# --------------------------------------------------------------------------- PR #13 finding 3
+def test_plan_approval_from_a_screen_of_the_old_protocol_is_refused_until_reload(
+    env: Env,
+) -> None:
+    with env.other() as s:  # Stage 4 with a displayed draft
+        repo = Repository(s)
+        repo.get_project(PID).phase = Phase.STAGE4_EXTRACTION_ROB.value
+        state = plan_service.plan_state(repo, PID)
+        plan_service.save_draft(
+            repo,
+            PID,
+            [AnalysisSpec(analysis_id="or", outcome_id="complication", effect_measure="OR")],
+            rationale="odds ratio",
+            reviewer=repo.require_active_reviewer(env.rid),
+            expected_latest_sha256=state["latest_sha256"],
+            expected_protocol_sha256=state["protocol_sha256"],
+        )
+        s.commit()
+    at = env.app("Analysis plan")
+    assert any("protocol version 1" in c.value for c in at.caption)
+    with env.other() as s:  # another reviewer narrows the outcome definition (same id)
+        repo = Repository(s)
+        reviewer = repo.require_active_reviewer(env.rid)
+        base = repo.latest_protocol(PID)
+        assert base is not None
+        data = base.model_dump(mode="json")
+        data["outcomes"][0]["name"] = "Serious complication requiring re-operation"
+        p = amendments.propose(
+            repo,
+            PID,
+            data,
+            rationale="narrowed",
+            reviewer=reviewer,
+            expected_base_sha256=editor.protocol_sha256(base),
+        )
+        amendments.decide(
+            repo,
+            PID,
+            p.amendment_id,
+            "approved",
+            reviewer=reviewer,
+            comments="ok",
+            expected_sha256=p.sha256,
+        )
+        s.commit()
+        n_plans = len(plan_service.list_plans(repo, PID))
+
+    def plan_obligation() -> str:
+        with env.other() as s:
+            return str(
+                next(
+                    o["state"]
+                    for o in amendments.obligation_status(Repository(s), PID)
+                    if o["area"] == "analysis_plans"
+                )
+            )
+
+    click(at, "Approve this draft (authenticated)")
+    assert any("has changed" in e for e in errors(at)), errors(at)
+    with env.other() as s:
+        assert len(plan_service.list_plans(Repository(s), PID)) == n_plans  # nothing stored
+    assert plan_obligation() == "open"
+    click(at, "Reload the current state")  # explicit reload: the amended definitions are shown
+    assert any("protocol version 2" in c.value for c in at.caption)
+    click(at, "Approve this draft (authenticated)")
+    assert any("Plan approved" in m for m in successes(at)), errors(at)
+    assert plan_obligation() == "resolved"

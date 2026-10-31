@@ -50,7 +50,7 @@ class DecisionBody(RevisionBody):
 
 
 class ResolutionBody(_Body):
-    resolution: Literal["confirmed", "revised", "not_applicable"]
+    resolution: Literal["confirmed", "revised", "not_applicable", "withdrawn"]
     note: str = Field(min_length=1)
     verdict: ScreeningVerdict | None = None
     exclusion_reason: str | None = None

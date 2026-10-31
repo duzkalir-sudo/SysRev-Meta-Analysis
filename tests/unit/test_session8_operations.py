@@ -17,8 +17,8 @@ from src.extraction import (
     ReviewError,
     StaleStateError,
     build_arms,
+    correction_state_sha256,
     double_counting_state_sha256,
-    item_state_sha256,
     link_reports_to_study,
     links_state_sha256,
     resolve_double_counting,
@@ -61,7 +61,7 @@ def test_correcting_an_accepted_value_invalidates_its_arm_and_keeps_history(
     _stage4(repo)
     estimate = items[0]
     assert repo.build_guard_context(PID).included_reports_without_extraction == 2
-    shown = item_state_sha256(repo.get_extraction_item(PID, estimate.item_id))
+    shown = correction_state_sha256(repo, PID, repo.get_extraction_item(PID, estimate.item_id))
     new, invalidated = revise_reviewed_item(
         repo,
         PID,
@@ -117,8 +117,8 @@ def test_correction_from_a_stale_screen_or_late_phase_is_refused(project: Projec
             project.doc("r1"),
             reviewer=project.reviewer,
             note="x",
-            expected_state_sha256=item_state_sha256(
-                repo.get_extraction_item(PID, items[0].item_id)
+            expected_state_sha256=correction_state_sha256(
+                repo, PID, repo.get_extraction_item(PID, items[0].item_id)
             ),
         )
     repo.get_project(PID).phase = Phase.STAGE5_META_ANALYSIS.value
@@ -131,8 +131,8 @@ def test_correction_from_a_stale_screen_or_late_phase_is_refused(project: Projec
             project.doc("r1"),
             reviewer=project.reviewer,
             note="x",
-            expected_state_sha256=item_state_sha256(
-                repo.get_extraction_item(PID, items[0].item_id)
+            expected_state_sha256=correction_state_sha256(
+                repo, PID, repo.get_extraction_item(PID, items[0].item_id)
             ),
         )
 
@@ -186,8 +186,9 @@ def test_links_are_bound_to_the_displayed_state_and_keep_history(project: Projec
     assert history == [("r1", "linked"), ("r2", "linked"), ("r2", "relinked"), ("r1", "unlinked")]
 
 
-def test_link_changes_make_statistics_stale(session: Session) -> None:
+def test_link_changes_in_stage5_make_statistics_stale_and_rerunnable(session: Session) -> None:
     repo, rid, _ = comparative_project(session)
+    repo.get_project("mc1").phase = Phase.STAGE5_META_ANALYSIS.value  # recomputation possible
     assert repo.stats_output_problems("mc1") == []
     reviewer = repo.require_active_reviewer(rid)
     link_reports_to_study(
@@ -262,6 +263,7 @@ def test_plan_drafts_revisions_and_bound_approval(session: Session) -> None:
         rationale="OR as sensitivity",
         reviewer=reviewer,
         expected_latest_sha256=state["latest_sha256"],
+        expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
     )
     with pytest.raises(StaleStateError):  # the earlier screen did not show this draft
         plan_service.save_draft(
@@ -271,6 +273,7 @@ def test_plan_drafts_revisions_and_bound_approval(session: Session) -> None:
             rationale=None,
             reviewer=reviewer,
             expected_latest_sha256=state["latest_sha256"],
+            expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
         )
     revised = plan_service.save_draft(
         repo,
@@ -279,6 +282,7 @@ def test_plan_drafts_revisions_and_bound_approval(session: Session) -> None:
         rationale="Wald",
         reviewer=reviewer,
         expected_latest_sha256=draft.sha256(),
+        expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
     )
     assert revised.version == draft.version + 1 and revised.status == "draft"
     with pytest.raises(StaleStateError):  # approving the older draft that was displayed
@@ -289,6 +293,7 @@ def test_plan_drafts_revisions_and_bound_approval(session: Session) -> None:
             reviewer=reviewer,
             expected_sha256=draft.sha256(),
             expected_latest_sha256=draft.sha256(),
+            expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
         )
     approved = plan_service.approve_draft(
         repo,
@@ -297,6 +302,7 @@ def test_plan_drafts_revisions_and_bound_approval(session: Session) -> None:
         reviewer=reviewer,
         expected_sha256=revised.sha256(),
         expected_latest_sha256=revised.sha256(),
+        expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
     )
     assert approved.status == "approved" and approved.approved_reviewer_id == rid
     assert any("plan" in p for p in repo.stats_output_problems("mc1"))  # stats now stale
@@ -316,6 +322,7 @@ def test_plan_approval_after_stage5_is_refused(session: Session) -> None:
         rationale=None,
         reviewer=reviewer,
         expected_latest_sha256=state["latest_sha256"],
+        expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
     )
     with pytest.raises(SysRevError, match="no route back"):
         plan_service.approve_draft(
@@ -325,5 +332,6 @@ def test_plan_approval_after_stage5_is_refused(session: Session) -> None:
             reviewer=reviewer,
             expected_sha256=draft.sha256(),
             expected_latest_sha256=draft.sha256(),
+            expected_protocol_sha256=plan_service.protocol_basis(repo, "mc1")[0],
         )
     assert repo.stats_output_problems("mc1") == []  # nothing changed

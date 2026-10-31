@@ -23,8 +23,10 @@ from src.extraction import (
     ProposedValue,
     accept_item,
     approve_rob,
+    arms_state_sha256,
     build_arms,
     correct_item,
+    correction_state_sha256,
     double_counting_state_sha256,
     export_csv,
     export_json,
@@ -36,7 +38,9 @@ from src.extraction import (
     reject_item,
     resolve_double_counting,
     revise_reviewed_item,
+    source_state,
     unlink_reports,
+    withdraw_arms,
 )
 from src.fulltext import (
     DocumentStore,
@@ -87,9 +91,15 @@ class CorrectionBody(_Body):
     correction: ProposedValue
     note: str = Field(min_length=1)
     attest_unverifiable: bool = False
-    # Session 8: hash of the item as displayed (``state_sha256`` of GET /extraction/items).
-    # Required to correct an already reviewed value; optional for pending items (legacy).
-    expected_state_sha256: str | None = None
+    # Hash of the item *and its linked PDF/identity confirmation* as displayed (``state_sha256``
+    # of GET /extraction/items). Required (review of PR #13, finding 1): a correction made on an
+    # older screen is never bound to evidence fetched afterwards.
+    expected_state_sha256: str = Field(min_length=64, max_length=64)
+
+
+class WithdrawArmsBody(_Body):
+    reason: str = Field(min_length=1)
+    expected_state_sha256: str = Field(min_length=64, max_length=64)
 
 
 class StudyLinkBody(_Body):
@@ -110,11 +120,13 @@ class PlanDraftBody(_Body):
     analyses: list[AnalysisSpec] = Field(min_length=1)
     rationale: str | None = None
     expected_latest_sha256: str | None  # explicit null only when no plan exists yet
+    expected_protocol_sha256: str = Field(min_length=64, max_length=64)  # GET /stats/plans
 
 
 class PlanApprovalBody(_Body):
     expected_sha256: str = Field(min_length=64, max_length=64)
     expected_latest_sha256: str = Field(min_length=64, max_length=64)
+    expected_protocol_sha256: str = Field(min_length=64, max_length=64)
 
 
 class UnavailabilityBody(_Body):
@@ -144,6 +156,9 @@ class RoBApprovalBody(_Body):
 class AnalysisPlanBody(_Body):
     analyses: list[AnalysisSpec] = Field(min_length=1)
     rationale: str | None = None
+    # Legacy direct approval (no draft screen). When sent, the protocol must be unchanged. An
+    # approval through this endpoint never closes an amendment's plan re-review by itself.
+    expected_protocol_sha256: str | None = None
 
 
 def _call(fn: Callable[[], T]) -> T:
@@ -285,10 +300,18 @@ def build_review_router(store: DocumentStore) -> APIRouter:
     def items(
         project_id: str, session: SessionDep, include_superseded: bool = False
     ) -> list[dict[str, Any]]:
-        rows = Repository(session).load_extraction_items(
-            project_id, include_superseded=include_superseded
-        )
-        return [i.model_dump(mode="json") | {"state_sha256": item_state_sha256(i)} for i in rows]
+        repo = Repository(session)
+        rows = repo.load_extraction_items(project_id, include_superseded=include_superseded)
+        sources = {rid: source_state(repo, project_id, rid) for rid in {i.record_id for i in rows}}
+        return [
+            i.model_dump(mode="json")
+            | {
+                "item_state_sha256": item_state_sha256(i),
+                "state_sha256": correction_state_sha256(repo, project_id, i),
+                "source": sources[i.record_id],
+            }
+            for i in rows
+        ]
 
     @router.get("/extraction/items/{item_id}/history")
     def history(project_id: str, item_id: str, session: SessionDep) -> list[dict[str, Any]]:
@@ -325,11 +348,6 @@ def build_review_router(store: DocumentStore) -> APIRouter:
                     note=body.note, attest_unverifiable=body.attest_unverifiable,
                     expected_state_sha256=body.expected_state_sha256,
                 )  # fmt: skip
-            if body.expected_state_sha256 is None:
-                raise ValueError(
-                    "correcting a reviewed value requires expected_state_sha256 (the state "
-                    "of the item as displayed)"
-                )
             new, invalidated = revise_reviewed_item(
                 repo, project_id, item_id, body.correction, doc, reviewer=reviewer,
                 note=body.note, attest_unverifiable=body.attest_unverifiable,
@@ -350,6 +368,34 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         repo = Repository(session)
         built = _call(lambda: build_arms(repo, project_id, record_id, reviewer=reviewer))
         return [a.model_dump(mode="json") for a in built]
+
+    @router.get("/extraction/records/{record_id}/arms-state")
+    def arms_state(project_id: str, record_id: str, session: SessionDep) -> dict[str, Any]:
+        repo = Repository(session)
+        _call(lambda: repo.get_record(project_id, record_id))
+        return {
+            "record_id": record_id,
+            "arms": [
+                a.model_dump(mode="json")
+                for a in repo.load_extracted_arms(project_id)
+                if a.record_id == record_id
+            ],
+            "included": record_id in repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT),
+            "state_sha256": arms_state_sha256(repo, project_id, record_id),
+        }
+
+    @router.post("/extraction/records/{record_id}/withdraw-arms")
+    def withdraw(project_id: str, record_id: str, body: WithdrawArmsBody, session: SessionDep,
+                 reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
+        """Retire the arms of a report no longer included at full text (finding 4)."""
+        repo = Repository(session)
+        arms = _call(
+            lambda: withdraw_arms(
+                repo, project_id, record_id, reviewer=reviewer, reason=body.reason,
+                expected_state_sha256=body.expected_state_sha256,
+            )
+        )  # fmt: skip
+        return {"withdrawn_arms": arms}
 
     @router.post("/extraction/records/{record_id}/unavailability",
                  status_code=status.HTTP_201_CREATED)  # fmt: skip
@@ -489,6 +535,10 @@ def build_review_router(store: DocumentStore) -> APIRouter:
                      reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
         """The authenticated reviewer approves an analysis plan (a new append-only version)."""
         repo = Repository(session)
+        if body.expected_protocol_sha256 is not None:
+            repo.lock_project(project_id)
+            _call(lambda: plan_service._check_protocol(
+                repo, project_id, body.expected_protocol_sha256))  # fmt: skip
         previous = repo.latest_analysis_plan(project_id, approved_only=False)
         plan = _call(
             lambda: AnalysisPlan(
@@ -517,6 +567,7 @@ def build_review_router(store: DocumentStore) -> APIRouter:
             lambda: plan_service.save_draft(
                 repo, project_id, body.analyses, rationale=body.rationale, reviewer=reviewer,
                 expected_latest_sha256=body.expected_latest_sha256,
+                expected_protocol_sha256=body.expected_protocol_sha256,
             )
         )  # fmt: skip
         return draft.model_dump(mode="json") | {
@@ -538,6 +589,7 @@ def build_review_router(store: DocumentStore) -> APIRouter:
                 repo, project_id, plan_id, reviewer=reviewer,
                 expected_sha256=body.expected_sha256,
                 expected_latest_sha256=body.expected_latest_sha256,
+                expected_protocol_sha256=body.expected_protocol_sha256,
             )
         )  # fmt: skip
         return plan.model_dump(mode="json") | {"sha256": plan.sha256()}

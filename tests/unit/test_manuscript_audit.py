@@ -581,12 +581,15 @@ def test_stale_audits_never_authorise_newer_versions(ms: Ctx) -> None:
 
 
 def test_changed_extraction_data_invalidates(ms: Ctx) -> None:
+    from tests.manuscript_helpers import out_of_band
     from tests.stats_helpers import LAST_FU, stats_arm
 
     ms.svc.audit()
-    ms.repo.save_extracted_arm(
-        ms.pid, stats_arm("s1", "control_crude", follow_up=LAST_FU, events="20", n_analyzed="25")
-    )
+    with out_of_band(ms.repo, ms.pid):
+        ms.repo.save_extracted_arm(
+            ms.pid,
+            stats_arm("s1", "control_crude", follow_up=LAST_FU, events="20", n_analyzed="25"),
+        )
     problems = completion_problems(ms.repo, ms.pid)
     assert any("evidence package unavailable" in p for p in problems)
     with pytest.raises(SysRevError, match="re-run"):

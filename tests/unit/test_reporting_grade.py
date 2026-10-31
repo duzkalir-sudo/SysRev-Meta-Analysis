@@ -30,6 +30,7 @@ from tests.manuscript_helpers import (
     confirm_checklists,
     decide_swim,
     human,
+    out_of_band,
     save_grade,
     save_group,
     single_arm_project,
@@ -549,15 +550,16 @@ def test_directions_need_a_comparison_and_consistent_claims(session: Session) ->
 def test_changed_study_links_invalidate_an_approved_synthesis(session: Session) -> None:
     repo, rid, rs = _comp(session)
     save_group(rs, _group(repo, rid), rid)
-    link_reports_to_study(
-        repo,
-        "mc1",
-        ["t1", "t2"],
-        study_id="study-t1",
-        primary_record_id="t1",
-        reviewer=repo.require_active_reviewer(rid),
-        note="synthetic",
-    )
+    with out_of_band(repo, "mc1"):
+        link_reports_to_study(
+            repo,
+            "mc1",
+            ["t1", "t2"],
+            study_id="study-t1",
+            primary_record_id="t1",
+            reviewer=repo.require_active_reviewer(rid),
+            note="synthetic",
+        )
     protocol = repo.latest_protocol("mc1")
     assert protocol is not None
     assert synthesis_entries(repo, "mc1", protocol)["g1"].status == "stale"

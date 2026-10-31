@@ -180,7 +180,7 @@ class ObligationResolution(StrictModel):
     area: ObligationArea
     subject: str
     stage: ScreeningStage | None = None
-    resolution: Literal["confirmed", "revised", "not_applicable"]
+    resolution: Literal["confirmed", "revised", "not_applicable", "withdrawn"]
     verdict: ScreeningVerdict | None = None  # for a revised screening verdict
     exclusion_reason: str | None = None
     note: NonEmptyStr
@@ -284,18 +284,24 @@ def compute_obligations(
             ))  # fmt: skip
     changed = _changed_outcomes(base, new)
     if changed:
+        # Every report whose data for a changed outcome exist — as extraction items *or* as
+        # approved arms (arms may exist without items, e.g. entered before the Master
+        # Extraction Table was used). Review of PR #13, finding 2.
         pairs = sorted({
             (i.record_id, i.outcome_id) for i in repo.load_extraction_items(project_id)
             if i.outcome_id in changed and i.review_status != ReviewStatus.SUPERSEDED
+        } | {
+            (a.record_id, a.outcome_id) for a in repo.load_extracted_arms(project_id)
+            if a.outcome_id in changed
         })  # fmt: skip
         for rid, outcome in pairs:
             assert outcome is not None
             out.append(Obligation(
                 obligation_id=oid("ex", rid, outcome), area="extraction",
                 subject=f"{rid}|{outcome}",
-                reason=f"outcome {outcome} was changed or removed: re-check the extracted data "
-                "of this report against the amended definition (correct values with the "
-                "correction workflow), then resolve",
+                reason=f"outcome {outcome} was changed or removed: re-check whether this "
+                "report's data meet the amended definition — confirm them, correct them "
+                "(then 'revised'), or withdraw them for this outcome",
             ))  # fmt: skip
         plan = repo.latest_analysis_plan(project_id)
         if plan is not None and any(s.outcome_id in changed for s in plan.analyses):
@@ -323,6 +329,7 @@ def obligation_status(repo: Repository, project_id: str) -> list[dict[str, Any]]
     runs = repo.load_search_runs(project_id)
     resolved = {r.obligation_id: r for r in resolutions(repo, project_id)}
     approved_plan = repo.latest_analysis_plan(project_id)
+    bases = repo.governance_records(project_id, "plan_approval_basis")
     rows = []
     for d in decisions(repo, project_id):
         if d.decision != "approved":
@@ -340,14 +347,27 @@ def obligation_status(repo: Repository, project_id: str) -> list[dict[str, Any]]
                 ob.area == "analysis_plans"
                 and approved_plan is not None
                 and approved_plan.plan_id != ob.subject
-                and approved_plan.approved_at is not None
-                and approved_plan.approved_at > d.decided_at
+                and _bound_to_protocol(bases, approved_plan.plan_id, d.protocol_version)
             ):
-                state, detail = "resolved", f"plan version {approved_plan.version} approved later"
+                state, detail = (
+                    "resolved",
+                    f"plan version {approved_plan.version} approved from a screen showing "
+                    f"protocol version {d.protocol_version} or later",
+                )
             rows.append(ob.model_dump(mode="json") | {
                 "amendment_id": d.amendment_id, "state": state, "detail": detail,
             })  # fmt: skip
     return rows
+
+
+def _bound_to_protocol(bases: list[dict[str, Any]], plan_id: str, version: int | None) -> bool:
+    """A plan approval closes a plan re-review only if it was made from a screen bound to the
+    amended protocol (``plan_approval_basis``, review of PR #13, finding 3). Approvals without
+    a recorded basis (the legacy direct endpoint) need an explicit confirmation."""
+    return version is not None and any(
+        b.get("plan_id") == plan_id and int(str(b.get("protocol_version", 0))) >= version
+        for b in bases
+    )
 
 
 def amendment_problems(repo: Repository, project_id: str) -> list[str]:
@@ -615,7 +635,7 @@ def resolve(
     repo: Repository,
     project_id: str,
     obligation_id: str,
-    resolution: Literal["confirmed", "revised", "not_applicable"],
+    resolution: Literal["confirmed", "revised", "not_applicable", "withdrawn"],
     *,
     reviewer: Reviewer,
     note: str,
@@ -649,6 +669,10 @@ def resolve(
         raise AmendmentError("a verdict is recorded only for a revised screening decision")
     if resolution == "not_applicable" and screening:
         raise AmendmentError("a screening re-review is confirmed or revised")
+    if row["area"] == "extraction":
+        _check_extraction_resolution(repo, project_id, row, resolution, active, note)
+    elif resolution == "withdrawn":
+        raise AmendmentError("only extraction data are withdrawn")
     if row["area"] == "analysis_plans" and resolution == "confirmed":
         from src.stats_engine.plan_service import plan_problems
 
@@ -669,6 +693,56 @@ def resolve(
         reviewer_id=active.id,
     )  # fmt: skip
     return res
+
+
+def _check_extraction_resolution(
+    repo: Repository,
+    project_id: str,
+    row: dict[str, Any],
+    resolution: str,
+    reviewer: Any,
+    note: str,
+) -> None:
+    """What each extraction resolution requires (review of PR #13, findings 2 and 4):
+
+    * ``confirmed`` — the reviewer attests that the existing data meet the amended definition;
+    * ``revised`` — only once no active arm for this report and outcome predates the amendment
+      (the values were corrected, which invalidates and rebuilds the arms);
+    * ``withdrawn`` — the data do not meet the amended definition: the report is recorded as
+      unavailable for this outcome (append-only ``QuantitativeUnavailability``; the arms and
+      evidence stay stored and the statistics ledger lists the reason);
+    * ``not_applicable`` — only when the outcome is no longer in the protocol.
+    """
+    from src.extraction.master_table import record_unavailability
+
+    record_id, outcome = str(row["subject"]).split("|", 1)
+    decision = next(d for d in decisions(repo, project_id) if d.amendment_id == row["amendment_id"])
+    protocol = repo.latest_protocol(project_id)
+    defined = protocol is not None and outcome in {o.outcome_id for o in protocol.outcomes}
+    arms = [
+        a for a in repo.load_extracted_arms(project_id)
+        if a.record_id == record_id and a.outcome_id == outcome
+    ]  # fmt: skip
+    if resolution == "not_applicable" and defined:
+        raise AmendmentError(
+            f"outcome {outcome} is still in the protocol: confirm, revise or withdraw the data"
+        )
+    if resolution == "revised":
+        older = [a.arm_id for a in arms
+                 if a.approved_at is None or a.approved_at <= decision.decided_at]  # fmt: skip
+        if older:
+            raise AmendmentError(
+                f"{len(older)} arm(s) of {record_id} for {outcome} predate the amendment: "
+                "correct the values first (the arms are invalidated and rebuilt), or confirm "
+                "or withdraw the data"
+            )
+    if resolution == "withdrawn":
+        record_unavailability(
+            repo, project_id, record_id, reviewer=reviewer, reason_code="other",
+            reason=f"does not meet the amended definition of {outcome} (protocol amendment "
+            f"{str(row['amendment_id'])[:12]}): {note}",
+            outcome_id=outcome,
+        )  # fmt: skip
 
 
 def state(repo: Repository, project_id: str) -> dict[str, Any]:

@@ -7,6 +7,14 @@ the screen shown: the request carries the hash of the draft displayed and of the
 stored plan version, and is refused (nothing saved) if either has changed — for example when
 another reviewer saved a newer draft or approved a plan in the meantime.
 
+Review of PR #13 (finding 3): the screen is also bound to the **protocol** it was composed
+against (``protocol_sha256``: the approved protocol, including every outcome definition). An
+amendment approved after the screen was loaded — e.g. a narrowed outcome that keeps its id —
+makes draft saves and approvals from that screen fail with nothing stored, until the reviewer
+reloads and reviews the current definitions. Each bound approval is recorded
+(``plan_approval_basis``: plan, protocol hash and version) so that only such an approval can
+close a plan re-review required by a protocol amendment.
+
 A newly approved plan makes any statistics output computed from an earlier plan stale
 (:meth:`Repository.stats_output_problems`), so Stage 5 must be re-run before Stage 6. Approval
 is refused once Stage 6 has been reached (no route back to re-run Stage 5).
@@ -50,11 +58,34 @@ def plan_problems(repo: Repository, project_id: str, analyses: list[AnalysisSpec
     return out
 
 
+def protocol_basis(repo: Repository, project_id: str) -> tuple[str | None, int | None]:
+    """(hash, version) of the current protocol; ``(None, None)`` before one exists."""
+    from src.search.protocol_editor import protocol_sha256
+
+    protocol = repo.latest_protocol(project_id)
+    if protocol is None:
+        return None, None
+    return protocol_sha256(protocol), protocol.version
+
+
+def _check_protocol(repo: Repository, project_id: str, expected: str | None) -> tuple[str, int]:
+    sha, version = protocol_basis(repo, project_id)
+    if sha is None or version is None:
+        raise StaleStateError("no protocol: an analysis plan needs protocol outcomes")
+    check_expected(sha, expected or "", "the protocol (outcome definitions)")
+    return sha, version
+
+
 def plan_state(repo: Repository, project_id: str) -> dict[str, Any]:
     plans = list_plans(repo, project_id)
     latest = plans[-1] if plans else None
     approved = next((p for p in reversed(plans) if p.status == "approved"), None)
+    protocol = repo.latest_protocol(project_id)
+    sha, version = protocol_basis(repo, project_id)
     return {
+        "protocol_sha256": sha,
+        "protocol_version": version,
+        "outcomes": [o.model_dump(mode="json") for o in protocol.outcomes] if protocol else [],
         "plans": [p.model_dump(mode="json") | {"sha256": p.sha256()} for p in plans],
         "latest_sha256": latest.sha256() if latest else None,
         "latest_approved_sha256": approved.sha256() if approved else None,
@@ -79,10 +110,12 @@ def save_draft(
     rationale: str | None,
     reviewer: ReviewerORM,
     expected_latest_sha256: str | None,
+    expected_protocol_sha256: str,
 ) -> AnalysisPlan:
     """A new draft version (the first, or a revision of what the reviewer saw)."""
     reviewer = repo.require_active_reviewer(reviewer.id)
     repo.lock_project(project_id)
+    _check_protocol(repo, project_id, expected_protocol_sha256)
     latest = _latest_sha(repo, project_id)
     if latest != expected_latest_sha256:
         raise StaleStateError(
@@ -108,9 +141,11 @@ def approve_draft(
     reviewer: ReviewerORM,
     expected_sha256: str,
     expected_latest_sha256: str,
+    expected_protocol_sha256: str,
 ) -> AnalysisPlan:
     reviewer = repo.require_active_reviewer(reviewer.id)
     repo.lock_project(project_id)
+    protocol_sha, protocol_version = _check_protocol(repo, project_id, expected_protocol_sha256)
     plans = list_plans(repo, project_id)
     draft = next((p for p in plans if p.plan_id == plan_id and p.status == "draft"), None)
     if draft is None:
@@ -129,4 +164,11 @@ def approve_draft(
         }
     )
     repo.save_analysis_plan(project_id, approved)
+    repo.add_governance_record(
+        project_id, "plan_approval_basis", approved.plan_id,
+        {"plan_id": approved.plan_id, "version": approved.version,
+         "plan_sha256": approved.sha256(), "protocol_sha256": protocol_sha,
+         "protocol_version": protocol_version},
+        reviewer_id=reviewer.id,
+    )  # fmt: skip
     return approved

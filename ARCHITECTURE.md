@@ -1317,6 +1317,41 @@ re-executing an identical strategy (amend its dates, which creates a new strateg
 | Provider batch processing | **Deferred** | Needs asynchronous submission, polling, result reconciliation with the audit trail and persisted results, cancellation semantics and live verification of result formats; the 50 % list discount would have to be recorded from actual billing. Not justified without live testing |
 | Adaptive model/effort routing | **Not implemented** (by design) | Requires explicit configuration and benchmarks against a human-verified reference set, which do not exist; user-selected models and efforts are never changed |
 
+**Review of PR #13 (independent review of commit 4748b58): five fixes.**
+
+1. *Corrections bound to the PDF displayed.* `correction_state_sha256` covers the item **and** its
+   linked PDF (SHA-256, stored filename), identity-check status, notes and human confirmation
+   (`source_state`). `GET /extraction/items` returns it with the `source` shown; the correction
+   endpoint requires it (422 without), and `correct_item` / `revise_reviewed_item` re-check it
+   under the write lock before saving. A replaced PDF or a changed confirmation gives 409 with
+   nothing stored; a correction is never bound to evidence fetched after the screen was loaded.
+2. *Outcome amendments and approved arms.* Re-review obligations are derived from extraction
+   items **and** active arms, so every report with data for a changed outcome must be
+   re-reviewed. Resolutions: `confirmed` (the data meet the amended definition), `revised` (only
+   once no active arm predates the amendment, i.e. the values were corrected and arms rebuilt),
+   `withdrawn` (recorded as `QuantitativeUnavailability` for that outcome, reason code `other`;
+   data and evidence stay stored), `not_applicable` (only for an outcome removed from the
+   protocol). A plan confirmation or a changed statistics hash never resolves them.
+3. *Plan screens bound to the protocol.* `GET /stats/plans` returns `protocol_sha256`,
+   `protocol_version` and the outcome definitions; draft saves and approvals require
+   `expected_protocol_sha256` and are refused (409, nothing stored) after an intervening
+   amendment until the reviewer reloads. The UI composes from the frozen outcome definitions.
+   Bound approvals record `plan_approval_basis` (plan, protocol hash and version); only such an
+   approval made against the amended protocol version closes a plan re-review. The legacy
+   `POST /stats/plan` accepts an optional `expected_protocol_sha256` and never closes one.
+4. *Withdrawing arms of reports no longer included.* `withdraw_arms`
+   (`POST /extraction/records/{id}/withdraw-arms`, reviewer token, bound to
+   `GET …/arms-state`) retires the active arms of a report excluded at full text (e.g. on
+   re-review after an eligibility amendment), in Stage 4 or at Gate 3. The arms stay stored; an
+   `arm_invalidation` record of kind `withdrawal` names the reviewer and reason; `build_arms`
+   refuses to rebuild them unless the report is included again. Included reports are corrected
+   or recorded as unavailable instead. Tested through Gate 3, Stage 5 and the statistics run.
+5. *No late changes to Stage 5 inputs.* From Stage 6 on, `Repository.require_stats_inputs_open`
+   refuses, before anything is written, every change to a statistics input: study links (link,
+   re-link, unlink), contribution and unavailability decisions (double counting), arm creation,
+   approval and invalidation, cohort-overlap resolutions and full-text eligibility decisions.
+   In Stage 5 such changes remain allowed and the supported route is to re-run Stage 5 (tested).
+
 **Limitations.** All provider traffic is mocked; no live listing, inference or cost measurement
 was made. The stale-state checks are guaranteed on SQLite only (one writer); on PostgreSQL the
 lock statement locks a row and does not serialise other writers (§9.9). The same enrolled

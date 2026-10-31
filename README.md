@@ -450,6 +450,14 @@ awaiting screening).
    above. To see a stale-screen refusal, open the same page in two browser tabs, decide in one,
    then submit from the other.
 
+**After the independent review of PR #13:** a correction is bound to the PDF shown with it
+(a replaced or re-confirmed PDF makes the screen stale); an outcome amendment requires every
+report with data for that outcome to be re-reviewed (confirm, correct, or withdraw the data for
+the outcome); analysis-plan screens are bound to the protocol version they show; arms of a
+report excluded after an amendment can be withdrawn (tab *Withdraw arms*, Stage 4 / Gate 3); and
+from Stage 6 on, links, double-counting decisions and other statistics inputs can no longer be
+changed, because Stage 5 cannot be re-run then.
+
 ### What is and is not supported (Session 8)
 
 * **Provider facts were verified against the official documentation on 2026-10-31**
