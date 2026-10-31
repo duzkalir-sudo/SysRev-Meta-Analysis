@@ -590,3 +590,58 @@ def test_old_grade_records_cannot_claim_extremely_serious_elsewhere() -> None:
     data.pop("implied_certainty")
     with pytest.raises(ValueError, match="applies only to risk of bias with the ROBINS-I"):
         GradeAssessment.model_validate(data)
+
+
+def _audit_with_summary(session_factory: Any, summary: str) -> tuple[list[str], Any]:
+    """A complete synthetic manuscript whose approved synthesis has ``summary``; returns the
+    unverifiable statements and the audit report."""
+    from src.reporting import synthesis as syn
+    from src.reporting.state import arms_of
+
+    with session_factory() as session:
+        repo, rid, _ = comparative_project(session)
+        rs = ReportingService(repo, "mc1")
+        group = save_group(rs, _group(repo, rid, summary=summary), rid)
+        protocol = repo.latest_protocol("mc1")
+        assert protocol is not None
+        assert syn.summary_problems(group, arms_of(protocol)) == []
+        unverifiable = syn.unverifiable_statements(group, arms_of(protocol))
+        svc = ManuscriptService(repo, "mc1")
+        complete_manuscript(svc, human(repo, rid))
+        decide_swim(rs, "not_applicable", "synthetic: a single tabulated trial", rid)
+        svc.rerender(human(repo, rid))
+        confirm_checklists(repo, "mc1", rid)
+        return unverifiable, svc.audit()
+
+
+@pytest.mark.parametrize(
+    "compound",
+    [
+        "The trial favoured the intervention, and placebo reduced complications.",
+        "The trial favoured the intervention and reduced complications.",
+    ],
+)
+def test_checked_clause_does_not_hide_an_unverifiable_interpretation(compound: str) -> None:
+    def factory() -> Session:
+        engine = make_engine("sqlite:///:memory:")
+        init_db(engine)
+        return make_session_factory(engine)()
+
+    standalone = "Placebo reduced complications."
+    for summary in (standalone, compound):
+        unverifiable, report = _audit_with_summary(factory, summary)
+        assert unverifiable == [summary]  # the interpretation is never exempted
+        review = [
+            f
+            for f in report.findings
+            if f.scope == "reporting"
+            and f.status == CheckStatus.REQUIRES_HUMAN_REVIEW
+            and "neither confirm" in f.message
+        ]
+        assert len(review) == 1 and summary in review[0].message
+        assert report.passed  # it passes only once a human acknowledges the review item
+        assert report.requires_human_review >= 1
+    # a sentence whose only directional claim was checked is not over-flagged
+    only_checked, report = _audit_with_summary(factory, "The trial favoured the intervention.")
+    assert only_checked == []
+    assert not [f for f in report.findings if "neither confirm" in f.message]

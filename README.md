@@ -364,8 +364,10 @@ current syntheses and the SWiM decision. Any relevant change to the manuscript s
 to the evidence makes the affected decisions stale; they are re-confirmed, never repaired.
 Each decision is tied to the screen you saw: if the manuscript, the evidence or the record
 changed after the page was loaded, the decision is refused and nothing is saved — reload,
-review and decide again. A synthesis is saved in two steps (preview the linked evidence, then
-save what you previewed).
+review and decide again. The pages keep the screen you loaded until you press "Reload the
+current state", so a submission always carries what you saw; a warning appears when the stored
+state has changed meanwhile. A synthesis is saved in two steps (preview the linked evidence,
+then save exactly what you previewed).
 
 ### What is and is not validated (Session 7)
 

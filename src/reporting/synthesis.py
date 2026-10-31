@@ -204,18 +204,39 @@ def summary_problems(group: SynthesisGroup, arms: Arms | None = None) -> list[st
     return problems
 
 
+FAVOUR_VERB_RE = re.compile(r"favou?r\w*", re.IGNORECASE)
+
+
 def unverifiable_statements(group: SynthesisGroup, arms: Arms) -> list[str]:
     """Directional wording the structured directions can neither confirm nor contradict
     (e.g. 'X reduced complications', or a favoured side that cannot be identified). These
-    are interpretations: the Auditor routes them to an explicit human review."""
+    are interpretations: the Auditor routes them to an explicit human review.
+
+    A sentence is exempt only if *every* directional cue in it was checked. A favour clause
+    whose side was identified (and so compared with the recorded directions by
+    :func:`summary_problems`) exempts only its own verb: any other directional word in the
+    sentence — including words inside the clause's target phrase — still needs review, so
+    adding a checkable clause never hides an otherwise unchanged interpretation. A negated
+    sentence or an unidentified side always needs review."""
     out: list[str] = []
     for s in _sentences(group.summary):
         if not DIRECTION_RE.search(s):
             continue
-        sides = [arms.side(m.group(1)) for m in FAVOUR_RE.finditer(s)]
-        if sides and all(x is not None for x in sides) and not NEGATION.search(s):
-            continue  # every claim was checked against the recorded directions
-        out.append(s.strip())
+        if NEGATION.search(s):
+            out.append(s.strip())
+            continue
+        residual = list(s)
+        checked_all = True
+        for m in FAVOUR_RE.finditer(s):
+            if arms.side(m.group(1)) is None:
+                checked_all = False
+                break
+            verb = FAVOUR_VERB_RE.search(m.group(0))
+            assert verb is not None
+            for i in range(m.start() + verb.start(), m.start() + verb.end()):
+                residual[i] = " "
+        if not checked_all or DIRECTION_RE.search("".join(residual)):
+            out.append(s.strip())
     return out
 
 

@@ -4,6 +4,16 @@ Summary of Findings, synthesis without meta-analysis and SWiM.
 Every decision is sent to the authenticated reporting API with the reviewer's token; the UI
 never records a decision itself, never pre-fills a GRADE judgement and never offers to mark
 a whole checklist as reported. Read views use the same API.
+
+**Screens are frozen.** Streamlit reruns this script when a form is submitted, so anything
+fetched during that rerun is state the reviewer has *not* seen. Each decision screen
+(a checklist, one GRADE analysis, the synthesis groups, one synthesis preview, the SWiM
+decision) is therefore kept in ``st.session_state`` under a key scoped by project and by
+checklist, analysis, synthesis group or screen. It is rendered from that snapshot, and a
+decision sends only the snapshot's state identifiers; the API refuses them if the stored
+state changed. The snapshot is replaced only by an explicit "Reload the current state" or
+after the reviewer's own successful decision (followed by a rerun, so the display and the
+next submission agree). A live comparison warns when the stored state has moved on.
 """
 
 from __future__ import annotations
@@ -39,6 +49,58 @@ CHECKLIST_LABEL = {
 }
 
 
+RELOAD = "Reload the current state (review it before deciding)"
+CHANGED = (
+    "The stored state changed after this screen was loaded. A decision from this screen will "
+    "be refused: reload, review the updated state, then decide."
+)
+
+
+def _key(pid: str, *scope: str) -> str:
+    return ":".join(("screen", pid, *scope))
+
+
+def _frozen(key: str, fetch: Callable[[], ApiResult]) -> tuple[Any, str | None]:
+    """The screen the reviewer is looking at: fetched once, then kept until an explicit
+    reload (never refreshed by the rerun that processes a submission)."""
+    if key not in st.session_state:
+        res = fetch()
+        if not res.ok:
+            return None, res.error
+        st.session_state[key] = res.data
+    return st.session_state[key], None
+
+
+def _reload_button(key: str) -> None:
+    if st.button(RELOAD, key=f"reload:{key}"):
+        st.session_state.pop(key, None)
+        st.rerun()
+
+
+def _accepted(key: str, message: str) -> None:
+    """After the reviewer's own successful decision: show the new state (rerun) so the next
+    submission is made from what is displayed."""
+    st.session_state.pop(key, None)
+    st.session_state["reporting_flash"] = message
+    st.rerun()
+
+
+def _flash() -> None:
+    message = st.session_state.pop("reporting_flash", None)
+    if message:
+        st.success(message)
+
+
+def _submit(result: ApiResult, show: Show, key: str, message: str) -> None:
+    if result.ok:
+        _accepted(key, message)
+    elif result.status == 409 and "has changed" in (result.error or ""):
+        st.error(f"Refused ({result.status}): {result.error}")
+        st.warning("Nothing was saved. Use the reload button to review the updated state.")
+    else:
+        show(result)
+
+
 def _blockers(be: UIBackend, pid: str) -> None:
     res = be.api.get(f"/projects/{pid}/reporting/status")
     if not res.ok:
@@ -56,12 +118,26 @@ def _blockers(be: UIBackend, pid: str) -> None:
     st.caption(data["note"])
 
 
+def _checklist_ids(data: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        data["manuscript_version"],
+        data["manuscript_sha256"],
+        data["evidence_sha256"],
+        tuple((r["item_id"], (r["decision"] or {}).get("decision_id")) for r in data["items"]),
+    )
+
+
 def checklist_panel(be: UIBackend, pid: str, name: str, token: str | None, show: Show) -> None:
-    res = be.api.get(f"/projects/{pid}/reporting/checklists/{name}")
-    if not res.ok:
-        st.info(res.error)
+    key = _key(pid, "checklist", name)
+    url = f"/projects/{pid}/reporting/checklists/{name}"
+    data, error = _frozen(key, lambda: be.api.get(url))
+    if data is None:
+        st.info(error)
         return
-    data = res.data
+    live = be.api.get(url)
+    if live.ok and _checklist_ids(live.data) != _checklist_ids(data):
+        st.warning(CHANGED)
+    _reload_button(key)
     st.caption(
         f"{data['standard']} · manuscript version {data['manuscript_version']} · {data['note']}"
     )
@@ -93,16 +169,16 @@ def checklist_panel(be: UIBackend, pid: str, name: str, token: str | None, show:
         location = st.text_input("Precise location (e.g. 'Methods, Information sources')")
         justification = st.text_area("Justification (required)")
         if st.form_submit_button("Record decision (authenticated)"):
-            show(
+            _submit(
                 be.api.post(
-                    f"/projects/{pid}/reporting/checklists/{name}/items/{item_id}",
+                    f"{url}/items/{item_id}",
                     token=token,
                     json={
                         "status": status,
                         "section_ids": sections,
                         "location": location,
                         "justification": justification,
-                        # the state this screen displayed: refused if it has changed since
+                        # identifiers of the displayed (frozen) screen, never refetched
                         "based_on_decision_id": (row["decision"] or {}).get("decision_id"),
                         "seen": {
                             k: data[k]
@@ -110,13 +186,13 @@ def checklist_panel(be: UIBackend, pid: str, name: str, token: str | None, show:
                         },
                     },
                 ),
-                "Decision recorded.",
+                show,
+                key,
+                f"Decision on item {item_id} recorded.",
             )
     cols = st.columns(3)
     for col, fmt in zip(cols, ("csv", "docx", "xlsx"), strict=True):
-        exp = be.api.get(
-            f"/projects/{pid}/reporting/checklists/{name}/export", params={"format": fmt}
-        )
+        exp = be.api.get(f"{url}/export", params={"format": fmt})
         if exp.ok:
             col.download_button(f"Download {fmt.upper()}", _bytes(exp), file_name=f"{name}.{fmt}")
 
@@ -137,6 +213,7 @@ def page_prisma(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
         "typed in or repaired. Checklist suggestions only point to candidate locations: "
         "every item needs your decision."
     )
+    _flash()
     _blockers(be, pid)
     variant = st.selectbox(
         "Template variant",
@@ -182,11 +259,13 @@ def page_grade(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
         "never raises certainty, and a missing or non-significant test is not evidence "
         "against publication bias."
     )
+    _flash()
     res = be.api.get(f"/projects/{pid}/reporting/grade")
     if not res.ok:
         st.error(res.error)
         return
     rows = res.data
+    st.caption("Current status of every analysis (live overview):")
     st.dataframe(
         [
             {k: r[k] for k in ("analysis_id", "outcome", "question_type", "status", "stale")}
@@ -196,7 +275,17 @@ def page_grade(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
     if not rows:
         return
     aid = st.selectbox("Outcome analysis", [r["analysis_id"] for r in rows])
-    row = next(r for r in rows if r["analysis_id"] == aid)
+    live = next(r for r in rows if r["analysis_id"] == aid)
+    key = _key(pid, "grade", aid)
+    # the analysis screen the reviewer works on (frozen; reload to review a newer state)
+    row = st.session_state.setdefault(key, live)
+    if (row["inputs_sha256"], row["based_on_assessment_id"]) != (
+        live["inputs_sha256"],
+        live["based_on_assessment_id"],
+    ):
+        st.warning(CHANGED)
+    _reload_button(key)
+    st.caption(f"Record displayed: {row['based_on_assessment_id'] or 'none'}")
     if row["stale"]:
         st.error("The current record was made on inputs that have changed: re-assess or withdraw.")
     for p in row["problems"]:
@@ -281,19 +370,24 @@ def page_grade(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
                             "source": b_source,
                         }
                     ]
-            show(
+            _submit(
                 be.api.post(f"/projects/{pid}/reporting/grade/{aid}", token=token, json=body),
-                "Saved.",
+                show,
+                key,
+                f"GRADE record for {aid} saved.",
             )
     with st.form(f"withdraw_{aid}"):
         why = st.text_input("Reason for withdrawing the current record")
         if st.form_submit_button("Withdraw (authenticated)"):
-            show(
+            _submit(
                 be.api.post(
                     f"/projects/{pid}/reporting/grade/{aid}/withdraw",
                     token=token,
                     json={"reason": why, "based_on_assessment_id": row["based_on_assessment_id"]},
-                )
+                ),
+                show,
+                key,
+                f"GRADE record for {aid} withdrawn.",
             )
     st.subheader("Summary of Findings and evidence summaries (preview)")
     sof = be.api.get(f"/projects/{pid}/reporting/sof")
@@ -312,12 +406,8 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
         "must come from accepted extraction items or approved arms; pooled estimates, "
         "significance-based vote counts and unsupported directional claims are refused."
     )
-    groups = be.api.get(f"/projects/{pid}/reporting/synthesis").data or []
-    for g in groups:
-        with st.expander(f"{g['group_id']} · {g['status']}"):
-            for p in g["problems"]:
-                st.error(p)
-            st.json(g["record"])
+    _flash()
+    _synthesis_groups(be, pid, token, show)
     with be.repo() as repo:
         protocol = repo.latest_protocol(pid)
         arms = [a for a in repo.load_extracted_arms(pid) if a.approved_by_human]
@@ -405,7 +495,7 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
         summary = st.text_area("Narrative summary (SWiM 8)")
         status = st.selectbox("Record as", ["draft", "approved"])
         if st.form_submit_button("Preview the linked evidence (step 1 of 2)"):
-            st.session_state["synthesis_draft"] = {
+            draft = {
                 "group_id": gid,
                 "outcome_id": outcome,
                 "status": status,
@@ -429,62 +519,141 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
                 "selection_rule": selection_rule or None,
                 "summary": summary,
             }
-    draft = st.session_state.get("synthesis_draft")
-    if draft:
-        preview = be.api.post(f"/projects/{pid}/reporting/synthesis/preview", json=draft)
-        if not preview.ok:
-            st.error(preview.error)
-        else:
-            st.markdown("**Linked evidence as it is now (review before saving)**")
-            st.json(preview.data["evidence"])
-            st.caption(f"Independent study units: {preview.data['voting_units']}")
-            for prob in preview.data["problems"]:
-                st.error(prob)
-            if st.button("Save the previewed group (step 2 of 2, authenticated)"):
-                ok = show(
-                    be.api.post(
-                        f"/projects/{pid}/reporting/synthesis",
-                        token=token,
-                        json=draft
-                        | {
-                            "inputs_sha256": preview.data["inputs_sha256"],
-                            "based_on_revision_id": preview.data["based_on_revision_id"],
-                        },
-                    ),
-                    "Saved.",
-                )
-                if ok:
-                    st.session_state.pop("synthesis_draft", None)
+            # step 1: freeze the preview response the reviewer is about to read
+            preview = be.api.post(f"/projects/{pid}/reporting/synthesis/preview", json=draft)
+            gkey = _key(pid, "synthesis", str(draft["group_id"] or "(no id)"))
+            st.session_state[gkey] = {
+                "draft": draft,
+                "preview": preview.data if preview.ok else None,
+                "error": None if preview.ok else preview.error,
+            }
+            st.session_state[_key(pid, "synthesis", "active")] = gkey
+    _synthesis_preview(be, pid, token, show)
     st.subheader("SWiM reporting guideline")
-    swim = be.api.get(f"/projects/{pid}/reporting/swim")
-    if swim.ok:
-        data = swim.data
-        if not data["required"]:
-            st.info("No synthesis without meta-analysis is approved: SWiM is not triggered.")
-            return
-        st.caption(f"Suggestion (you decide): {data['suggestion']}")
-        if data["stale"]:
-            st.warning("The syntheses changed after the applicability decision: decide again.")
-        st.json(data["decision"] or {"decision": "none yet"})
-        with st.form("swim_applicability"):
-            choice = st.selectbox(
-                "SWiM applies to these syntheses",
-                ["applicable", "partially_applicable", "not_applicable"],
+    key = _key(pid, "swim")
+    data, error = _frozen(key, lambda: be.api.get(f"/projects/{pid}/reporting/swim"))
+    if data is None:
+        st.error(error)
+        return
+    live = be.api.get(f"/projects/{pid}/reporting/swim")
+    if live.ok and (live.data["synthesis_sha256"], live.data["based_on_decision_id"]) != (
+        data["synthesis_sha256"],
+        data["based_on_decision_id"],
+    ):
+        st.warning(CHANGED)
+    _reload_button(key)
+    if not data["required"]:
+        st.info("No synthesis without meta-analysis is approved: SWiM is not triggered.")
+        return
+    st.caption(f"Suggestion (you decide): {data['suggestion']}")
+    if data["stale"]:
+        st.warning("The syntheses changed after the applicability decision: decide again.")
+    st.json(data["decision"] or {"decision": "none yet"})
+    with st.form("swim_applicability"):
+        choice = st.selectbox(
+            "SWiM applies to these syntheses",
+            ["applicable", "partially_applicable", "not_applicable"],
+        )
+        why = st.text_area("Rationale")
+        if st.form_submit_button("Record (authenticated)"):
+            _submit(
+                be.api.post(
+                    f"/projects/{pid}/reporting/swim",
+                    token=token,
+                    json={
+                        "applicability": choice,
+                        "rationale": why,
+                        # the syntheses and decision this (frozen) screen displayed
+                        "synthesis_sha256": data["synthesis_sha256"],
+                        "based_on_decision_id": data["based_on_decision_id"],
+                    },
+                ),
+                show,
+                key,
+                "SWiM applicability recorded.",
             )
-            why = st.text_area("Rationale")
-            if st.form_submit_button("Record (authenticated)"):
-                show(
+    if data["checklist_required"]:
+        checklist_panel(be, pid, "swim", token, show)
+
+
+def _synthesis_groups(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
+    """The recorded groups (frozen screen) and their withdrawal."""
+    key = _key(pid, "synthesis", "groups")
+    url = f"/projects/{pid}/reporting/synthesis"
+    groups, error = _frozen(key, lambda: be.api.get(url))
+    if groups is None:
+        st.error(error)
+        return
+    live = be.api.get(url)
+    if live.ok and [(g["group_id"], g["revision_id"]) for g in live.data] != [
+        (g["group_id"], g["revision_id"]) for g in groups
+    ]:
+        st.warning(CHANGED)
+    _reload_button(key)
+    for g in groups:
+        with st.expander(f"{g['group_id']} · {g['status']} · revision {g['revision_id'][:8]}"):
+            for prob in g["problems"]:
+                st.error(prob)
+            st.json(g["record"])
+    withdrawable = [g for g in groups if g["status"] != "withdrawn"]
+    if withdrawable:
+        with st.form("synthesis_withdraw"):
+            gid = st.selectbox("Group to withdraw", [g["group_id"] for g in withdrawable])
+            why = st.text_input("Reason for withdrawing the group")
+            if st.form_submit_button("Withdraw group (authenticated)"):
+                shown = next(g for g in withdrawable if g["group_id"] == gid)
+                _submit(
                     be.api.post(
-                        f"/projects/{pid}/reporting/swim",
+                        f"{url}/{gid}/withdraw",
                         token=token,
-                        json={
-                            "applicability": choice,
-                            "rationale": why,
-                            # the syntheses and decision this screen displayed
-                            "synthesis_sha256": data["synthesis_sha256"],
-                            "based_on_decision_id": data["based_on_decision_id"],
-                        },
-                    )
+                        json={"reason": why, "based_on_revision_id": shown["revision_id"]},
+                    ),
+                    show,
+                    key,
+                    f"Synthesis group {gid} withdrawn.",
                 )
-        if data["checklist_required"]:
-            checklist_panel(be, pid, "swim", token, show)
+
+
+def _synthesis_preview(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
+    """Step 2 shows the *frozen* preview (step 1's response) and submits its identifiers;
+    nothing is previewed again during the submission."""
+    active = st.session_state.get(_key(pid, "synthesis", "active"))
+    gkey = str(active) if active else ""
+    frozen = st.session_state.get(gkey) if gkey else None
+    if not frozen:
+        return
+    draft, preview = frozen["draft"], frozen["preview"]
+    st.markdown(f"**Preview of group {draft['group_id'] or '(no id)'} (frozen at step 1)**")
+    if st.button("Discard this preview", key=f"discard:{gkey}"):
+        st.session_state.pop(gkey, None)
+        st.session_state.pop(_key(pid, "synthesis", "active"), None)
+        st.rerun()
+    if preview is None:
+        st.error(frozen["error"])
+        return
+    st.json(preview["evidence"])
+    st.caption(
+        f"Independent study units: {preview['voting_units']} · group revision displayed: "
+        f"{preview['based_on_revision_id'] or 'none (new group)'}"
+    )
+    for prob in preview["problems"]:
+        st.error(prob)
+    if st.button("Save the previewed group (step 2 of 2, authenticated)"):
+        result = be.api.post(
+            f"/projects/{pid}/reporting/synthesis",
+            token=token,
+            json=draft
+            | {
+                "inputs_sha256": preview["inputs_sha256"],
+                "based_on_revision_id": preview["based_on_revision_id"],
+            },
+        )
+        if result.ok:
+            st.session_state.pop(_key(pid, "synthesis", "active"), None)
+            st.session_state.pop(_key(pid, "synthesis", "groups"), None)
+            st.session_state.pop(_key(pid, "swim"), None)
+            _accepted(gkey, f"Synthesis group {draft['group_id']} saved.")
+        else:
+            _submit(result, show, gkey, "")
+            if result.status == 409:
+                st.warning("Discard this preview and preview again to review the updated state.")

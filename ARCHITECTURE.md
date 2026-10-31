@@ -1046,8 +1046,19 @@ problems) and saved with the previewed `inputs_sha256` and revision id; SWiM dec
 the displayed `synthesis_sha256` and decision id. Withdrawals name the record withdrawn.
 Before checking, the repository takes the database write lock for the transaction
 (`_lock_for_reporting`: a no-op update of the project row), so nothing can change between the
-check and the commit (SQLite has one writer; on other databases the row lock serialises
-reporting decisions).
+check and the commit. This is implemented and tested for **SQLite only**, which allows one
+writer at a time. On PostgreSQL or another server database the same statement only locks the
+project row: it serialises reporting decisions with each other, but **evidence writes by other
+code paths (extraction, risk of bias, study links, manuscript edits) are not serialised**
+against it, and no test covers that configuration.
+
+The local UI keeps each decision screen frozen in the Streamlit session (scoped by project and
+by checklist, GRADE analysis, synthesis group, group list or SWiM screen): it renders that
+snapshot and submits only its identifiers, because Streamlit reruns the script — and would
+otherwise fetch the current state — when a form is submitted. A synthesis preview is frozen at
+step 1 and step 2 submits that preview's identifiers. Only an explicit "Reload the current
+state", or the reviewer's own successful decision followed by a rerun, replaces a snapshot; a
+live comparison warns when the stored state has moved on.
 
 **Checklists** (`checklist.py`). Suggestions are deterministic (bound evidence keys per
 section; cue phrases as a weak signal) and yield only *requires human review* or *missing*.
@@ -1116,7 +1127,10 @@ result needs the group's documented selection rule. The vote-count statement is 
 from these structured directions; a summary that contradicts them (a favoured side no
 selected result shows, or a "consistent" claim the directions do not support) is refused,
 and directional wording that cannot be checked mechanically becomes an audit finding that
-requires an explicit human acknowledgement. A group records the SWiM content
+requires an explicit human acknowledgement. A favour clause whose side was identified exempts
+only its own verb: any other directional word in the same sentence (also inside the clause's
+target phrase) still requires review, so adding a checkable clause never removes the review
+of an otherwise unchanged interpretation. A group records the SWiM content
 (grouping and rationale, protocol changes, reason not pooled, standardised metric, method —
 structured tabulation or vote counting on the direction of effect; summary statistics of
 effects and combining P values are not offered —, prioritisation, heterogeneity, certainty
