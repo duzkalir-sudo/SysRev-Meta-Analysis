@@ -102,6 +102,23 @@ class AIWorkflow:
             return [str(exc)]
         return []
 
+    def preflight_warnings(self, task: AITask) -> list[str]:
+        """Non-blocking notes: deprecation, unknown prices, a catalogue that changed since the
+        settings were saved (the stored selection is never rewritten)."""
+        try:
+            settings = self.settings()
+            config = settings.config_for(task)
+            cap = self.catalogue.validate(config)
+        except SysRevError:
+            return []
+        out = cap.warnings()
+        if settings.catalogue_sha256 and settings.catalogue_sha256 != self.catalogue.sha256:
+            out.append(
+                "the model catalogue changed since these settings were saved; the stored "
+                "selection is unchanged and still validated against the active catalogue"
+            )
+        return out
+
     def budget(self) -> BudgetGuard:
         s = self.settings()
         totals = self.repo.llm_usage_totals(self.project_id)
@@ -126,6 +143,10 @@ class AIWorkflow:
                 (lambda key: self.repo.has_persisted_result(self.project_id, key))
                 if dedupe else None
             ),
+            provenance={
+                "catalogue_sha256": self.catalogue.sha256,
+                "catalogue_snapshot_id": self.catalogue.snapshot_id or "built-in",
+            },
         )  # fmt: skip
         return audited, config
 

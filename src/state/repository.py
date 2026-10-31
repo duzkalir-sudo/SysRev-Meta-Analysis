@@ -79,6 +79,8 @@ from src.core.security import (
     parse_token,
     verify_secret,
 )
+from src.llm.catalogue import ModelCatalogue
+from src.llm.model_registry import CatalogueSnapshot, ProviderDiscovery
 from src.llm.tasks import ProjectAISettings
 from src.llm.usage import LLMCallRecord
 from src.screening.agreement import screening_status
@@ -99,10 +101,13 @@ from src.state.db import (
     FullTextDocumentORM,
     FullTextItemORM,
     GateDecisionORM,
+    GovernanceRecordORM,
     LLMCallORM,
     LLMCallOutcomeORM,
     ManuscriptApprovalORM,
     ManuscriptVersionORM,
+    ModelCatalogueActivationORM,
+    ModelCatalogueSnapshotORM,
     ProjectAISettingsORM,
     ProjectORM,
     ProtocolEventORM,
@@ -1994,6 +1999,154 @@ class Repository:
                 for p in self._load_reporting(project_id, "swim_applicability")]  # fmt: skip
 
     # ------------------------------------------------------------------ guards
+    # ------------------------------------------------------------------ Session 8: models
+    def save_catalogue_snapshot(self, snapshot: CatalogueSnapshot) -> None:
+        if snapshot.reviewer_id is not None:
+            reviewer = self.require_active_reviewer(snapshot.reviewer_id)
+            if reviewer.display_name != snapshot.created_by:
+                raise SysRevError("created_by does not match the enrolled reviewer")
+        self.session.add(
+            ModelCatalogueSnapshotORM(
+                id=snapshot.snapshot_id, kind=snapshot.kind, sha256=snapshot.sha256,
+                parent_sha256=snapshot.parent_sha256, created_by=snapshot.created_by,
+                reviewer_id=snapshot.reviewer_id, payload=snapshot.model_dump(mode="json"),
+            )
+        )  # fmt: skip
+        self.session.flush()
+
+    def load_catalogue_snapshots(self) -> list[CatalogueSnapshot]:
+        rows = self.session.scalars(
+            select(ModelCatalogueSnapshotORM).order_by(ModelCatalogueSnapshotORM.seq)
+        ).all()
+        return [self._snapshot(r) for r in rows]
+
+    def get_catalogue_snapshot(self, snapshot_id: str) -> CatalogueSnapshot:
+        row = self.session.scalars(
+            select(ModelCatalogueSnapshotORM).where(ModelCatalogueSnapshotORM.id == snapshot_id)
+        ).first()
+        if row is None:
+            raise NotFoundError(f"catalogue snapshot {snapshot_id} not found")
+        return self._snapshot(row)
+
+    @staticmethod
+    def _snapshot(row: ModelCatalogueSnapshotORM) -> CatalogueSnapshot:
+        snapshot = CatalogueSnapshot.model_validate(row.payload)
+        if snapshot.sha256 != row.sha256:
+            raise SysRevError(f"catalogue snapshot {row.id} fails its integrity hash")
+        return snapshot
+
+    def catalogue_activations(self) -> list[ModelCatalogueActivationORM]:
+        return list(
+            self.session.scalars(
+                select(ModelCatalogueActivationORM).order_by(ModelCatalogueActivationORM.seq)
+            )
+        )
+
+    def active_catalogue(self, base: ModelCatalogue) -> ModelCatalogue:
+        """The latest activated snapshot, or ``base`` (built-in + local override) if none."""
+        latest = self.session.scalars(
+            select(ModelCatalogueActivationORM)
+            .order_by(ModelCatalogueActivationORM.seq.desc())
+            .limit(1)
+        ).first()
+        if latest is None:
+            return base
+        snapshot = self.get_catalogue_snapshot(latest.snapshot_id)
+        if snapshot.sha256 != latest.sha256:
+            raise SysRevError("the active catalogue snapshot does not match its activation")
+        return snapshot.catalogue()
+
+    def latest_discovery(self) -> dict[str, ProviderDiscovery]:
+        """The most recent listing attempt per provider (successful or not)."""
+        out: dict[str, ProviderDiscovery] = {}
+        for snapshot in self.load_catalogue_snapshots():
+            for d in snapshot.discovery:
+                out[d.provider] = d
+        return out
+
+    def activate_catalogue_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        base: ModelCatalogue,
+        expected_sha256: str,
+        expected_active_sha256: str,
+        reviewer_id: str,
+        note: str | None = None,
+    ) -> ModelCatalogueActivationORM:
+        """Activate a previewed snapshot. Refused (nothing saved) if the snapshot is not the
+        one previewed, or if the active catalogue changed since the preview, or if the
+        snapshot was built on another catalogue (it would silently drop those changes)."""
+        reviewer = self.require_active_reviewer(reviewer_id)
+        # Write lock before the checks (SQLite: one writer), as for reporting decisions.
+        self.session.execute(text("UPDATE model_catalogue_activations SET note = note WHERE 1 = 0"))
+        snapshot = self.get_catalogue_snapshot(snapshot_id)
+        active = self.active_catalogue(base)
+        if snapshot.sha256 != expected_sha256:
+            raise SysRevError("the catalogue snapshot has changed since it was previewed")
+        if active.sha256 != expected_active_sha256:
+            raise SysRevError(
+                "the active catalogue has changed since this preview was shown; reload the "
+                "preview before activating"
+            )
+        if snapshot.parent_sha256 != active.sha256:
+            raise SysRevError(
+                "this snapshot was built on a different catalogue than the active one; refresh "
+                "or verify again so that no intervening change is lost"
+            )
+        if snapshot.sha256 == active.sha256:
+            raise SysRevError("nothing to activate: the snapshot equals the active catalogue")
+        row = ModelCatalogueActivationORM(
+            id=uuid.uuid4().hex, snapshot_id=snapshot.snapshot_id, sha256=snapshot.sha256,
+            previous_sha256=active.sha256, reviewer_id=reviewer.id, note=note,
+        )  # fmt: skip
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    # ------------------------------------------------------------------ Session 8: governance
+    def add_governance_record(
+        self,
+        project_id: str,
+        kind: str,
+        subject: str,
+        payload: dict[str, object],
+        *,
+        reviewer_id: str | None,
+        record_id: str | None = None,
+    ) -> str:
+        import json
+
+        if reviewer_id is not None:
+            self.require_active_reviewer(reviewer_id)
+        text_ = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                           default=str)  # fmt: skip
+        rid = record_id or uuid.uuid4().hex
+        self.session.add(GovernanceRecordORM(
+            id=rid, project_id=project_id, kind=kind, subject=subject[:128],
+            reviewer_id=reviewer_id, payload=json.loads(text_),
+            payload_sha256=hashlib.sha256(text_.encode("utf-8")).hexdigest(),
+        ))  # fmt: skip
+        self.session.flush()
+        return rid
+
+    def governance_records(
+        self, project_id: str, kind: str, subject: str | None = None
+    ) -> list[dict[str, object]]:
+        stmt = select(GovernanceRecordORM).where(
+            GovernanceRecordORM.project_id == project_id, GovernanceRecordORM.kind == kind
+        )
+        if subject is not None:
+            stmt = stmt.where(GovernanceRecordORM.subject == subject[:128])
+        rows = self.session.scalars(stmt.order_by(GovernanceRecordORM.seq)).all()
+        return [r.payload | {"_record_id": r.id, "_recorded_at": r.created_at.isoformat()}
+                for r in rows]  # fmt: skip
+
+    def lock_project(self, project_id: str) -> None:
+        """Take the database write lock for this transaction before checking that the state a
+        reviewer saw is still current (see ``_lock_for_reporting``; SQLite only)."""
+        self._lock_for_reporting(project_id)
+
     def build_guard_context(self, project_id: str) -> GuardContext:
         """Derive every guard fact from persisted rows. Missing data counts as missing work."""
         project = self.get_project(project_id)

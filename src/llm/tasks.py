@@ -53,6 +53,11 @@ class TaskModelSettings(StrictModel):
     model_id: NonEmptyStr
     effort: str | None = None
     max_output_tokens: int = Field(default=16000, ge=256, le=128000)
+    prompt_caching: bool = Field(
+        default=False,
+        description="Anthropic explicit prompt caching of the record-invariant prefix "
+        "(opt-in; absent from settings saved before Session 8, which therefore stay off)",
+    )
 
     def to_llm_config(self, task: AITask) -> LLMConfig:
         return LLMConfig(
@@ -62,6 +67,7 @@ class TaskModelSettings(StrictModel):
             temperature=None,
             max_output_tokens=self.max_output_tokens,
             effort=self.effort,
+            prompt_caching=self.prompt_caching,
         )
 
 
@@ -74,6 +80,12 @@ class ProjectAISettings(StrictModel):
     warn_tokens: int | None = Field(default=None, ge=0)
     stop_tokens: int | None = Field(default=None, ge=0)
     note: str | None = None
+    catalogue_sha256: str | None = Field(
+        default=None,
+        description="SHA-256 of the model catalogue these settings were checked against when "
+        "saved (Session 8; None for older settings). Provenance only: a later catalogue never "
+        "rewrites the stored selection",
+    )
 
     @model_validator(mode="after")
     def _ordered_limits(self) -> ProjectAISettings:

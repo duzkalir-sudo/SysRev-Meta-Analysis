@@ -4,16 +4,34 @@ Provider parameters are *not* interchangeable: an effort value is passed to the 
 exactly as written (Anthropic ``output_config.effort``, OpenAI ``reasoning.effort``) and
 only if the catalogue lists it for that exact model. No effort level is assumed to be
 equivalent across providers. A model that is not in the catalogue cannot be used — the
-user extends the catalogue (local override file) after checking the provider's current
+user extends the catalogue (local override file, or a reviewed and activated catalogue
+snapshot, :mod:`src.llm.model_registry`) after checking the provider's current
 documentation, rather than the software guessing.
+
+Session 8 separates four facts about a model, each with its own evidence:
+
+* **discovery / account availability** — whether the provider's official model-list
+  endpoint returned the ID for this API key (:mod:`src.llm.discovery`). Being listed never
+  makes a model executable;
+* **adapter compatibility** — which adapter (Anthropic Messages / OpenAI Responses) the
+  documented interface of the model matches (``adapter``; ``unsupported`` blocks it);
+* **verified capabilities** — efforts, default effort, thinking mode and output limit,
+  checked against official documentation (``verified``, ``source``, ``verified_at``);
+* **verified pricing** — list prices with their own source and date (``pricing_source``,
+  ``pricing_verified_at``); unknown prices are reported as unavailable, never as zero.
+
+Only a verified entry whose lifecycle is not ``retired`` and whose adapter is supported can
+run. Nothing is substituted: a retired or unverified model fails with an explicit error.
 
 Prices are list prices used for *estimates* only; the provider's invoice is authoritative.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
+from datetime import date
 from importlib import resources
 from pathlib import Path
 from typing import Literal
@@ -24,6 +42,11 @@ from src.llm.provider import LLMConfig, TokenUsage, UnsupportedConfigurationErro
 
 SUPPORTED_PROVIDERS = ("anthropic", "openai")
 OVERRIDE_FILENAME = "model_catalogue.json"
+ADAPTER_OF_PROVIDER: dict[str, str] = {
+    "anthropic": "anthropic.messages",
+    "openai": "openai.responses",
+}
+Lifecycle = Literal["active", "deprecated", "retired"]
 
 
 class Pricing(BaseModel):
@@ -63,6 +86,66 @@ class ModelCapability(BaseModel):
     pricing: Pricing | None = None
     source: str = Field(min_length=1)
     verified: bool
+    # ---- Session 8 (all optional, so earlier catalogue files and snapshots stay valid)
+    verified_at: date | None = Field(
+        default=None, description="date the capabilities were checked against the source"
+    )
+    adapter: Literal["anthropic.messages", "openai.responses", "unsupported"] | None = Field(
+        default=None,
+        description="documented interface; None = the provider's standard adapter (the only "
+        "one a verified entry could use before Session 8)",
+    )
+    pricing_source: str | None = Field(
+        default=None, description="where the list prices come from (None: see source)"
+    )
+    pricing_verified_at: date | None = None
+    lifecycle: Lifecycle | None = Field(
+        default=None, description="provider lifecycle stage if recorded (None: not recorded)"
+    )
+    retires_at: date | None = None
+    lifecycle_source: str | None = None
+    provider_reported: dict[str, object] | None = Field(
+        default=None,
+        description="metadata the provider's model-list endpoint reported at discovery; shown "
+        "to reviewers, never used for execution",
+    )
+
+    @property
+    def interface(self) -> str:
+        """The adapter this entry is run with (``unsupported`` = none)."""
+        return self.adapter or ADAPTER_OF_PROVIDER[self.provider]
+
+    def execution_problems(self) -> list[str]:
+        """Why this entry may not run (empty = executable). Never answered by substitution."""
+        out: list[str] = []
+        name = f"{self.provider}/{self.model_id}"
+        if not self.verified:
+            out.append(
+                f"{name} is an unverified catalogue entry (discovered or entered without "
+                "verified capabilities); it is not available for execution until its "
+                "capabilities are verified against official documentation and the catalogue "
+                "snapshot is activated"
+            )
+        if self.interface == "unsupported":
+            out.append(f"{name} is not compatible with this software's {self.provider} adapter")
+        elif self.interface != ADAPTER_OF_PROVIDER[self.provider]:
+            out.append(f"{name}: adapter {self.interface!r} does not belong to {self.provider}")
+        if self.lifecycle == "retired":
+            out.append(
+                f"{name} is retired by the provider ({self.lifecycle_source or 'recorded'}); "
+                "no other model is substituted — choose a model explicitly"
+            )
+        return out
+
+    def warnings(self) -> list[str]:
+        out: list[str] = []
+        if self.lifecycle == "deprecated":
+            when = f" (retirement scheduled {self.retires_at})" if self.retires_at else ""
+            out.append(f"{self.provider}/{self.model_id} is deprecated{when}")
+        if self.pricing is None:
+            out.append(f"{self.provider}/{self.model_id} has no verified list price: costs "
+                       "are reported as unavailable")  # fmt: skip
+        return out
 
     @model_validator(mode="after")
     def _consistent(self) -> ModelCapability:
@@ -82,14 +165,24 @@ class ModelCapability(BaseModel):
             )
         if not self.verified and "UNVERIFIED" not in self.display_name:
             raise ValueError(f"{self.model_id}: unverified entries must say so in their name")
+        if self.pricing_source is not None and self.pricing_source.startswith("UNVERIFIED"):
+            raise ValueError(f"{self.model_id}: a pricing source cannot be UNVERIFIED")
+        if self.pricing_verified_at is not None and self.pricing is None:
+            raise ValueError(f"{self.model_id}: a pricing verification date needs prices")
         return self
 
 
 class ModelCatalogue:
-    def __init__(self, models: list[ModelCapability]) -> None:
+    def __init__(self, models: list[ModelCapability], *, snapshot_id: str | None = None) -> None:
         self._models: dict[tuple[str, str], ModelCapability] = {
             (m.provider, m.model_id): m for m in models
         }
+        self.snapshot_id = snapshot_id  # None: built-in catalogue (+ local override file)
+
+    @property
+    def sha256(self) -> str:
+        """Content hash of the catalogue (recorded with settings and every call)."""
+        return catalogue_sha256(self.models())
 
     @classmethod
     def load(cls, override_dir: Path | None = None) -> ModelCatalogue:
@@ -124,6 +217,14 @@ class ModelCatalogue:
         if config.provider not in SUPPORTED_PROVIDERS:
             raise UnsupportedConfigurationError(f"unknown provider {config.provider!r}")
         cap = self.get(config.provider, config.model_id)
+        problems = cap.execution_problems()
+        if problems:
+            raise UnsupportedConfigurationError("; ".join(problems))
+        if config.prompt_caching and cap.provider != "anthropic":
+            raise UnsupportedConfigurationError(
+                "explicit prompt caching is only configurable for Anthropic; OpenAI caches "
+                "prompts automatically (cached tokens are recorded either way)"
+            )
         if config.effort is not None and config.effort not in cap.efforts:
             allowed = ", ".join(cap.efforts) or "none (provider default only)"
             raise UnsupportedConfigurationError(
@@ -141,6 +242,14 @@ class ModelCatalogue:
                 f"{cap.max_output_tokens} limit of {config.model_id}"
             )
         return cap
+
+
+def catalogue_sha256(models: list[ModelCapability]) -> str:
+    data = sorted(
+        (m.model_dump(mode="json") for m in models), key=lambda d: (d["provider"], d["model_id"])
+    )
+    text = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +283,7 @@ def estimate_cost(cap: ModelCapability | None, usage: TokenUsage | None) -> Cost
     if cap.provider == "openai":
         uncached = max(usage.input_tokens - cache_read - cache_write, 0)
     total_prompt = uncached + cache_read + cache_write
-    notes = [f"list price ({cap.source.split(';')[0]})"]
+    notes = [f"list price ({(cap.pricing_source or cap.source).split(';')[0]})"]
     in_rate, out_rate = p.input, p.output
     read_rate, write_rate = p.cache_read, p.cache_write
     if p.long_prompt_threshold_tokens and total_prompt > p.long_prompt_threshold_tokens:

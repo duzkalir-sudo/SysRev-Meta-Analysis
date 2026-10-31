@@ -177,6 +177,7 @@ class AuditedProvider:
         budget: BudgetGuard | None = None,
         already_answered: Callable[[str], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        provenance: dict[str, Any] | None = None,
     ) -> None:
         self.inner = inner
         self.project_id = project_id
@@ -188,6 +189,7 @@ class AuditedProvider:
         self.budget = budget
         self._already_answered = already_answered
         self._clock = clock
+        self._provenance = dict(provenance or {})  # e.g. the catalogue hash, on every record
         self.records: list[LLMCallRecord] = []
 
     @property
@@ -199,6 +201,7 @@ class AuditedProvider:
         return self.inner.model_id
 
     def _record(self, request: LLMRequest, key: str, **fields: Any) -> LLMCallRecord:
+        fields["settings"] = {**self._provenance, **fields.get("settings", {})}
         record = LLMCallRecord(
             project_id=self.project_id, task=self.task, label=self.label,
             provider=self.provider_name, requested_model=self.model_id,

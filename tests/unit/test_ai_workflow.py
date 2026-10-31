@@ -187,8 +187,9 @@ def test_cost_stop_threshold_requires_priced_model(session: Session, tmp_path: P
     repo, store = setup(session, tmp_path, Phase.STAGE2_SEARCH_SCREENING, stop_usd=1.0)
     (tmp_path / "model_catalogue.json").write_text(json.dumps({"models": [{
         "provider": "openai", "model_id": "local-unpriced", "efforts": ["low"],
-        "display_name": "Local (UNVERIFIED)", "source": "UNVERIFIED: local test entry",
-        "verified": False}]}), encoding="utf-8")  # fmt: skip
+        "display_name": "Local verified, unpriced",
+        "source": "https://example.invalid/model-docs (synthetic test entry)",
+        "verified": True}]}), encoding="utf-8")  # fmt: skip
     cat = ModelCatalogue.load(tmp_path)
     unpriced = TaskModelSettings(provider="openai", model_id="local-unpriced")
     repo.save_ai_settings(PID, settings(stop_usd=1.0).model_copy(update={"tasks": {
