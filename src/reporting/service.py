@@ -19,6 +19,7 @@ from typing import Any
 
 from src.core.enums import ActorType, EffectMeasure
 from src.core.exceptions import SysRevError
+from src.core.schemas.base import new_id
 from src.core.schemas.manuscript import ManuscriptVersion, fingerprint_sha256
 from src.core.schemas.reporting import (
     ChecklistDecision,
@@ -35,6 +36,19 @@ from src.reporting.review import reporting_checks
 from src.reporting.standards import CATALOGUES, STANDARD_VERSION, item
 from src.reporting.state import grade_inputs, group_problems, synthesis_entries, synthesis_sha256
 from src.state.repository import Repository
+
+STALE = (
+    "the state you reviewed has changed since it was displayed ({what}); nothing was saved — "
+    "reload, review the updated evidence and decide again"
+)
+
+
+def evidence_sha256(package: Any) -> str:
+    """The content evidence state a reviewer sees (checklist decisions excluded, so deciding
+    one item does not invalidate the screen for the others)."""
+    from src.manuscript.evidence import content_fingerprint
+
+    return fingerprint_sha256(content_fingerprint(package.fingerprint))
 
 
 def _package(repo: Repository, project_id: str) -> Any:
@@ -59,8 +73,19 @@ def checklist_decision_problems(
     problems: list[str] = []
     if (d.manuscript_version, d.manuscript_sha256) != (version.version, version.content_sha256):
         problems.append(
-            f"the decision names version {d.manuscript_version}, but the current manuscript is "
-            f"version {version.version}"
+            STALE.format(
+                what=f"you reviewed manuscript version {d.manuscript_version}; the current "
+                f"version is {version.version}"
+            )
+        )
+    latest = [
+        x.decision_id
+        for x in repo.load_checklist_decisions(d.project_id)
+        if (x.checklist, x.item_id) == (d.checklist, d.item_id)
+    ]
+    if (latest[-1] if latest else None) != d.based_on_decision_id:
+        problems.append(
+            STALE.format(what=f"the decision on item {d.item_id} changed after it was displayed")
         )
     for sid in d.section_ids:
         sec = version.section(sid)
@@ -71,8 +96,8 @@ def checklist_decision_problems(
             package = _package(repo, d.project_id)
         except SysRevError as exc:
             return [*problems, f"evidence package unavailable: {exc}"]
-    if d.evidence_sha256 != fingerprint_sha256(package.fingerprint):
-        problems.append("the decision does not name the current evidence state")
+    if d.evidence_sha256 != evidence_sha256(package):
+        problems.append(STALE.format(what="the evidence changed"))
     for k in d.evidence_keys:
         if k not in package.facts and k not in package.templates:
             problems.append(f"unknown evidence key {k}")
@@ -95,6 +120,9 @@ def grade_problems(repo: Repository, g: GradeAssessment) -> list[str]:
     previous = [
         r for r in repo.load_grade_assessments(g.project_id) if r.analysis_id == g.analysis_id
     ]
+    shown = previous[-1].assessment_id if previous else None
+    if g.based_on_assessment_id != shown:
+        return [STALE.format(what=f"the GRADE record for {g.analysis_id} changed")]
     if g.status == "withdrawn":
         if not previous or previous[-1].status == "withdrawn":
             return ["there is no GRADE record to withdraw for this analysis"]
@@ -113,7 +141,12 @@ def grade_problems(repo: Repository, g: GradeAssessment) -> list[str]:
     approved_rob = [x for x in repo.load_rob(g.project_id) if x.approved_by_human]
     sha, rob = grade_inputs(repo, g.project_id, a, protocol, approved_rob)
     if g.inputs_sha256 != sha:
-        problems.append("the record does not describe the current analysis inputs")
+        problems.append(
+            STALE.format(
+                what="the analysis result, outcome, risk-of-bias assessments or study links "
+                "behind this assessment changed"
+            )
+        )
     if g.status == "approved":
         problems += gr.applicability_problems(g.approach, a, rob)
         if g.baseline_risks and a.effect_measure not in (EffectMeasure.RR, EffectMeasure.OR):
@@ -151,6 +184,9 @@ def synthesis_problems(repo: Repository, group: SynthesisGroup) -> list[str]:
     previous = [
         r for r in repo.load_synthesis_groups(group.project_id) if r.group_id == group.group_id
     ]
+    shown = previous[-1].revision_id if previous else None
+    if group.based_on_revision_id != shown:
+        return [STALE.format(what=f"synthesis group {group.group_id} changed")]
     if group.status == "withdrawn":
         if not previous or previous[-1].status == "withdrawn":
             return ["there is no synthesis group to withdraw"]
@@ -159,7 +195,7 @@ def synthesis_problems(repo: Repository, group: SynthesisGroup) -> list[str]:
     out = (
         []
         if group.inputs_sha256 == sha
-        else ["the record does not describe the current study-level evidence"]
+        else [STALE.format(what="the linked study-level evidence changed")]
     )
     if group.status == "approved":
         out += problems
@@ -177,8 +213,11 @@ def swim_applicability_problems(repo: Repository, d: SwimApplicability) -> list[
         return [
             "no synthesis without meta-analysis is approved, so SWiM reporting is not triggered"
         ]
+    previous = repo.load_swim_applicability(d.project_id)
+    if (previous[-1].decision_id if previous else None) != d.based_on_decision_id:
+        return [STALE.format(what="the SWiM applicability decision changed")]
     if d.synthesis_sha256 != synthesis_sha256(entries):
-        return ["the decision does not describe the current approved syntheses"]
+        return [STALE.format(what="the approved syntheses changed")]
     return []
 
 
@@ -236,6 +275,9 @@ class ReportingService:
 
     # ---- checklists
     def checklist(self, name: str) -> dict[str, Any]:
+        """The checklist screen. ``manuscript_version``, ``manuscript_sha256``,
+        ``evidence_sha256`` and each item's ``decision_id`` identify the state displayed; a
+        decision must send them back, and is refused if that state has changed."""
         if name not in CATALOGUES:
             raise SysRevError(f"unknown checklist {name}")
         package = self.package()
@@ -248,7 +290,7 @@ class ReportingService:
             "standard": STANDARD_VERSION[name],
             "manuscript_version": version.version,
             "manuscript_sha256": version.content_sha256,
-            "evidence_sha256": fingerprint_sha256(package.fingerprint),
+            "evidence_sha256": evidence_sha256(package),
             "complete": cl.complete(states),
             "summary": cl.summary(states),
             "note": "A complete checklist record means each item has a current human decision; "
@@ -266,6 +308,8 @@ class ReportingService:
         location: str,
         justification: str,
         evidence_keys: list[str],
+        based_on_decision_id: str | None,
+        seen: dict[str, Any],
         reviewer_id: str,
         reviewer_name: str,
     ) -> ChecklistDecision:
@@ -277,18 +321,41 @@ class ReportingService:
             "location": location,
             "justification": justification,
             "evidence_keys": evidence_keys,
+            "based_on_decision_id": based_on_decision_id,
         }
-        return self.decide_items([row], reviewer_id=reviewer_id, reviewer_name=reviewer_name)[0]
+        return self.decide_items(
+            [row], seen=seen, reviewer_id=reviewer_id, reviewer_name=reviewer_name
+        )[0]
 
     def decide_items(
-        self, rows: list[dict[str, Any]], *, reviewer_id: str, reviewer_name: str
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        seen: dict[str, Any],
+        reviewer_id: str,
+        reviewer_name: str,
     ) -> list[ChecklistDecision]:
-        """Several item decisions by one reviewer, made on the same manuscript version and
-        evidence state (each still states its own status, location and justification)."""
+        """Item decisions by one reviewer on the state they were shown: ``seen`` carries the
+        screen's manuscript version, manuscript SHA-256 and evidence SHA-256, and each row
+        the item's displayed ``based_on_decision_id`` (None when there was none). The
+        repository refuses the whole batch if any of it no longer matches."""
+        missing = [k for k in SEEN_CHECKLIST if not seen.get(k)]
+        if missing:
+            raise SysRevError(f"the displayed state is required: {', '.join(missing)}")
+        try:
+            version = self.repo.get_manuscript_version(
+                self.project_id, int(seen["manuscript_version"])
+            )
+        except SysRevError as exc:
+            raise SysRevError(STALE.format(what=str(exc))) from exc
         package = self.package()
-        version = self._version()
         decisions = []
         for row in rows:
+            if "based_on_decision_id" not in row:
+                raise SysRevError(
+                    f"item {row['item_id']}: based_on_decision_id (the decision displayed, or "
+                    "null) is required"
+                )
             it = item(row["checklist"], row["item_id"])
             sections = list(row.get("section_ids") or [])
             decisions.append(
@@ -303,11 +370,12 @@ class ReportingService:
                         "justification": row["justification"],
                         "evidence_keys": list(row.get("evidence_keys") or []),
                         "manuscript_version": version.version,
-                        "manuscript_sha256": version.content_sha256,
-                        "evidence_sha256": fingerprint_sha256(package.fingerprint),
+                        "manuscript_sha256": seen["manuscript_sha256"],
+                        "evidence_sha256": seen["evidence_sha256"],
                         "basis_sha256": cl.decision_basis(
                             it, version, sections, package.fingerprint, row["status"]
                         ),
+                        "based_on_decision_id": row["based_on_decision_id"],
                         "reviewer_id": reviewer_id,
                         "reviewer_name": reviewer_name,
                     }
@@ -329,6 +397,7 @@ class ReportingService:
                     "status": e.status,
                     "stale": e.stale,
                     "inputs_sha256": e.inputs_sha256,
+                    "based_on_assessment_id": e.record.assessment_id if e.record else None,
                     "problems": e.problems,
                     "record": e.record.model_dump(mode="json") if e.record else None,
                     "decision_support": e.support,
@@ -351,7 +420,13 @@ class ReportingService:
     def save_grade(
         self, analysis_id: str, body: dict[str, Any], *, reviewer_id: str, reviewer_name: str
     ) -> GradeAssessment:
-        """Record a draft, an approval or a 'not assessed' declaration (all authenticated)."""
+        """Record a draft, an approval or a 'not assessed' declaration (all authenticated).
+
+        ``body`` must carry the ``inputs_sha256`` and ``based_on_assessment_id`` displayed with
+        the decision support; the record is refused if either no longer matches."""
+        for k in ("inputs_sha256", "based_on_assessment_id"):
+            if k not in body:
+                raise SysRevError(f"the displayed state is required: {k}")
         package = self.package()
         e = package.reporting.grade.get(analysis_id)
         if e is None:
@@ -385,7 +460,8 @@ class ReportingService:
                 "analysis_id": analysis_id,
                 "outcome_id": e.analysis.outcome_id,
                 "question_type": e.question_type,
-                "inputs_sha256": e.inputs_sha256,
+                "inputs_sha256": body["inputs_sha256"],
+                "based_on_assessment_id": body["based_on_assessment_id"],
                 "created_by": reviewer_name,
                 "actor_type": ActorType.HUMAN,
                 "reviewer_id": reviewer_id,
@@ -395,7 +471,13 @@ class ReportingService:
         return g
 
     def withdraw_grade(
-        self, analysis_id: str, reason: str, *, reviewer_id: str, reviewer_name: str
+        self,
+        analysis_id: str,
+        reason: str,
+        *,
+        based_on_assessment_id: str | None,
+        reviewer_id: str,
+        reviewer_name: str,
     ) -> GradeAssessment:
         previous = [
             r
@@ -413,6 +495,7 @@ class ReportingService:
             status="withdrawn",
             status_note=reason,
             inputs_sha256=last.inputs_sha256,
+            based_on_assessment_id=based_on_assessment_id,
             created_by=reviewer_name,
             actor_type=ActorType.HUMAN,
             reviewer_id=reviewer_id,
@@ -435,20 +518,20 @@ class ReportingService:
                 "stale": g.stale,
                 "problems": g.problems,
                 "inputs_sha256": g.inputs_sha256,
+                "revision_id": g.record.revision_id,
+                "units": g.units,
+                "unverifiable_statements": g.unverifiable,
                 "record": g.record.model_dump(mode="json"),
             }
             for gid, g in sorted(package.reporting.groups.items())
         ]
 
-    def save_group(
-        self, body: dict[str, Any], *, reviewer_id: str, reviewer_name: str
+    def _group_from_body(
+        self, body: dict[str, Any], reviewer_id: str, reviewer_name: str
     ) -> SynthesisGroup:
-        protocol = self.repo.latest_protocol(self.project_id)
-        if protocol is None:
-            raise SysRevError("no protocol")
-        data = dict(body)
+        data = {k: v for k, v in body.items() if k not in ("inputs_sha256",)}
         data["findings"] = [SynthesisFinding.model_validate(f) for f in body["findings"]]
-        draft = SynthesisGroup.model_validate(
+        return SynthesisGroup.model_validate(
             data
             | {
                 "project_id": self.project_id,
@@ -458,14 +541,69 @@ class ReportingService:
                 "reviewer_id": reviewer_id,
             }
         )
-        sha, _ = group_problems(self.repo, self.project_id, draft, protocol)
-        group = draft.model_copy(update={"inputs_sha256": sha})
-        group = SynthesisGroup.model_validate(group.model_dump())
+
+    def preview_group(self, body: dict[str, Any]) -> dict[str, Any]:
+        """What a reviewer must see before saving a group: the linked evidence as it is now,
+        its hash (to be sent back with the save), the voting units and every problem."""
+        from src.reporting.state import group_inputs, voting_units
+
+        protocol = self.repo.latest_protocol(self.project_id)
+        if protocol is None:
+            raise SysRevError("no protocol")
+        draft = self._preview_draft(body)
+        sha, texts, _ = group_inputs(self.repo, self.project_id, draft, protocol)
+        _, problems = group_problems(self.repo, self.project_id, draft, protocol)
+        previous = [
+            g
+            for g in self.repo.load_synthesis_groups(self.project_id)
+            if g.group_id == draft.group_id
+        ]
+        return {
+            "inputs_sha256": sha,
+            "based_on_revision_id": previous[-1].revision_id if previous else None,
+            "evidence": texts,
+            "voting_units": voting_units(self.repo, self.project_id, draft),
+            "problems": problems,
+        }
+
+    def _preview_draft(self, body: dict[str, Any]) -> SynthesisGroup:
+        data = {k: v for k, v in body.items() if k not in ("inputs_sha256", "status")}
+        data["findings"] = [SynthesisFinding.model_validate(f) for f in body["findings"]]
+        return SynthesisGroup.model_validate(
+            data
+            | {
+                "status": "draft",
+                "project_id": self.project_id,
+                "inputs_sha256": "0" * 64,
+                "created_by": "preview",
+                "actor_type": ActorType.SYSTEM,
+            }
+        )
+
+    def save_group(
+        self, body: dict[str, Any], *, reviewer_id: str, reviewer_name: str
+    ) -> SynthesisGroup:
+        """Save a group previewed by the reviewer: ``body`` carries the ``inputs_sha256`` and
+        ``based_on_revision_id`` returned by :meth:`preview_group`; the repository refuses the
+        group if the linked evidence or the group changed since."""
+        for k in ("inputs_sha256", "based_on_revision_id"):
+            if k not in body:
+                raise SysRevError(f"the displayed state is required: {k} (preview the group)")
+        group = self._group_from_body(body, reviewer_id, reviewer_name)
+        group = SynthesisGroup.model_validate(
+            group.model_dump() | {"inputs_sha256": body["inputs_sha256"]}
+        )
         self.repo.save_synthesis_group(group)
         return group
 
     def withdraw_group(
-        self, group_id: str, reason: str, *, reviewer_id: str, reviewer_name: str
+        self,
+        group_id: str,
+        reason: str,
+        *,
+        based_on_revision_id: str | None,
+        reviewer_id: str,
+        reviewer_name: str,
     ) -> SynthesisGroup:
         previous = [
             g for g in self.repo.load_synthesis_groups(self.project_id) if g.group_id == group_id
@@ -476,6 +614,8 @@ class ReportingService:
             update={
                 "status": "withdrawn",
                 "status_note": reason,
+                "revision_id": new_id(),
+                "based_on_revision_id": based_on_revision_id,
                 "created_by": reviewer_name,
                 "reviewer_id": reviewer_id,
                 "actor_type": ActorType.HUMAN,
@@ -486,15 +626,24 @@ class ReportingService:
         return g
 
     def decide_swim(
-        self, applicability: str, rationale: str, *, reviewer_id: str, reviewer_name: str
+        self,
+        applicability: str,
+        rationale: str,
+        *,
+        synthesis_sha256: str,
+        based_on_decision_id: str | None,
+        reviewer_id: str,
+        reviewer_name: str,
     ) -> SwimApplicability:
-        package = self.package()
+        """``synthesis_sha256`` and ``based_on_decision_id`` are those displayed with the
+        syntheses the reviewer judged; the decision is refused if either changed."""
         d = SwimApplicability.model_validate(
             {
                 "project_id": self.project_id,
                 "applicability": applicability,
                 "rationale": rationale,
-                "synthesis_sha256": package.reporting.synthesis_sha256,
+                "synthesis_sha256": synthesis_sha256,
+                "based_on_decision_id": based_on_decision_id,
                 "reviewer_id": reviewer_id,
                 "reviewer_name": reviewer_name,
             }
@@ -516,6 +665,7 @@ class ReportingService:
         return {
             "required": rs.swim_required,
             "decision": rs.swim.model_dump(mode="json") if rs.swim else None,
+            "based_on_decision_id": rs.swim.decision_id if rs.swim else None,
             "stale": rs.swim_stale,
             "checklist_required": rs.swim_checklist_required,
             "suggestion": suggestion,
@@ -601,6 +751,7 @@ class ReportingService:
         return buf.getvalue()
 
 
+SEEN_CHECKLIST = ("manuscript_version", "manuscript_sha256", "evidence_sha256")
 G_FIXED = {
     "interventions_randomised": "high",
     "interventions_nrsi_robins_i": "high",

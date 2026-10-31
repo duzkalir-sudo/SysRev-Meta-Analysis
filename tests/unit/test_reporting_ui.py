@@ -21,7 +21,7 @@ from tests.manuscript_helpers import SYSTEM, comparative_project
     [
         ("PRISMA flow & checklists", "PRISMA 2020 flow diagram", "Record decision"),
         ("GRADE & Summary of Findings", "Summary of Findings", "Save (authenticated)"),
-        ("Synthesis without MA & SWiM", "Synthesis without meta-analysis", "Save group"),
+        ("Synthesis without MA & SWiM", "Synthesis without meta-analysis", "Preview"),
     ],
 )
 def test_reporting_pages_render_and_require_a_token(
@@ -54,7 +54,13 @@ def test_reporting_pages_render_and_require_a_token(
     assert target
     target[0].click().run()
     assert not at.exception
-    assert any("Not authenticated" in e.value or "Refused" in e.value for e in at.error)
+    # a decision without a token is refused by the API; an incomplete synthesis is already
+    # refused at the preview step, and no save is offered
+    errors = [e.value for e in at.error]
+    assert any(
+        "Not authenticated" in e or "Refused" in e or "at least 1 item" in e for e in errors
+    ), errors
+    assert not [b for b in at.button if "Save the previewed group" in b.label]
     with make_session_factory(engine)() as s:
         repo = Repository(s)
         assert repo.load_checklist_decisions("mc1") == []

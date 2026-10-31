@@ -1036,13 +1036,29 @@ violations, sources without a recorded type such as `manual`) are drawn as a red
 banner. Unsupported variants raise `UnsupportedVariantError` with the fields that cannot be
 filled. The figure legend (`{{figure:prisma}}`, Figure 1) binds the same PRISMA facts.
 
+**Decisions are bound to the state displayed** (review of PR #12). Every decision request
+carries the identifiers of the screen the reviewer saw, and the repository refuses it —
+saving nothing — if that state has changed: checklist decisions send the manuscript version,
+manuscript SHA-256, content-evidence SHA-256 (fingerprint without checklist decisions) and
+the item's displayed decision id; GRADE records send the displayed `inputs_sha256` and record
+id; synthesis groups are first *previewed* (linked evidence, its hash, voting units,
+problems) and saved with the previewed `inputs_sha256` and revision id; SWiM decisions send
+the displayed `synthesis_sha256` and decision id. Withdrawals name the record withdrawn.
+Before checking, the repository takes the database write lock for the transaction
+(`_lock_for_reporting`: a no-op update of the project row), so nothing can change between the
+check and the commit (SQLite has one writer; on other databases the row lock serialises
+reporting decisions).
+
 **Checklists** (`checklist.py`). Suggestions are deterministic (bound evidence keys per
 section; cue phrases as a weak signal) and yield only *requires human review* or *missing*.
 A human decision (`reported` / `partially_reported` with sections and a precise location,
 `missing`, `not_applicable` with a justification) records the manuscript version and
 SHA-256, the evidence-fingerprint SHA-256 and a *basis hash* (located sections' source and
 frozen values + the item's evidence components). A change to either makes the decision
-stale. Batches (`decide_items`) are verified against one evidence state; each item still
+stale. The basis covers the sections named in the decision *and the item's usual sections*
+whatever the status, so a "not applicable" or "missing" decision also goes stale when the
+sections in which the item would be reported change (e.g. a funding statement added after
+"no external support" for item 25). Batches (`decide_items`) are verified against one evidence state; each item still
 carries its own status and justification.
 
 **GRADE** (`grade.py`, `core/schemas/reporting.py`). The question type comes from the
@@ -1058,7 +1074,10 @@ cumulative incidence → single-group estimate. Approaches and starting levels:
 
 Mixed tool sets are refused (rate randomised and non-randomised bodies separately). An
 approved assessment judges all five domains (not serious / serious / very serious = 0/1/2
-levels) with rationales; rating up (large effect 1–2 levels, dose-response 1, plausible
+levels; "extremely serious" = 3 levels exists only for risk of bias under the ROBINS-I
+approach, which starts at high certainty — GRADE guidelines 18 report that such evidence is
+generally rated down at least two levels to low or very low, and reaching very low through
+risk of bias alone needs three) with rationales; rating up (large effect 1–2 levels, dose-response 1, plausible
 confounding 1) is available only for non-randomised approaches; the *implied* certainty
 (initial − downgrades + upgrades, bounded very low…high) is computed, the final certainty
 is the reviewer's and may not exceed initial + upgrades, and any departure from the implied
@@ -1079,7 +1098,25 @@ MD rows show the mean difference; SMD is not re-expressed. Single-group outcomes
 as not a comparative Summary of Findings table. Exports: Markdown/DOCX with a source-key
 appendix.
 
-**Synthesis without meta-analysis** (`synthesis.py`). A group records the SWiM content
+**Synthesis without meta-analysis** (`synthesis.py`). *Direction of effect* is the side of
+the null on which a study's observed effect lies, irrespective of statistical significance
+or the confidence interval (vote counting based on the direction of effect is an acceptable
+method; vote counting based on statistical significance is not — Cochrane Handbook ch. 12,
+§§12.2.1.3 and 12.2.2.1, as cited by the reviewer — the Handbook site was not reachable from
+the build environment; SWiM item 3; Boon & Thomson 2021, ref. 20, verified via PubMed
+Central, which applies the 2019 Handbook guidance and excludes studies with inconsistent
+direction from the count). Categories: favours
+intervention, favours comparator (the only two counted as votes), point estimate exactly at
+the null, mixed/conflicting results and direction not determinable (tabulated, never
+counted). A direction basis that relies on significance, a P value or whether an interval
+includes the null is refused. The *voting unit* is the study/cohort: reports a human linked
+to one study and studies a human judged to share participants (resolved cohort-overlap
+warnings) form one unit, each unit must have exactly one selected result, and any other
+result needs the group's documented selection rule. The vote-count statement is generated
+from these structured directions; a summary that contradicts them (a favoured side no
+selected result shows, or a "consistent" claim the directions do not support) is refused,
+and directional wording that cannot be checked mechanically becomes an audit finding that
+requires an explicit human acknowledgement. A group records the SWiM content
 (grouping and rationale, protocol changes, reason not pooled, standardised metric, method —
 structured tabulation or vote counting on the direction of effect; summary statistics of
 effects and combining P values are not offered —, prioritisation, heterogeneity, certainty
@@ -1192,3 +1229,6 @@ uvicorn src.api_server.main:app --reload                       # binds 127.0.0.1
 19. Iorio A, Spencer FA, Falavigna M, et al. Use of GRADE for assessment of evidence about
     prognosis: rating confidence in estimates of event rates in broad categories of
     patients. *BMJ* 2015;350:h870. doi:10.1136/bmj.h870
+20. Boon MH, Thomson H. The effect direction plot revisited: application of the 2019 Cochrane
+    Handbook guidance on alternative synthesis methods. *Res Synth Methods* 2021;12:29-33.
+    doi:10.1002/jrsm.1458

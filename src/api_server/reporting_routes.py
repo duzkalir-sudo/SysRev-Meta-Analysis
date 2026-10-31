@@ -32,19 +32,37 @@ class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ItemDecisionBody(_Body):
+SHA = r"^[0-9a-f]{64}$"
+
+
+class SeenChecklist(_Body):
+    """The checklist screen the reviewer decided on (from GET /checklists/{name})."""
+
+    manuscript_version: int = Field(ge=1)
+    manuscript_sha256: str = Field(pattern=SHA)
+    evidence_sha256: str = Field(pattern=SHA)
+
+
+class ItemDecision(_Body):
     status: Literal["reported", "partially_reported", "missing", "not_applicable"]
     section_ids: list[str] = Field(default_factory=list)
     location: str = ""
     justification: str = Field(min_length=10)
     evidence_keys: list[str] = Field(default_factory=list)
+    # required (may be null): the item's decision displayed to the reviewer
+    based_on_decision_id: str | None
 
 
-class BulkItemBody(ItemDecisionBody):
+class ItemDecisionBody(ItemDecision):
+    seen: SeenChecklist
+
+
+class BulkItemBody(ItemDecision):
     item_id: str
 
 
 class BulkDecisionBody(_Body):
+    seen: SeenChecklist
     decisions: list[BulkItemBody] = Field(min_length=1, max_length=100)
 
 
@@ -63,10 +81,19 @@ class GradeBody(_Body):
     notes: list[str] = Field(default_factory=list)
     not_assessed_reason: str | None = None
     status_note: str | None = None
+    # the state displayed with the decision support (from GET /grade); both required
+    inputs_sha256: str = Field(pattern=SHA)
+    based_on_assessment_id: str | None
 
 
-class WithdrawBody(_Body):
+class WithdrawGradeBody(_Body):
     reason: str = Field(min_length=10)
+    based_on_assessment_id: str
+
+
+class WithdrawGroupBody(_Body):
+    reason: str = Field(min_length=10)
+    based_on_revision_id: str
 
 
 class SynthesisBody(_Body):
@@ -90,12 +117,22 @@ class SynthesisBody(_Body):
     presentation: str
     limitations: str
     findings: list[dict[str, Any]] = Field(min_length=1)
+    selection_rule: str | None = None
     summary: str
+
+
+class SynthesisSaveBody(SynthesisBody):
+    # from POST /synthesis/preview: the evidence state and group revision displayed
+    inputs_sha256: str = Field(pattern=SHA)
+    based_on_revision_id: str | None
 
 
 class SwimBody(_Body):
     applicability: Literal["applicable", "partially_applicable", "not_applicable"]
     rationale: str = Field(min_length=20)
+    # from GET /swim: the approved syntheses and decision displayed
+    synthesis_sha256: str = Field(pattern=SHA)
+    based_on_decision_id: str | None
 
 
 def _call(fn: Callable[[], T]) -> T:
@@ -203,7 +240,9 @@ def build_reporting_router() -> APIRouter:
         reviewer: ReviewerDep,
     ) -> dict[str, Any]:
         s = svc(session, project_id)
-        d = _call(lambda: s.decide_item(checklist, item_id, **body.model_dump(),
+        data = body.model_dump()
+        seen = data.pop("seen")
+        d = _call(lambda: s.decide_item(checklist, item_id, **data, seen=seen,
                                         reviewer_id=reviewer.id,
                                         reviewer_name=reviewer.display_name))  # fmt: skip
         return d.model_dump(mode="json")
@@ -220,7 +259,8 @@ def build_reporting_router() -> APIRouter:
         location and justification (no blanket approval)."""
         s = svc(session, project_id)
         rows = [d.model_dump() | {"checklist": checklist} for d in body.decisions]
-        out = _call(lambda: s.decide_items(rows, reviewer_id=reviewer.id,
+        out = _call(lambda: s.decide_items(rows, seen=body.seen.model_dump(),
+                                           reviewer_id=reviewer.id,
                                            reviewer_name=reviewer.display_name))  # fmt: skip
         return [d.model_dump(mode="json") for d in out]
 
@@ -236,17 +276,25 @@ def build_reporting_router() -> APIRouter:
 
     @router.post("/grade/{analysis_id}/withdraw")
     def withdraw_grade(
-        project_id: str, analysis_id: str, body: WithdrawBody, session: SessionDep,
+        project_id: str, analysis_id: str, body: WithdrawGradeBody, session: SessionDep,
         reviewer: ReviewerDep,
     ) -> dict[str, Any]:  # fmt: skip
         s = svc(session, project_id)
-        g = _call(lambda: s.withdraw_grade(analysis_id, body.reason, reviewer_id=reviewer.id,
-                                           reviewer_name=reviewer.display_name))  # fmt: skip
+        g = _call(lambda: s.withdraw_grade(
+            analysis_id, body.reason, based_on_assessment_id=body.based_on_assessment_id,
+            reviewer_id=reviewer.id, reviewer_name=reviewer.display_name))  # fmt: skip
         return g.model_dump(mode="json")
+
+    @router.post("/synthesis/preview")
+    def preview_group(project_id: str, body: SynthesisBody, session: SessionDep) -> dict[str, Any]:
+        """Read-only: the linked evidence as it is now, its hash and the problems. A save must
+        send back the returned ``inputs_sha256`` and ``based_on_revision_id``."""
+        s = svc(session, project_id)
+        return _call(lambda: s.preview_group(body.model_dump()))
 
     @router.post("/synthesis")
     def save_group(
-        project_id: str, body: SynthesisBody, session: SessionDep, reviewer: ReviewerDep
+        project_id: str, body: SynthesisSaveBody, session: SessionDep, reviewer: ReviewerDep
     ) -> dict[str, Any]:
         s = svc(session, project_id)
         g = _call(lambda: s.save_group(body.model_dump(), reviewer_id=reviewer.id,
@@ -255,12 +303,13 @@ def build_reporting_router() -> APIRouter:
 
     @router.post("/synthesis/{group_id}/withdraw")
     def withdraw_group(
-        project_id: str, group_id: str, body: WithdrawBody, session: SessionDep,
+        project_id: str, group_id: str, body: WithdrawGroupBody, session: SessionDep,
         reviewer: ReviewerDep,
     ) -> dict[str, Any]:  # fmt: skip
         s = svc(session, project_id)
-        g = _call(lambda: s.withdraw_group(group_id, body.reason, reviewer_id=reviewer.id,
-                                           reviewer_name=reviewer.display_name))  # fmt: skip
+        g = _call(lambda: s.withdraw_group(
+            group_id, body.reason, based_on_revision_id=body.based_on_revision_id,
+            reviewer_id=reviewer.id, reviewer_name=reviewer.display_name))  # fmt: skip
         return g.model_dump(mode="json")
 
     @router.post("/swim")
@@ -269,6 +318,8 @@ def build_reporting_router() -> APIRouter:
     ) -> dict[str, Any]:
         s = svc(session, project_id)
         d = _call(lambda: s.decide_swim(body.applicability, body.rationale,
+                                        synthesis_sha256=body.synthesis_sha256,
+                                        based_on_decision_id=body.based_on_decision_id,
                                         reviewer_id=reviewer.id,
                                         reviewer_name=reviewer.display_name))  # fmt: skip
         return d.model_dump(mode="json")

@@ -28,7 +28,10 @@ from tests.manuscript_helpers import (
     comparative_project,
     complete_manuscript,
     confirm_checklists,
+    decide_swim,
     human,
+    save_grade,
+    save_group,
     single_arm_project,
 )
 
@@ -216,7 +219,7 @@ def test_sof_absolute_effects_require_and_use_a_sourced_baseline(session: Sessio
         "risk": 0.15,
         "source": "median control-group risk reported by the three synthetic trials",
     }
-    rs.save_grade("comp", approval(baseline_risks=[base]), reviewer_id=rid, reviewer_name=REVIEWER)
+    save_grade(rs, "comp", approval(baseline_risks=[base]), rid)
     package = build_evidence_package(repo, "mc1")
     a = package.analysis("comp")
     assert a is not None and a.primary is not None
@@ -240,12 +243,13 @@ def test_sof_absolute_effects_require_and_use_a_sourced_baseline(session: Sessio
 
 def test_without_baseline_no_absolute_effect_is_calculated(session: Session) -> None:
     repo, rid, rs = _comp(session)
-    rs.save_grade("comp", approval(), reviewer_id=rid, reviewer_name=REVIEWER)
+    save_grade(rs, "comp", approval(), rid)
     package = build_evidence_package(repo, "mc1")
     assert not any(k.startswith("sof.comp.") for k in package.facts)
     assert "not calculated: no assumed comparator risk" in package.templates["table:sof"]
     with pytest.raises(SysRevError, match="not in the reference registry"):
-        rs.save_grade(
+        save_grade(
+            rs,
             "comp",
             approval(
                 baseline_risks=[
@@ -257,22 +261,17 @@ def test_without_baseline_no_absolute_effect_is_calculated(session: Session) -> 
                     }
                 ]
             ),
-            reviewer_id=rid,
-            reviewer_name=REVIEWER,
+            rid,
         )
 
 
 def test_approach_must_match_the_evidence(session: Session) -> None:
     _, rid, rs = _comp(session)
     with pytest.raises(SysRevError, match="robins_i"):
-        rs.save_grade(
-            "comp",
-            approval(approach="interventions_nrsi_robins_i"),
-            reviewer_id=rid,
-            reviewer_name=REVIEWER,
-        )
+        save_grade(rs, "comp", approval(approach="interventions_nrsi_robins_i"), rid)
     with pytest.raises((SysRevError, ValueError), match="does not apply"):
-        rs.save_grade(
+        save_grade(
+            rs,
             "comp",
             approval(
                 approach="overall_prognosis",
@@ -280,11 +279,10 @@ def test_approach_must_match_the_evidence(session: Session) -> None:
                 initial_rationale="x" * 30,
                 framework_rationale="y" * 60,
             ),
-            reviewer_id=rid,
-            reviewer_name=REVIEWER,
+            rid,
         )
     with pytest.raises(SysRevError):  # an unknown (automated) identity cannot record GRADE
-        rs.save_grade("comp", approval(), reviewer_id="agent", reviewer_name="agent")
+        save_grade(rs, "comp", approval(), "agent")
     view = {g["analysis_id"]: g for g in rs.grade()}["comp"]
     assert view["applicable_approaches"] == ["interventions_randomised"]
     assert "no value here determines" in view["decision_support"]["disclaimer"]
@@ -295,7 +293,7 @@ def test_approach_must_match_the_evidence(session: Session) -> None:
 
 def test_changed_risk_of_bias_makes_the_assessment_stale(session: Session) -> None:
     repo, rid, rs = _comp(session)
-    rs.save_grade("comp", approval(), reviewer_id=rid, reviewer_name=REVIEWER)
+    save_grade(rs, "comp", approval(), rid)
     svc = ManuscriptService(repo, "mc1")
     complete_manuscript(svc, human(repo, rid))
     assert svc.audit().passed
@@ -313,9 +311,11 @@ def test_changed_risk_of_bias_makes_the_assessment_stale(session: Session) -> No
         for f in r.findings
     )
     assert not r.passed
+    shown = next(r for r in rs.grade() if r["analysis_id"] == "comp")["based_on_assessment_id"]
     rs.withdraw_grade(
         "comp",
         "risk of bias re-assessed; GRADE to be redone",
+        based_on_assessment_id=shown,
         reviewer_id=rid,
         reviewer_name=REVIEWER,
     )
@@ -325,25 +325,25 @@ def test_changed_risk_of_bias_makes_the_assessment_stale(session: Session) -> No
 
 def test_draft_blocks_but_declared_not_assessed_does_not(session: Session) -> None:
     repo, rid, rs = _comp(session)
-    rs.save_grade(
+    save_grade(
+        rs,
         "comp",
         {"status": "draft", "approach": "interventions_randomised", "domains": domains()},
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
+        rid,
     )
     svc = ManuscriptService(repo, "mc1")
     complete_manuscript(svc, human(repo, rid))
     r = svc.audit()
     assert any("drafted but not approved" in f.message for f in r.findings if f.blocking)
-    rs.save_grade(
+    save_grade(
+        rs,
         "comp",
         {
             "status": "not_assessed",
             "not_assessed_reason": "not_performed",
             "status_note": "certainty assessment outside the scope of this synthetic review",
         },
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
+        rid,
     )
     package = build_evidence_package(repo, "mc1")
     assert "certainty was not assessed" in package.facts["grade.methods"].text
@@ -369,7 +369,7 @@ def test_typed_certainty_claims_are_checked(session: Session) -> None:
         f.status == CheckStatus.UNSUPPORTED and "no current, approved GRADE" in f.message
         for f in r.findings
     )
-    rs.save_grade("comp", approval(), reviewer_id=rid, reviewer_name=REVIEWER)
+    save_grade(rs, "comp", approval(), rid)
     svc.rerender(human(repo, rid))
     r = svc.audit()
     assert any(
@@ -384,8 +384,9 @@ def test_single_arm_evidence_summary_is_not_a_comparative_sof(session: Session) 
     repo, rid, _ = single_arm_project(session)
     rs = ReportingService(repo, "ms1")
     with pytest.raises((SysRevError, ValueError), match="does not apply"):
-        rs.save_grade("nec", approval(), reviewer_id=rid, reviewer_name=REVIEWER)
-    rs.save_grade(
+        save_grade(rs, "nec", approval(), rid)
+    save_grade(
+        rs,
         "nec",
         approval(
             approach="overall_prognosis",
@@ -396,8 +397,7 @@ def test_single_arm_evidence_summary_is_not_a_comparative_sof(session: Session) 
             domains=domains(imprecision="serious", risk_of_bias="serious"),
             final_certainty="low",
         ),
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
+        rid,
     )
     package = build_evidence_package(repo, "ms1")
     assert "table:sof" not in package.templates
@@ -451,7 +451,7 @@ def _group(repo: Any, rid: str, **kw: Any) -> dict[str, Any]:
 
 def test_mixed_review_synthesis_is_source_linked_and_not_pooled(session: Session) -> None:
     repo, rid, rs = _comp(session)
-    rs.save_group(_group(repo, rid), reviewer_id=rid, reviewer_name=REVIEWER)
+    save_group(rs, _group(repo, rid), rid)
     package = build_evidence_package(repo, "mc1")
     contribution = package.facts["synthesis.g1.contribution"].text
     assert contribution.startswith("1 study contributed to this synthesis without meta-analysis")
@@ -463,19 +463,13 @@ def test_mixed_review_synthesis_is_source_linked_and_not_pooled(session: Session
     r = svc.audit()
     swim = [f for f in r.findings if f.blocking and "SWiM" in f.message]
     assert swim and "no current decision" in swim[0].message
-    rs.decide_swim(
-        "not_applicable",
-        "synthetic: a single tabulated trial, no synthesis of effects",
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
+    decide_swim(
+        rs, "not_applicable", "synthetic: a single tabulated trial, no synthesis of effects", rid
     )
     r = svc.audit()
     assert not [f for f in r.findings if f.blocking and "SWiM" in f.location]
-    rs.decide_swim(
-        "applicable",
-        "quantitative intervention effects synthesised without meta-analysis",
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
+    decide_swim(
+        rs, "applicable", "quantitative intervention effects synthesised without meta-analysis", rid
     )
     svc.rerender(human(repo, rid))  # the supplementary list now names the SWiM checklist
     confirm_checklists(repo, "mc1", rid)
@@ -505,10 +499,8 @@ def test_unsupported_synthesis_claims_are_refused(
 ) -> None:
     repo, rid, rs = _comp(session)
     with pytest.raises(SysRevError, match=message):
-        rs.save_group(_group(repo, rid, **change), reviewer_id=rid, reviewer_name=REVIEWER)
-    draft = rs.save_group(
-        _group(repo, rid, status="draft", **change), reviewer_id=rid, reviewer_name=REVIEWER
-    )
+        save_group(rs, _group(repo, rid, **change), rid)
+    draft = save_group(rs, _group(repo, rid, status="draft", **change), rid)
     assert draft.status == "draft"
     assert any(message.split()[0] in p for p in rs.syntheses()[0]["problems"])
 
@@ -519,7 +511,7 @@ def test_finding_numbers_must_come_from_linked_evidence(session: Session) -> Non
     body["findings"][0]["finding"] = "Complications occurred in 13 of 100 participants (X)."
     body["summary"] = "The single trial favoured X."
     with pytest.raises(SysRevError, match="does not appear in its linked evidence"):
-        rs.save_group(body, reviewer_id=rid, reviewer_name=REVIEWER)
+        save_group(rs, body, rid)
 
 
 def test_directions_need_a_comparison_and_consistent_claims(session: Session) -> None:
@@ -547,16 +539,16 @@ def test_directions_need_a_comparison_and_consistent_claims(session: Session) ->
     ]
     rs = ReportingService(repo, "ms1")
     with pytest.raises(SysRevError, match="needs a comparison"):
-        rs.save_group(body, reviewer_id=rid, reviewer_name=REVIEWER)
+        save_group(rs, body, rid)
     body["findings"][0] |= {"direction": "not_applicable", "direction_basis": None}
     body["summary"] = "Necrosis was consistently lower than in other series."
     with pytest.raises(SysRevError, match="directional statement"):
-        rs.save_group(body, reviewer_id=rid, reviewer_name=REVIEWER)
+        save_group(rs, body, rid)
 
 
 def test_changed_study_links_invalidate_an_approved_synthesis(session: Session) -> None:
     repo, rid, rs = _comp(session)
-    rs.save_group(_group(repo, rid), reviewer_id=rid, reviewer_name=REVIEWER)
+    save_group(rs, _group(repo, rid), rid)
     link_reports_to_study(
         repo,
         "mc1",

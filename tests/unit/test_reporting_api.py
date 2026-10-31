@@ -53,8 +53,21 @@ def test_decisions_require_a_token_and_never_name_the_reviewer(
     api: tuple[TestClient, dict[str, str]],
 ) -> None:
     client, auth = api
-    body = {"status": "not_applicable", "justification": "no funding for this synthetic review"}
+    screen = client.get(f"{BASE}/checklists/prisma_2020_main").json()
+    seen = {k: screen[k] for k in ("manuscript_version", "manuscript_sha256", "evidence_sha256")}
+    body = {
+        "status": "not_applicable",
+        "justification": "no funding for this synthetic review",
+        "seen": seen,
+        "based_on_decision_id": next(
+            (r["decision"] or {}).get("decision_id")
+            for r in screen["items"]
+            if r["item_id"] == "25"
+        ),
+    }
     url = f"{BASE}/checklists/prisma_2020_main/items/25"
+    without_state = {k: v for k, v in body.items() if k not in ("seen", "based_on_decision_id")}
+    assert client.post(url, json=without_state, headers=auth).status_code == 422
     assert client.post(url, json=body).status_code == 401
     assert client.post(url, json=body | {"reviewer_name": "x"}, headers=auth).status_code == 422
     ok = client.post(url, json=body, headers=auth)
@@ -80,6 +93,9 @@ def test_decisions_require_a_token_and_never_name_the_reviewer(
         "final_certainty": "high",
         "summary": "no domain rated down (synthetic)",
     }
+    assert client.post(f"{BASE}/grade/comp", json=grade, headers=auth).status_code == 422
+    shown = client.get(f"{BASE}/grade").json()[0]
+    grade |= {"inputs_sha256": shown["inputs_sha256"], "based_on_assessment_id": None}
     assert client.post(f"{BASE}/grade/comp", json=grade).status_code == 401
     r = client.post(f"{BASE}/grade/comp", json=grade, headers=auth)
     assert r.status_code == 200 and r.json()["implied_certainty"] == "high"
@@ -99,6 +115,8 @@ def test_decisions_require_a_token_and_never_name_the_reviewer(
             json={
                 "applicability": "applicable",
                 "rationale": "no synthesis without MA here (synthetic)",
+                "synthesis_sha256": client.get(f"{BASE}/swim").json()["synthesis_sha256"],
+                "based_on_decision_id": None,
             },
             headers=auth,
         ).status_code

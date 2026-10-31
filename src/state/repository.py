@@ -10,7 +10,7 @@ import hashlib
 import uuid
 from collections.abc import Sequence
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, text
 from sqlalchemy.orm import Session
 
 from src.core.enums import (
@@ -1876,6 +1876,16 @@ class Repository:
         )
         return [r.payload for r in rows]
 
+    def _lock_for_reporting(self, project_id: str) -> None:
+        """Take the database write lock for this transaction *before* the preconditions of a
+        reporting decision are checked, so the state checked is the state the decision is
+        stored against: no other writer can change records, decisions or evidence between
+        the check and the commit (SQLite allows one writer; on other databases this locks the
+        project row, which serialises reporting decisions)."""
+        self.session.execute(
+            text("UPDATE projects SET title = title WHERE id = :pid"), {"pid": project_id}
+        )
+
     def _require_reporting_phase(self, project_id: str) -> None:
         phase = self.get_project(project_id).phase
         if phase not in self.STAGE6_EDITABLE:
@@ -1907,6 +1917,7 @@ class Repository:
         self._require_reporting_phase(pid)
         for d in decisions:
             self._require_named_reviewer(d.reviewer_id, d.reviewer_name)
+        self._lock_for_reporting(pid)
         try:
             package = build_evidence_package(self, pid)
         except SysRevError as exc:
@@ -1935,6 +1946,7 @@ class Repository:
         self._require_reporting_phase(assessment.project_id)
         if assessment.reviewer_id is not None or assessment.actor_type == ActorType.HUMAN:
             self._require_named_reviewer(assessment.reviewer_id, assessment.created_by)
+        self._lock_for_reporting(assessment.project_id)
         problems = grade_problems(self, assessment)
         if problems:
             raise SysRevError("GRADE record refused: " + "; ".join(problems))
@@ -1952,6 +1964,7 @@ class Repository:
         self._require_reporting_phase(group.project_id)
         if group.reviewer_id is not None or group.actor_type == ActorType.HUMAN:
             self._require_named_reviewer(group.reviewer_id, group.created_by)
+        self._lock_for_reporting(group.project_id)
         problems = synthesis_problems(self, group)
         if problems:
             raise SysRevError("synthesis refused: " + "; ".join(problems))
@@ -1968,6 +1981,7 @@ class Repository:
 
         self._require_reporting_phase(decision.project_id)
         self._require_named_reviewer(decision.reviewer_id, decision.reviewer_name)
+        self._lock_for_reporting(decision.project_id)
         problems = swim_applicability_problems(self, decision)
         if problems:
             raise SysRevError("SWiM applicability decision refused: " + "; ".join(problems))

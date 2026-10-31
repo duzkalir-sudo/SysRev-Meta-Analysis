@@ -45,13 +45,17 @@ def decision_basis(
     fingerprint: dict[str, str],
     status: str,
 ) -> str:
-    sections = section_ids if status in ("reported", "partially_reported") else []
+    # Every decision rests on manuscript content: where the item is reported, and — for
+    # "not applicable" or "missing" — the sections in which it would be reported (e.g. a
+    # funding statement added later contradicts "no external support"). The basis therefore
+    # covers the named sections and the item's usual sections, whatever the status.
+    sections = sorted(set(section_ids) | set(item.sections))
     return canonical_sha256(
         {
             "checklist": item.checklist,
             "item": item.item_id,
             "status": status,
-            "sections": {s: section_basis(version, s) for s in sorted(sections)},
+            "sections": {s: section_basis(version, s) for s in sections},
             "evidence": {k: fingerprint.get(k) for k in sorted(item.evidence)},
         }
     )

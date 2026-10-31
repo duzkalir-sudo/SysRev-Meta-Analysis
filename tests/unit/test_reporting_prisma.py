@@ -27,6 +27,7 @@ from tests.manuscript_helpers import (
     SYSTEM,
     complete_manuscript,
     confirm_checklists,
+    decide_item,
     fill_author_input,
     human,
     single_arm_project,
@@ -234,39 +235,39 @@ def test_keyword_presence_is_never_compliance(session: Session) -> None:
 def test_decisions_need_location_reviewer_and_current_basis(session: Session) -> None:
     repo, rid, svc, rs = _draft(session)
     with pytest.raises(ValueError, match="location"):
-        rs.decide_item(
+        decide_item(
+            rs,
             "prisma_2020_main",
             "6",
+            rid,
             status="reported",
             section_ids=[],
             location="",
             justification="search described",
             evidence_keys=[],
-            reviewer_id=rid,
-            reviewer_name=REVIEWER,
         )
     with pytest.raises(SysRevError):  # an unknown (e.g. automated) identity
-        rs.decide_item(
+        decide_item(
+            rs,
             "prisma_2020_main",
             "6",
+            "agent",
             status="reported",
             section_ids=["methods"],
             location="Methods, Information sources",
             justification="search described",
             evidence_keys=[],
-            reviewer_id="agent",
-            reviewer_name="agent",
         )
-    d = rs.decide_item(
+    d = decide_item(
+        rs,
         "prisma_2020_main",
         "6",
+        rid,
         status="reported",
         section_ids=["methods"],
         location="Methods, Information sources and search",
         justification="all databases and the last search date are stated",
         evidence_keys=["search.statement"],
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
     )
     # a forged decision (wrong basis hash) is refused by the repository
     forged = ChecklistDecision.model_validate(
@@ -301,31 +302,31 @@ def test_missing_items_block_and_complete_record_passes(session: Session) -> Non
     confirm_checklists(repo, "ms1", rid)
     rs = ReportingService(repo, "ms1")
     # a reviewer records an item as not reported: it blocks
-    rs.decide_item(
+    decide_item(
+        rs,
         "prisma_2020_main",
         "25",
+        rid,
         status="missing",
         section_ids=[],
         location="",
         justification="funding statement not yet written",
         evidence_keys=[],
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
     )
     r = svc.audit()
     assert [f.message for f in r.findings if f.blocking] == [
         "a reviewer recorded PRISMA 2020 item 25 (Support) as not reported"
     ]
-    rs.decide_item(
+    decide_item(
+        rs,
         "prisma_2020_main",
         "25",
+        rid,
         status="partially_reported",
         section_ids=["supplementary"],
         location="Supplementary material",
         justification="sources of support listed; role of funders not described",
         evidence_keys=[],
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
     )
     r = svc.audit()
     assert r.passed and any(f.scope == "reporting" and f.needs_human for f in r.findings)
@@ -338,16 +339,16 @@ def test_checklist_decision_after_audit_invalidates_it(session: Session) -> None
     report = svc.audit()
     assert report.passed
     assert not any("evidence changed" in p for p in completion_problems(repo, "ms1"))
-    ReportingService(repo, "ms1").decide_item(
+    decide_item(
+        ReportingService(repo, "ms1"),
         "prisma_2020_main",
         "26",
+        rid,
         status="missing",
         section_ids=[],
         location="",
         justification="competing interests not declared",
         evidence_keys=[],
-        reviewer_id=rid,
-        reviewer_name=REVIEWER,
     )
     problems = completion_problems(repo, "ms1")
     assert any("evidence changed" in p and "reporting_decisions" in p for p in problems)
@@ -402,16 +403,16 @@ def test_swim_checklist_refused_when_not_triggered(session: Session) -> None:
     repo, rid, _ = single_arm_project(session)
     complete_manuscript(ManuscriptService(repo, "ms1"), human(repo, rid))
     with pytest.raises(SysRevError, match="SWiM checklist is not required"):
-        ReportingService(repo, "ms1").decide_item(
+        decide_item(
+            ReportingService(repo, "ms1"),
             "swim",
             "3",
+            rid,
             status="not_applicable",
             section_ids=[],
             location="",
             justification="no synthesis without meta-analysis",
             evidence_keys=[],
-            reviewer_id=rid,
-            reviewer_name=REVIEWER,
         )
     package = build_evidence_package(repo, "ms1")
     assert package.reporting is not None and not package.reporting.swim_required

@@ -362,6 +362,10 @@ against the persisted PRISMA facts, current human decisions for every checklist 
 current GRADE records (recomputed absolute effects; certainty words typed in the text),
 current syntheses and the SWiM decision. Any relevant change to the manuscript sections or
 to the evidence makes the affected decisions stale; they are re-confirmed, never repaired.
+Each decision is tied to the screen you saw: if the manuscript, the evidence or the record
+changed after the page was loaded, the decision is refused and nothing is saved — reload,
+review and decide again. A synthesis is saved in two steps (preview the linked evidence, then
+save what you previewed).
 
 ### What is and is not validated (Session 7)
 

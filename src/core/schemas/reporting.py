@@ -81,8 +81,14 @@ class ChecklistDecision(FrozenModel):
     )
     manuscript_version: int = Field(ge=1)
     manuscript_sha256: str = SHA
-    evidence_sha256: str = SHA
+    evidence_sha256: str = Field(
+        pattern=r"^[0-9a-f]{64}$",
+        description="content evidence fingerprint (SHA-256) displayed to the reviewer",
+    )
     basis_sha256: str = SHA
+    based_on_decision_id: Identifier | None = Field(
+        default=None, description="the item's decision displayed to the reviewer (None: none)"
+    )
     reviewer_id: Identifier
     reviewer_name: NonEmptyStr
     decided_at: AwareDatetime = Field(default_factory=utc_now)
@@ -130,8 +136,16 @@ DOMAIN_LABEL: dict[str, str] = {
     "imprecision": "imprecision",
     "publication_bias": "publication bias",
 }
-Concern = Literal["not_serious", "serious", "very_serious"]
-CONCERN_LEVELS: dict[str, int] = {"not_serious": 0, "serious": 1, "very_serious": 2}
+Concern = Literal["not_serious", "serious", "very_serious", "extremely_serious"]
+CONCERN_LEVELS: dict[str, int] = {
+    "not_serious": 0, "serious": 1, "very_serious": 2, "extremely_serious": 3,
+}  # fmt: skip
+# Rating down by three levels ("extremely serious") exists for risk of bias in bodies of
+# non-randomised evidence assessed with ROBINS-I, which start at high certainty (GRADE
+# guidelines 18: such evidence is generally rated down by at least two levels, to low or very
+# low; reaching very low from high through risk of bias alone requires three). It is not
+# available for any other domain or approach.
+THREE_LEVEL_SCOPE = ("risk_of_bias", "interventions_nrsi_robins_i")
 
 UpgradeFactor = Literal["large_effect", "dose_response", "plausible_confounding"]
 UPGRADE_LABEL: dict[str, str] = {
@@ -253,6 +267,9 @@ class GradeAssessment(FrozenModel):
     ) = None
     status_note: str | None = Field(default=None, max_length=4000)
     inputs_sha256: str = SHA
+    based_on_assessment_id: Identifier | None = Field(
+        default=None, description="the record displayed to the reviewer (None: none)"
+    )
     created_by: NonEmptyStr
     actor_type: ActorType
     reviewer_id: Identifier | None = None
@@ -307,6 +324,14 @@ class GradeAssessment(FrozenModel):
             raise ValueError("not_assessed_reason only applies to 'not assessed' records")
         if self.approach is not None:
             self._approach_rules()
+        for d in self.domains:
+            if d.concern == "extremely_serious" and (d.domain, self.approach) != THREE_LEVEL_SCOPE:
+                raise ValueError(
+                    "'extremely serious' (rating down by three levels) applies only to risk of "
+                    "bias with the ROBINS-I approach (non-randomised studies starting at high "
+                    f"certainty); not to {d.domain.replace('_', ' ')} with "
+                    f"{APPROACH_LABEL.get(str(self.approach), 'no approach')}"
+                )
         names = [d.domain for d in self.domains]
         if len(names) != len(set(names)):
             raise ValueError("each GRADE domain is judged once")
@@ -413,20 +438,39 @@ NotPooledReason = Literal[
     "single_study",
     "other",
 ]
+# The direction of effect is the side of the null on which the study's observed effect lies,
+# irrespective of its statistical significance or confidence interval (vote counting based
+# on the direction of effect; vote counting based on statistical significance is not an
+# acceptable synthesis method — Cochrane Handbook ch. 12, McKenzie & Brennan; SWiM item 3;
+# Boon MH, Thomson H. Res Synth Methods 2021;12:29-33, doi:10.1002/jrsm.1458, which applies
+# that guidance and excludes studies with inconsistent direction from the count).
+# Only "favours_*" enter a vote count. A point estimate exactly at the null, mixed results
+# within a study and an unreportable direction are tabulated, never counted as votes.
 Direction = Literal[
     "favours_intervention",
     "favours_comparator",
-    "no_clear_difference",
+    "point_estimate_at_null",
     "mixed_or_conflicting",
+    "direction_not_determinable",
     "not_applicable",
 ]
+VOTE_DIRECTIONS = frozenset({"favours_intervention", "favours_comparator"})
 DIRECTION_LABEL: dict[str, str] = {
-    "favours_intervention": "favoured the intervention",
-    "favours_comparator": "favoured the comparator",
-    "no_clear_difference": "showed no clear difference",
-    "mixed_or_conflicting": "showed mixed or conflicting results",
+    "favours_intervention": "favoured the intervention (observed direction)",
+    "favours_comparator": "favoured the comparator (observed direction)",
+    "point_estimate_at_null": "had a point estimate exactly at the null (not counted)",
+    "mixed_or_conflicting": "had results in conflicting directions (not counted)",
+    "direction_not_determinable": "did not report enough to establish a direction (not counted)",
     "not_applicable": "direction not applicable",
 }
+# A direction basis may not rest on statistical significance, P values or whether an
+# interval includes the null: those classify by significance, not by direction.
+SIGNIFICANCE_BASIS_RE = re.compile(
+    r"significan|\bp\s*[<>=≤≥]|\bp[- ]?values?\b|confidence interval\w*\s+"
+    r"(?:includ|cross|overlap|span|contain)|\bCI\s+(?:includ|cross|overlap|span|contain)|"
+    r"\bnull\s+(?:not\s+)?(?:included|excluded)|\bchance\b",
+    re.IGNORECASE,
+)
 # SWiM item 3 lists further methods (summary statistics of effect estimates, combining P
 # values); they compute new statistics and are not implemented, so they cannot be chosen.
 SynthesisMethod = Literal["structured_tabulation", "vote_counting_direction_of_effect"]
@@ -449,6 +493,11 @@ class SynthesisFinding(StrictModel):
     finding: str = Field(min_length=10, max_length=2000)
     direction: Direction = "not_applicable"
     direction_basis: str | None = Field(default=None, max_length=2000)
+    selected_for_unit: bool = Field(
+        default=True,
+        description="this result represents its study/cohort (the voting unit); other "
+        "results of the same unit are tabulated but never counted",
+    )
 
     @model_validator(mode="after")
     def _sourced(self) -> SynthesisFinding:
@@ -458,6 +507,15 @@ class SynthesisFinding(StrictModel):
             self.direction_basis and len(self.direction_basis) >= 10
         ):
             raise ValueError("a direction of effect needs its basis (≥ 10 characters)")
+        if self.direction_basis and SIGNIFICANCE_BASIS_RE.search(self.direction_basis):
+            raise ValueError(
+                f"the direction basis for report {self.record_id} relies on statistical "
+                "significance, a P value or the confidence interval; the direction of effect "
+                "is the side of the null on which the observed effect lies, regardless of "
+                "significance (vote counting based on significance is not acceptable — "
+                "Cochrane Handbook 12.2.2.1). State the observed direction, or record the "
+                "result as direction not determinable"
+            )
         return self
 
 
@@ -488,8 +546,18 @@ class SynthesisGroup(FrozenModel):
     presentation: str = Field(min_length=10, max_length=2000)
     limitations: str = Field(min_length=20, max_length=4000)
     findings: list[SynthesisFinding] = Field(min_length=1)
+    selection_rule: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="how one result was selected for a study/cohort with several reports or "
+        "results (required whenever a result is not selected)",
+    )
     summary: str = Field(min_length=20, max_length=4000)
     inputs_sha256: str = SHA
+    revision_id: Identifier = Field(default_factory=new_id)
+    based_on_revision_id: Identifier | None = Field(
+        default=None, description="the revision displayed to the reviewer (None: new group)"
+    )
     status_note: str | None = Field(default=None, max_length=4000)
     created_by: NonEmptyStr
     actor_type: ActorType
@@ -512,11 +580,18 @@ class SynthesisGroup(FrozenModel):
         if len(records) != len(set(records)):
             raise ValueError("each report contributes one finding per group")
         if self.synthesis_method == "vote_counting_direction_of_effect" and any(
-            f.direction == "not_applicable" for f in self.findings
+            f.direction == "not_applicable" for f in self.findings if f.selected_for_unit
         ):
             raise ValueError(
-                "vote counting based on direction of effect needs a judged direction for every "
-                "contributing study"
+                "vote counting based on direction of effect needs a judged direction (or "
+                "'direction not determinable') for every selected study result"
+            )
+        if any(not f.selected_for_unit for f in self.findings) and not (
+            self.selection_rule and len(self.selection_rule) >= 20
+        ):
+            raise ValueError(
+                "a result that does not represent its study/cohort needs the documented "
+                "selection rule (≥ 20 characters) used to choose the counted result"
             )
         return self
 
@@ -537,6 +612,9 @@ class SwimApplicability(FrozenModel):
     applicability: Literal["applicable", "partially_applicable", "not_applicable"]
     rationale: str = Field(min_length=20, max_length=4000)
     synthesis_sha256: str = SHA
+    based_on_decision_id: Identifier | None = Field(
+        default=None, description="the decision displayed to the reviewer (None: none)"
+    )
     reviewer_id: Identifier
     reviewer_name: NonEmptyStr
     decided_at: AwareDatetime = Field(default_factory=utc_now)

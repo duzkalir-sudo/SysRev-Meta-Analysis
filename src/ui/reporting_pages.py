@@ -102,6 +102,12 @@ def checklist_panel(be: UIBackend, pid: str, name: str, token: str | None, show:
                         "section_ids": sections,
                         "location": location,
                         "justification": justification,
+                        # the state this screen displayed: refused if it has changed since
+                        "based_on_decision_id": (row["decision"] or {}).get("decision_id"),
+                        "seen": {
+                            k: data[k]
+                            for k in ("manuscript_version", "manuscript_sha256", "evidence_sha256")
+                        },
                     },
                 ),
                 "Decision recorded.",
@@ -216,9 +222,10 @@ def page_grade(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
         domains = []
         for d in GRADE_DOMAINS:
             c = st.columns([1, 3])
-            concern = c[0].selectbox(
-                d.replace("_", " "), ["not_serious", "serious", "very_serious"], key=f"{aid}_{d}"
-            )
+            options = ["not_serious", "serious", "very_serious"]
+            if d == "risk_of_bias":  # three levels: ROBINS-I approach only (checked by the API)
+                options.append("extremely_serious")
+            concern = c[0].selectbox(d.replace("_", " "), options, key=f"{aid}_{d}")
             why = c[1].text_input(f"Rationale: {d.replace('_', ' ')}", key=f"{aid}_{d}_why")
             domains.append({"domain": d, "concern": concern, "rationale": why})
         upgrades = []
@@ -245,7 +252,12 @@ def page_grade(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
         )
         note = st.text_input("If not assessed: explanation")
         if st.form_submit_button("Save (authenticated)"):
-            body: dict[str, Any] = {"status": status}
+            body: dict[str, Any] = {
+                "status": status,
+                # the decision support and record this screen displayed
+                "inputs_sha256": row["inputs_sha256"],
+                "based_on_assessment_id": row["based_on_assessment_id"],
+            }
             if status == "not_assessed":
                 body |= {"not_assessed_reason": reason, "status_note": note}
             else:
@@ -280,7 +292,7 @@ def page_grade(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
                 be.api.post(
                     f"/projects/{pid}/reporting/grade/{aid}/withdraw",
                     token=token,
-                    json={"reason": why},
+                    json={"reason": why, "based_on_assessment_id": row["based_on_assessment_id"]},
                 )
             )
     st.subheader("Summary of Findings and evidence summaries (preview)")
@@ -360,12 +372,21 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
                     "not_applicable",
                     "favours_intervention",
                     "favours_comparator",
-                    "no_clear_difference",
+                    "point_estimate_at_null",
                     "mixed_or_conflicting",
+                    "direction_not_determinable",
                 ],
                 key=f"dir{i}",
+                help="The observed direction of the effect estimate, irrespective of statistical "
+                "significance or the confidence interval. Results at the null, mixed or "
+                "undeterminable directions are tabulated and never counted as votes.",
             )
-            why = st.text_input("Basis for the direction", key=f"why{i}")
+            why = st.text_input(
+                "Basis for the direction (observed direction, not significance)", key=f"why{i}"
+            )
+            unit = st.checkbox(
+                "This result represents its study/cohort (counted)", value=True, key=f"unit{i}"
+            )
             sel = [choices[k] for k in picked]
             if sel:
                 findings.append(
@@ -375,41 +396,65 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
                         "finding": text,
                         "direction": direction,
                         "direction_basis": why or None,
+                        "selected_for_unit": unit,
                     }
                 )
+        selection_rule = st.text_input(
+            "Selection rule when a study/cohort has several reports or results (required then)"
+        )
         summary = st.text_area("Narrative summary (SWiM 8)")
         status = st.selectbox("Record as", ["draft", "approved"])
-        if st.form_submit_button("Save group (authenticated)"):
-            show(
-                be.api.post(
-                    f"/projects/{pid}/reporting/synthesis",
-                    token=token,
-                    json={
-                        "group_id": gid,
-                        "outcome_id": outcome,
-                        "status": status,
-                        "title": title,
-                        "grouping_basis": basis,
-                        "description": description,
-                        "rationale": rationale,
-                        "protocol_change": change,
-                        "protocol_change_rationale": change_why or None,
-                        "reason_not_pooled": reason,
-                        "reason_note": reason_note,
-                        "standardised_metric": metric,
-                        "synthesis_method": method,
-                        "method_justification": method_why,
-                        "prioritisation_criteria": prioritisation or None,
-                        "heterogeneity_investigation": heterogeneity or None,
-                        "certainty_method": certainty,
-                        "presentation": presentation,
-                        "limitations": limitations,
-                        "findings": findings,
-                        "summary": summary,
-                    },
-                ),
-                "Saved.",
-            )
+        if st.form_submit_button("Preview the linked evidence (step 1 of 2)"):
+            st.session_state["synthesis_draft"] = {
+                "group_id": gid,
+                "outcome_id": outcome,
+                "status": status,
+                "title": title,
+                "grouping_basis": basis,
+                "description": description,
+                "rationale": rationale,
+                "protocol_change": change,
+                "protocol_change_rationale": change_why or None,
+                "reason_not_pooled": reason,
+                "reason_note": reason_note,
+                "standardised_metric": metric,
+                "synthesis_method": method,
+                "method_justification": method_why,
+                "prioritisation_criteria": prioritisation or None,
+                "heterogeneity_investigation": heterogeneity or None,
+                "certainty_method": certainty,
+                "presentation": presentation,
+                "limitations": limitations,
+                "findings": findings,
+                "selection_rule": selection_rule or None,
+                "summary": summary,
+            }
+    draft = st.session_state.get("synthesis_draft")
+    if draft:
+        preview = be.api.post(f"/projects/{pid}/reporting/synthesis/preview", json=draft)
+        if not preview.ok:
+            st.error(preview.error)
+        else:
+            st.markdown("**Linked evidence as it is now (review before saving)**")
+            st.json(preview.data["evidence"])
+            st.caption(f"Independent study units: {preview.data['voting_units']}")
+            for prob in preview.data["problems"]:
+                st.error(prob)
+            if st.button("Save the previewed group (step 2 of 2, authenticated)"):
+                ok = show(
+                    be.api.post(
+                        f"/projects/{pid}/reporting/synthesis",
+                        token=token,
+                        json=draft
+                        | {
+                            "inputs_sha256": preview.data["inputs_sha256"],
+                            "based_on_revision_id": preview.data["based_on_revision_id"],
+                        },
+                    ),
+                    "Saved.",
+                )
+                if ok:
+                    st.session_state.pop("synthesis_draft", None)
     st.subheader("SWiM reporting guideline")
     swim = be.api.get(f"/projects/{pid}/reporting/swim")
     if swim.ok:
@@ -432,7 +477,13 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
                     be.api.post(
                         f"/projects/{pid}/reporting/swim",
                         token=token,
-                        json={"applicability": choice, "rationale": why},
+                        json={
+                            "applicability": choice,
+                            "rationale": why,
+                            # the syntheses and decision this screen displayed
+                            "synthesis_sha256": data["synthesis_sha256"],
+                            "based_on_decision_id": data["based_on_decision_id"],
+                        },
                     )
                 )
         if data["checklist_required"]:

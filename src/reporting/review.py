@@ -290,6 +290,18 @@ def reporting_checks(version: ManuscriptVersion, package: EvidencePackage) -> li
                         f"synthesis.{gid}",
                     )
                 )
+            for sentence in g.unverifiable:
+                out.append(
+                    ReportingCheck(
+                        CheckStatus.REQUIRES_HUMAN_REVIEW,
+                        loc,
+                        "the narrative summary makes a directional statement that the recorded "
+                        f"study-level directions can neither confirm nor contradict: {sentence!r}",
+                        "Confirm that the statement follows from the tabulated findings, or "
+                        "reword it using the recorded directions.",
+                        f"synthesis.{gid}.summary",
+                    )
+                )
     # ---- SWiM
     if rs.swim_required:
         if rs.swim is None or rs.swim_stale:

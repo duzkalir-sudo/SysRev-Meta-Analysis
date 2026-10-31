@@ -24,8 +24,15 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from dataclasses import dataclass
 
-from src.core.schemas.reporting import DIRECTION_LABEL, METHOD_LABEL, SynthesisGroup
+from src.core.schemas.reporting import (
+    DIRECTION_LABEL,
+    METHOD_LABEL,
+    VOTE_DIRECTIONS,
+    SynthesisFinding,
+    SynthesisGroup,
+)
 from src.manuscript.formatting import find_numbers, mask_identifiers
 
 NEGATION = re.compile(r"\b(not|no|neither|nor|without|cannot|could not|unable|none)\b", re.I)
@@ -51,7 +58,6 @@ MAJORITY_RE = re.compile(
     r"\bmost studies\b",
     re.IGNORECASE,
 )
-DIRECTIONAL = frozenset({"favours_intervention", "favours_comparator"})
 
 
 def _sentences(text: str) -> list[str]:
@@ -85,7 +91,53 @@ def finding_problems(
     return problems
 
 
-def summary_problems(group: SynthesisGroup) -> list[str]:
+FAVOUR_RE = re.compile(
+    r"\b(?:in\s+favou?r\s+of|favou?r(?:s|ed|ing)?)\s+(?:the\s+)?"
+    r"([A-Za-z][\w-]*(?:\s+[A-Za-z][\w-]*){0,3})",
+    re.IGNORECASE,
+)
+COMPARATOR_WORDS = frozenset(
+    {"comparator", "comparators", "control", "controls", "placebo", "sham", "usual",
+     "standard", "comparison", "no-treatment", "untreated"}
+)  # fmt: skip
+INTERVENTION_WORDS = frozenset({"intervention", "interventions", "treatment", "experimental"})
+STOP = frozenset({"the", "and", "with", "for", "of", "or", "arm", "group", "groups", "care"})
+
+
+def _tokens(text: str | None) -> set[str]:
+    return {t for t in re.findall(r"[a-z][\w-]+", (text or "").lower()) if t not in STOP}
+
+
+@dataclass(frozen=True, slots=True)
+class Arms:
+    """Words that name each side of the comparison (protocol wording plus generic terms)."""
+
+    intervention: frozenset[str]
+    comparator: frozenset[str]
+
+    @classmethod
+    def of(cls, intervention: str | None, comparator: str | None) -> Arms:
+        i = _tokens(intervention) | INTERVENTION_WORDS
+        c = _tokens(comparator) | COMPARATOR_WORDS
+        return cls(frozenset(i - c), frozenset(c - i))
+
+    def side(self, phrase: str) -> str | None:
+        words = _tokens(phrase)
+        hit_i, hit_c = bool(words & self.intervention), bool(words & self.comparator)
+        if hit_i == hit_c:
+            return None  # unresolved: cannot be verified mechanically
+        return "favours_intervention" if hit_i else "favours_comparator"
+
+
+def selected(group: SynthesisGroup) -> list[SynthesisFinding]:
+    """One result per study/cohort (the voting units; checked against study identities and
+    participant overlap by :func:`src.reporting.state.group_problems`)."""
+    return [f for f in group.findings if f.selected_for_unit]
+
+
+def summary_problems(group: SynthesisGroup, arms: Arms | None = None) -> list[str]:
+    """Statements the structured, approved data contradict or cannot support (refused)."""
+    arms = arms or Arms.of(None, None)
     problems: list[str] = []
     text = group.summary
     for s in _sentences(text):
@@ -100,10 +152,11 @@ def summary_problems(group: SynthesisGroup) -> list[str]:
                 "vote counting based on statistical significance is not an acceptable "
                 "synthesis method"
             )
+    units = selected(group)
     allowed = set().union(*(numbers_of(f.finding) for f in group.findings))
     if group.synthesis_method == "vote_counting_direction_of_effect":
         allowed |= {float(v) for v in direction_counts(group).values()}
-        allowed.add(float(len(group.findings)))
+        allowed.add(float(len(units)))
     stray = sorted(numbers_of(text) - allowed)
     if stray:
         problems.append(
@@ -111,19 +164,37 @@ def summary_problems(group: SynthesisGroup) -> list[str]:
             + ", ".join(f"{x:g}" for x in stray)
             + ", which does not appear in the approved study-level findings"
         )
-    directions = [f.direction for f in group.findings]
-    directional = [d for d in directions if d in DIRECTIONAL]
+    directions = [f.direction for f in units]
+    votes = [d for d in directions if d in VOTE_DIRECTIONS]
     for s in _sentences(text):
-        if DIRECTION_RE.search(s) and not NEGATION.search(s) and not directional:
+        negated = bool(NEGATION.search(s))
+        if DIRECTION_RE.search(s) and not negated and not votes:
             problems.append(
-                f"directional statement ({s[:80]!r}) but no study-level finding was judged to "
-                "favour either group"
+                f"directional statement ({s[:80]!r}) but no selected study result was judged "
+                "to favour either group"
             )
         if CONSISTENT_RE.search(s) and DIRECTION_RE.search(s) and len(set(directions)) > 1:
             problems.append(
-                f"the summary claims a consistent direction ({s[:80]!r}) but the study-level "
-                "directions differ: " + ", ".join(sorted(set(directions)))
+                f"the summary claims a consistent direction ({s[:80]!r}) but the selected "
+                "study-level directions differ: " + ", ".join(sorted(set(directions)))
             )
+        for m in FAVOUR_RE.finditer(s):
+            claimed = arms.side(m.group(1))
+            if claimed is None or negated:
+                continue
+            who = "intervention" if claimed == "favours_intervention" else "comparator"
+            if claimed not in votes:
+                problems.append(
+                    f"the summary says results favoured the {who} ({s[:80]!r}), but no selected "
+                    f"study result was judged to favour the {who}: this contradicts the "
+                    "recorded directions"
+                )
+            elif CONSISTENT_RE.search(s) and any(d != claimed for d in directions):
+                problems.append(
+                    f"the summary says all results consistently favoured the {who} "
+                    f"({s[:80]!r}), but the recorded directions are "
+                    + ", ".join(sorted(set(directions)))
+                )
         if MAJORITY_RE.search(s) and group.synthesis_method != "vote_counting_direction_of_effect":
             problems.append(
                 f"'{MAJORITY_RE.search(s).group(0)}' is a vote count; use the vote-counting "  # type: ignore[union-attr]
@@ -133,17 +204,44 @@ def summary_problems(group: SynthesisGroup) -> list[str]:
     return problems
 
 
+def unverifiable_statements(group: SynthesisGroup, arms: Arms) -> list[str]:
+    """Directional wording the structured directions can neither confirm nor contradict
+    (e.g. 'X reduced complications', or a favoured side that cannot be identified). These
+    are interpretations: the Auditor routes them to an explicit human review."""
+    out: list[str] = []
+    for s in _sentences(group.summary):
+        if not DIRECTION_RE.search(s):
+            continue
+        sides = [arms.side(m.group(1)) for m in FAVOUR_RE.finditer(s)]
+        if sides and all(x is not None for x in sides) and not NEGATION.search(s):
+            continue  # every claim was checked against the recorded directions
+        out.append(s.strip())
+    return out
+
+
 def direction_counts(group: SynthesisGroup) -> dict[str, int]:
-    return dict(sorted(Counter(f.direction for f in group.findings).items()))
+    """Directions of the selected result of each study/cohort (one per voting unit)."""
+    return dict(sorted(Counter(f.direction for f in selected(group)).items()))
 
 
 def direction_text(group: SynthesisGroup) -> str:
+    """The vote-count statement, generated from the structured directions only."""
     counts = direction_counts(group)
-    parts = [f"{n} {DIRECTION_LABEL[d]}" for d, n in counts.items()]
-    return (
-        f"Of {len(group.findings)} studies, " + "; ".join(parts) + " (vote counting based on "
-        "the direction of effect as judged by the reviewers; no statistical test was performed "
-        "and no effect size is implied)"
+    n = sum(counts.values())
+    fav_i = counts.get("favours_intervention", 0)
+    fav_c = counts.get("favours_comparator", 0)
+    other = [f"{k} {DIRECTION_LABEL[d]}" for d, k in counts.items() if d not in VOTE_DIRECTIONS]
+    text = (
+        f"Of {n} independent study units (one selected result per study or cohort), {fav_i} "
+        f"favoured the intervention and {fav_c} favoured the comparator in the observed "
+        "direction of effect"
+    )
+    if other:
+        text += "; " + "; ".join(other)
+    return text + (
+        " (vote counting based on the direction of effect as judged by the reviewers, "
+        "irrespective of statistical significance; no statistical test was performed and no "
+        "effect size is implied)"
     )
 
 
@@ -165,6 +263,11 @@ def methods_text(group: SynthesisGroup, outcome_name: str) -> str:
         )
     else:
         parts.append("The grouping was the one planned in the protocol.")
+    if group.selection_rule:
+        parts.append(
+            "Where a study or cohort contributed several reports or results, one result "
+            f"represented it: {group.selection_rule.rstrip('.')}."
+        )
     if group.prioritisation_criteria:
         parts.append(f"Prioritisation: {group.prioritisation_criteria.rstrip('.')}.")
     if group.heterogeneity_investigation:

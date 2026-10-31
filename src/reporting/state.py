@@ -96,6 +96,8 @@ class GroupEntry:
     inputs_sha256: str
     stale: bool = False
     problems: list[str] = field(default_factory=list)
+    units: int = 0  # independent voting units (studies/cohorts)
+    unverifiable: list[str] = field(default_factory=list)  # routed to human review
 
     @property
     def status(self) -> str:
@@ -230,6 +232,8 @@ def group_inputs(
         "review_design": protocol.review_design.value,
         "included": {r: r in included for r in rids},
         "study_links": repo.study_ids(project_id, set(rids)),
+        # voting units: documented study identities plus human-resolved participant overlap
+        "cohorts": repo.cohort_ids(project_id, set(rids)),
     }
     return canonical_sha256(payload), texts, problems
 
@@ -241,10 +245,44 @@ def group_problems(
     outcome = next((o for o in protocol.outcomes if o.outcome_id == group.outcome_id), None)
     comparative = outcome is not None and outcome.comparison == ComparisonType.COMPARATIVE
     problems += syn.finding_problems(group, texts, comparative)
-    problems += syn.summary_problems(group)
+    problems += unit_problems(repo, project_id, group)
+    problems += syn.summary_problems(group, arms_of(protocol))
     if not comparative and "comparator" in group.grouping_basis:
         problems.append("a single-group outcome has no comparator to group by")
     return sha, problems
+
+
+def arms_of(protocol: PICOProtocol) -> syn.Arms:
+    return syn.Arms.of(protocol.intervention, protocol.comparator)
+
+
+def unit_problems(repo: Repository, project_id: str, group: SynthesisGroup) -> list[str]:
+    """The voting unit is the study/cohort, not the report: reports a human linked to one
+    study, and studies a human judged to share participants (resolved cohort-overlap
+    warnings), form one unit. Each unit must contribute exactly one selected result; any
+    other result of the unit is tabulated only, under the group's documented selection rule.
+    """
+    cohorts = repo.cohort_ids(project_id, set(group.record_ids))
+    units: dict[str, list[str]] = {}
+    for f in group.findings:
+        units.setdefault(cohorts.get(f.record_id, f.record_id), []).append(f.record_id)
+    problems: list[str] = []
+    picked = {f.record_id for f in group.findings if f.selected_for_unit}
+    for unit, rids in sorted(units.items()):
+        chosen = [r for r in rids if r in picked]
+        if len(chosen) != 1:
+            problems.append(
+                f"study/cohort {unit} has {len(rids)} report(s) or results in this group "
+                f"({', '.join(sorted(rids))}) and {len(chosen)} selected as its result: exactly "
+                "one must represent it (reports of one study, or studies sharing participants, "
+                "are not independent votes); document the selection rule"
+            )
+    return problems
+
+
+def voting_units(repo: Repository, project_id: str, group: SynthesisGroup) -> int:
+    cohorts = repo.cohort_ids(project_id, set(group.record_ids))
+    return len({cohorts.get(r, r) for r in group.record_ids})
 
 
 def _latest(records: list[Any], key: str) -> dict[str, Any]:
@@ -279,7 +317,11 @@ def synthesis_entries(
             groups[gid] = GroupEntry(rec, "", False)
             continue
         sha, problems = group_problems(repo, project_id, rec, protocol)
-        groups[gid] = GroupEntry(rec, sha, rec.inputs_sha256 != sha, problems)
+        groups[gid] = GroupEntry(
+            rec, sha, rec.inputs_sha256 != sha, problems,
+            units=voting_units(repo, project_id, rec),
+            unverifiable=syn.unverifiable_statements(rec, arms_of(protocol)),
+        )  # fmt: skip
     return groups
 
 
@@ -605,7 +647,7 @@ def add_reporting_outputs(
             )
             b.add(
                 f"{p}.contribution",
-                _contribution(sg, stats, study_of, outcome_name),
+                _contribution(sg, state.groups[sg.group_id].units, stats, study_of, outcome_name),
                 "which studies contributed, and their relation to any meta-analysis",
                 src,
                 "synthesis",
@@ -668,6 +710,7 @@ def add_reporting_outputs(
 
 def _contribution(
     g: SynthesisGroup,
+    units: int,
     stats: StatsOutput,
     study_of: dict[str, str],
     outcome_name: dict[str, str],
@@ -681,6 +724,13 @@ def _contribution(
     name = outcome_name.get(g.outcome_id, g.outcome_id)
     noun = "study" if len(studies) == 1 else "studies"
     text = f"{len(studies)} {noun} contributed to this synthesis without meta-analysis"
+    reports = len(g.record_ids)
+    if reports != len(studies) or units != len(studies):
+        text += (
+            f" ({reports} reports; {units} independent study unit"
+            f"{'' if units == 1 else 's'} after accounting for reports of the same study and "
+            "documented participant overlap, each represented by one selected result)"
+        )
     if both:
         text += (
             f"; {len(both)} of them also contributed to a statistical analysis of {name}, "
