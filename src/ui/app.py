@@ -31,6 +31,7 @@ from src.llm.credentials import BILLING_NOTE, ENV_VARS, CredentialResolver, inst
 from src.llm.tasks import TASK_LABELS, AITask, ProjectAISettings, TaskModelSettings
 from src.search.databases import DATABASES
 from src.ui import protocol_form as pf
+from src.ui import reporting_pages as rp
 from src.ui.services import ApiResult, UIBackend
 
 PROVIDER_DEFAULT = "(provider default — not sent)"
@@ -38,7 +39,8 @@ NOT_CONFIGURED = "— choose a model —"
 PAGES = (
     "Projects", "Protocol", "Searches & import", "Pipeline status", "AI models & keys",
     "Run AI steps", "Screening", "Full text & extraction", "Risk of bias", "Statistics",
-    "Manuscript", "Usage & costs",
+    "Manuscript", "PRISMA flow & checklists", "GRADE & Summary of Findings",
+    "Synthesis without MA & SWiM", "Usage & costs",
 )  # fmt: skip
 
 
@@ -1287,6 +1289,18 @@ def page_manuscript(be: UIBackend) -> None:
                                  json={"statement": statement}), "Signed off.")  # fmt: skip
 
 
+def page_prisma(be: UIBackend) -> None:
+    rp.page_prisma(be, require_project(), token(), show)
+
+
+def page_grade(be: UIBackend) -> None:
+    rp.page_grade(be, require_project(), token(), show)
+
+
+def page_synthesis(be: UIBackend) -> None:
+    rp.page_synthesis(be, require_project(), token(), show)
+
+
 def page_usage(be: UIBackend) -> None:
     pid = require_project()
     st.header("API usage and estimated costs")
@@ -1333,7 +1347,8 @@ def main() -> None:
         "AI models & keys": page_models, "Run AI steps": page_run,
         "Screening": page_screening, "Full text & extraction": page_extraction,
         "Risk of bias": page_rob, "Statistics": page_stats, "Manuscript": page_manuscript,
-        "Usage & costs": page_usage,
+        "PRISMA flow & checklists": page_prisma, "GRADE & Summary of Findings": page_grade,
+        "Synthesis without MA & SWiM": page_synthesis, "Usage & costs": page_usage,
     }  # fmt: skip
     handlers[str(page)](be)
 

@@ -12,7 +12,7 @@ implemented today and what is not.
 | # | Guardrail | Where it is enforced |
 |---|-----------|----------------------|
 | G1 | **Zero fabrication of literature.** Bibliographic records come only from deterministic API clients (PubMed E-utilities, Europe PMC, OpenAlex, Crossref) or user-uploaded PDFs. An LLM never writes a citation, identifier or study datum from its weights. | `src/apis/*` build `StudyRecord`s only from fields present in API responses. Invalid identifiers are **dropped, never "repaired"**. Each record carries a `SearchProvenance` (database, query, endpoint, timestamp, reported hit count). |
-| G2 | **Zero LLM arithmetic.** Effect sizes, pooled estimates, heterogeneity, bias tests and Median/IQR→Mean/SD conversions are computed by deterministic code. | `ExtractedValue` rejects any value that is not literally the number printed in its `verbatim_quote` (§4.3). Derived numbers can only originate from `src/stats_engine` (§9.5), run from a human-approved analysis plan. The Auditor cross-checks manuscript numbers against `stats_output.json`. |
+| G2 | **Zero LLM arithmetic.** Effect sizes, pooled estimates, heterogeneity, bias tests and Median/IQR→Mean/SD conversions are computed by deterministic code. | `ExtractedValue` rejects any value that is not literally the number printed in its `verbatim_quote` (§4.3). Derived numbers can only originate from `src/stats_engine` (§9.5), run from a human-approved analysis plan; the only other derivation is the Summary of Findings absolute effect (`src/reporting/absolute_effects.py`, §9.9): a documented transformation of an engine result with a human-entered, sourced baseline risk. The Auditor cross-checks manuscript numbers against `stats_output.json`. |
 | G3 | **Humans own every gate.** The pipeline cannot pass a HITL gate without a recorded, authenticated human decision. | `PipelineStateMachine` refuses gate exits unless `actor_type == HUMAN` and a matching `GateDecision` is supplied (§3). The HTTP gate endpoint requires an enrolled reviewer's bearer token, and the repository refuses to persist a gate decision without an active enrolled reviewer (§6). |
 | G4 | **Append-only audit trail.** | `state_transitions`, `gate_decisions` and `source_evidence` rows raise on ORM update/delete (§5). |
 
@@ -37,6 +37,8 @@ src/
 validation/        R reference script, metafor comparison, VALIDATION_REPORT.md
   auditor/         Stage 6 deterministic, completeness-aware Auditor (Session 6)
   manuscript/      Stage 6 evidence package, marker renderer, drafting, references, exports
+  reporting/       Session 7: PRISMA 2020 flow diagram and checklists, GRADE / Summary of
+                   Findings, synthesis without meta-analysis, SWiM, reporting audit checks
   api_server/      FastAPI app: project state, guards, gate decisions, Stage 2-4 review routes
   search/          Session 5: database registry, protocol editor, search execution, RIS/BibTeX/CSV
                    import, preparation for screening, PRISMA derivation, PRISMA-S report
@@ -127,7 +129,7 @@ even if no `ScreeningConflict` row was ever saved.
 | Gate 3 → Stage 5 | As above, plus every arm approved by a human; **0 master-table items awaiting review; every included study has a human-approved risk-of-bias assessment; no outcome receives arm data from two reports of the same cohort without a documented human resolution (§9.3)**; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
 | Stage 5 → Stage 6 | **A verified `stats_output.json`**: stored (append-only) with a matching SHA-256, schema- and results-hash-valid, computed from the *latest* human-approved analysis plan and from the *current* approved extraction data (input hash recomputed; any later change blocks Stage 6 until Stage 5 is re-run) (§9.5) |
 | Stage 6 → Audit | Manuscript draft exists |
-| Audit → COMPLETED | **Session 6:** the latest `AuditReport` is complete and passed, examined the *current* manuscript version (content SHA-256) and the *current* evidence fingerprint (recomputed); every `REQUIRES_HUMAN_REVIEW` finding is acknowledged by an active enrolled reviewer for that exact content/evidence; and an authenticated human signed off that version and audit (§9.8) |
+| Audit → COMPLETED | **Session 6:** the latest `AuditReport` was made by the current Auditor (Session 7: 1.3.0, with the `reporting` scope, §9.9), is complete and passed, examined the *current* manuscript version (content SHA-256) and the *current* evidence fingerprint (recomputed); every `REQUIRES_HUMAN_REVIEW` finding is acknowledged by an active enrolled reviewer for that exact content/evidence; and an authenticated human signed off that version and audit (§9.8) |
 | Audit → Stage 6 | Always allowed (returning to drafting certifies nothing) |
 
 **PRISMA cross-check.** The stored `PRISMACounts` snapshot must agree with the database:
@@ -260,7 +262,8 @@ stamps and draft rules (§9.4); `ScreeningDecision` gained `reviewer_id` (humans
 * **`CoverageItem`** — an expected reportable output and where it was found.
 * **`AuditReport`** — `complete`, `passed`, `failures`, `requires_human_review` are
   **computed**. `complete` requires the manuscript SHA-256, the evidence fingerprint, every
-  scope in `REQUIRED_SCOPES` and a non-empty coverage list; `passed` requires `complete`
+  scope required for its Auditor version (`required_scopes()`: Auditor 1.3.0 adds
+  `reporting`) and a non-empty coverage list; `passed` requires `complete`
   and no blocking status anywhere. A hand-built report with one verified number or
   citation is therefore incomplete and never passes; a forged `passed`/`complete` claim is
   rejected on load, and `Repository.save_audit_report()` refuses any report that differs
@@ -710,7 +713,7 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | Manuscript drafting (Session 6): evidence package, marker renderer, deterministic template draft, validated model drafting, Vancouver references, versioning, Markdown/DOCX export | Implemented and tested with synthetic projects and **mocked** model replies; **no live model call**; real-world prose quality unvalidated |
 | Statistics engine (`stats_engine`, Session 3) | Implemented for crude proportions (GLMM + logit IV), KM / cumulative incidence at time *t* (from reported CIs), RR, OR (IV, MH), MD, SMD; validated against metafor 4.4-0 / lme4 (1,475 comparisons; `validation/VALIDATION_REPORT.md`). HR, RD, IRR, rates, means, medians: reported as unsupported |
 | Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
-| PRISMA diagram rendering, GRADE SoF | Not implemented |
+| PRISMA 2020 flow diagram, PRISMA 2020 / abstract / SWiM checklists, GRADE and Summary of Findings, synthesis without meta-analysis (Session 7) | Implemented and tested with synthetic projects only (§9.9). Only the *new review, databases and registers* diagram variant is supported; other variants are refused with their unsupported fields |
 | Auditor (Session 6) | Implemented: deterministic, completeness-aware checks (§9.8), human acknowledgement and sign-off, advisory model claim review. Prose checks are rule-based and incomplete (limitations in §9.8 and in every report); reference verification tested with in-memory PubMed/Crossref fakes only — **no live lookup was made** |
 | Protocol editor, database selection, search execution (PubMed/Europe PMC/OpenAlex), RIS/BibTeX/CSV import, preparation for screening, search log, PRISMA derivation, PRISMA-S report (Session 5) | Implemented and tested with **mocked HTTP and synthetic export files only**; no live database call; parsers not tested on real vendor exports. Subscription-database APIs and a ClinicalTrials.gov API search are not implemented (manual import). Protocol amendments after Gate 1 and update (top-up) searches after screening has started are not supported |
 | Model discovery / "Refresh Models" (issue #9) | Not implemented (deferred from Session 5): needs official model-list calls for both providers, versioned catalogue snapshots with sources, unverified-model flags that block execution, a reviewed manual override, and the mocked acceptance scenarios listed in the issue |
@@ -966,7 +969,7 @@ of verified live.
 | numeric_bindings | every frozen binding re-resolved; each displayed number within its tolerance (`NumericClaimCheck`) | mismatch / not_found |
 | literal_numbers | typed numbers (all formats above, title included): role inferred from context (estimate, CI bound, I², p, τ², timepoint, count + unit) and compared with the fact of the analysis named in the sentence; "x of n (z%)" arithmetic; zero for an unavailable result | mismatch; a correct but unbound number → requires review; a count that matches no total and is not presented as a total (no "included/identified/pooled…" wording, not in the title) may describe a subset → requires review; untraceable → unsupported; a number attributed to cited literature → requires review |
 | semantic_labels | pooled vs single study; estimator; model; transformed scale; relative vs absolute; significance vs CI and null value; "no difference" and "clinically important" | mismatch / unsupported / requires review |
-| methods | human dual-screening or dual-extraction claims, registration, databases vs search log, analyses never performed (meta-regression, subgroups, publication-bias tests, trim-and-fill, leave-one-out, Bayesian, network, GRADE, mean/SD conversion, HR pooling, IPD), estimators/models not used, RoB tools not used; negated statements are not flagged | mismatch / unsupported |
+| methods | human dual-screening or dual-extraction claims, registration, databases vs search log, analyses never performed (meta-regression, subgroups, publication-bias tests, trim-and-fill, leave-one-out, Bayesian, network, GRADE unless a current approved assessment exists (§9.9), mean/SD conversion, HR pooling, IPD), estimators/models not used, RoB tools not used; negated statements are not flagged | mismatch / unsupported |
 | claims | overclaiming, comparative claims in single-arm reviews; causal, recommendation and mechanistic language | unsupported / requires review |
 | coverage | every expected output bound in an allowed section; every included report cited | missing |
 | consistency | statistics in the abstract/conclusions also reported in Results/Tables | missing |
@@ -1000,6 +1003,124 @@ lexical comparison with human-entered excerpts, nor judge clinical interpretatio
 `StudyRecord` does not store volume/issue/pages, so Vancouver entries for included studies
 omit them. Recomputing the audit on save and the evidence package on every guard check is
 deliberately conservative and makes Stage 6 checks slower than earlier stages.
+
+### 9.9 Session 7 — PRISMA 2020, GRADE and synthesis without meta-analysis (`src/reporting`)
+
+**Standards and versions.** PRISMA 2020 (Page et al., *BMJ* 2021;372:n71): main checklist
+(27 items, 42 entries with sub-items), PRISMA 2020 for Abstracts (12 items) and the flow
+diagram template for new reviews. SWiM (Campbell et al., *BMJ* 2020;368:l6890): nine items,
+ten entries (1a/1b). Item wording is reproduced verbatim (both CC BY 4.0) in
+`standards.py`, retrieved from PubMed Central on 2026-10-30. GRADE: Guyatt et al. GRADE
+guidelines 9 (rating up) and 12 (Summary of Findings, binary outcomes); Schünemann et al.
+GRADE guidelines 18 (ROBINS-I); Iorio et al. *BMJ* 2015;350:h870 (prognosis). The Cochrane
+Handbook chapter 14 web page could not be reached from the build environment; the rules below
+are taken from the GRADE articles listed, verified through PubMed.
+
+**Persistence.** One append-only table, `reporting_records` (kind, subject, reviewer,
+payload, payload SHA-256); the latest record per subject is current. Kinds:
+`checklist_decision`, `grade_assessment`, `synthesis_group`, `swim_applicability`. Every save
+is re-verified by the repository (`src/reporting/service.py`): active enrolled reviewer whose
+name matches, Stage 6 phase, and recomputation of the record's input/basis hash against the
+current state. A forged or stale record is refused.
+
+**PRISMA flow diagram** (`prisma_flow.py`). Built from the stored `PRISMACounts` only:
+per-database and per-register identification (registers *not searched* are labelled so,
+never shown as zero), the three removal lines (zero values shown), records screened and
+excluded (with the human/automation split of the template footnote when automated screening
+passes alone excluded records; derived from stored decisions), reports sought, not retrieved,
+assessed, excluded with reasons, studies included (report-to-study links, §9.8) and reports
+of included studies. The JSON specification is the source; SVG (and PNG with matplotlib) is
+regenerated from it deterministically, with the snapshot SHA-256 in the SVG metadata.
+Snapshot problems (differences from the stored records, non-final flow, invariant
+violations, sources without a recorded type such as `manual`) are drawn as a red warning
+banner. Unsupported variants raise `UnsupportedVariantError` with the fields that cannot be
+filled. The figure legend (`{{figure:prisma}}`, Figure 1) binds the same PRISMA facts.
+
+**Checklists** (`checklist.py`). Suggestions are deterministic (bound evidence keys per
+section; cue phrases as a weak signal) and yield only *requires human review* or *missing*.
+A human decision (`reported` / `partially_reported` with sections and a precise location,
+`missing`, `not_applicable` with a justification) records the manuscript version and
+SHA-256, the evidence-fingerprint SHA-256 and a *basis hash* (located sections' source and
+frozen values + the item's evidence components). A change to either makes the decision
+stale. Batches (`decide_items`) are verified against one evidence state; each item still
+carries its own status and justification.
+
+**GRADE** (`grade.py`, `core/schemas/reporting.py`). The question type comes from the
+analysis: RR/OR/MD/SMD → comparative intervention effect; crude proportion / Kaplan–Meier /
+cumulative incidence → single-group estimate. Approaches and starting levels:
+
+| Approach | Question | Initial certainty | Contributing studies' approved RoB tool |
+|---|---|---|---|
+| `interventions_randomised` | comparative | high (fixed) | RoB 2 |
+| `interventions_nrsi_robins_i` | comparative | high (fixed; GRADE 18) | ROBINS-I |
+| `interventions_nonrandomised_other` | comparative | low (fixed; GRADE 18) | NOS / external |
+| `overall_prognosis` | single-group | recorded by the reviewer with a justification | any |
+
+Mixed tool sets are refused (rate randomised and non-randomised bodies separately). An
+approved assessment judges all five domains (not serious / serious / very serious = 0/1/2
+levels) with rationales; rating up (large effect 1–2 levels, dose-response 1, plausible
+confounding 1) is available only for non-randomised approaches; the *implied* certainty
+(initial − downgrades + upgrades, bounded very low…high) is computed, the final certainty
+is the reviewer's and may not exceed initial + upgrades, and any departure from the implied
+level needs a reason. A publication-bias "not serious" rationale that relies on a test or a
+funnel plot is refused (none is performed, and a non-significant test is not evidence of
+absence). Statuses: draft, approved, not assessed (reason: framework not applicable / not
+performed / insufficient information), withdrawn. Without a record the outcome is labelled
+*not assessed*. The input hash covers the analysis result, the outcome definition, the review
+design, every approved RoB assessment of contributing reports and their study links.
+
+**Summary of Findings** (comparative, approved): outcome and measure/timepoint, relative
+effect (engine estimate and CI), assumed comparator risk(s) *with a stated source*, risk with
+the intervention and risk difference per 1000 (RR: ACR × RR; OR: ACR·OR / (1 − ACR + ACR·OR);
+CI from the relative-effect bounds; the ACR's own uncertainty is not propagated), participants
+(studies), certainty and reasons. Without a sourced baseline nothing absolute is calculated;
+MD rows show the mean difference; SMD is not re-expressed. Single-group outcomes get an
+*evidence summary* (estimate, k, participants, events, certainty or "not assessed"), labelled
+as not a comparative Summary of Findings table. Exports: Markdown/DOCX with a source-key
+appendix.
+
+**Synthesis without meta-analysis** (`synthesis.py`). A group records the SWiM content
+(grouping and rationale, protocol changes, reason not pooled, standardised metric, method —
+structured tabulation or vote counting on the direction of effect; summary statistics of
+effects and combining P values are not offered —, prioritisation, heterogeneity, certainty
+method, presentation, limitations), source-linked study findings and a narrative. Refused:
+numbers in a finding that are not in its linked evidence; numbers in the narrative that are
+not in the findings; pooled/overall estimates; significance-based counts; directional or
+"consistent" claims the approved directions do not show; directions for single-group
+outcomes; "most studies" without the vote-counting method. The contribution fact states how
+many studies contributed and whether they also contributed to a statistical analysis of the
+outcome (mixed reviews). Input hash: linked items and arms, inclusion, study links, outcome.
+
+**SWiM.** Triggered once a synthesis is approved; a reviewer records applicable / partially
+applicable / not applicable with a rationale (bound to the approved syntheses). Only if it
+applies is the SWiM checklist required.
+
+**Evidence package, fingerprint and audit.** New facts (`grade.*`, `sof.*`, `synthesis.*`),
+templates (`figure:prisma`, `table:sof`, `table:evidence_summary`, `table:synthesis`) and
+expected outputs; fingerprint components `reporting_sha256` (content) and
+`reporting_decisions_sha256` (audit-only: never makes a version stale, but invalidates an
+audit and sign-off). Auditor 1.3.0 adds the required `reporting` scope: diagram boxes vs
+PRISMA facts and snapshot; checklist completeness and currency; GRADE drafts (missing),
+stale/orphan records (mismatch); SoF absolute effects recomputed from the current statistics
+output; approved syntheses re-validated; SWiM decision/checklist; typed compliance claims
+(unsupported while the checklist is incomplete, otherwise human review); typed certainty
+levels vs approved ratings; significance-based vote counts in prose. Reports by Auditor
+1.0.0–1.2.0 still load and are judged by their own scope set, but completion requires an
+audit by the current Auditor. Genuine inapplicability is not missing work: an outcome
+declared not assessed, a review with no synthesis without meta-analysis, or SWiM judged not
+applicable produces no blocking finding.
+
+**Template draft changes.** The Methods no longer assert that the review "is reported
+according to the PRISMA 2020 statement"; they point to the completed checklist. Figure 1 is
+the PRISMA flow diagram (forest plots follow), certainty and synthesis sections are added,
+tables are numbered dynamically.
+
+**Limitations.** Synthetic tests only; no live literature or API. The SWiM/GRADE checks of
+prose are lexical; they block the listed unsupported statements but cannot verify the
+interpretation. GRADE for syntheses without meta-analysis is recorded as text (SWiM item 6),
+not as a structured rating. Imprecision is limited to two levels of rating down. The
+PRISMA "other methods" and updated-review variants, minimally important differences and
+optimal information size are not supported.
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;
@@ -1057,3 +1178,17 @@ uvicorn src.api_server.main:app --reload                       # binds 127.0.0.1
     introduction to the JBI critical appraisal tool. *JBI Evid Synth* 2020;18:2127-2133.
 14. Europe PMC RESTful Web Service documentation; Unpaywall REST API documentation
     (https://europepmc.org/RestfulWebService; https://unpaywall.org/products/api).
+15. Campbell M, McKenzie JE, Sowden A, et al. Synthesis without meta-analysis (SWiM) in
+    systematic reviews: reporting guideline. *BMJ* 2020;368:l6890. doi:10.1136/bmj.l6890
+16. Guyatt GH, Oxman AD, Sultan S, et al. GRADE guidelines: 9. Rating up the quality of
+    evidence. *J Clin Epidemiol* 2011;64:1311-6. doi:10.1016/j.jclinepi.2011.06.004
+17. Guyatt GH, Oxman AD, Santesso N, et al. GRADE guidelines: 12. Preparing summary of
+    findings tables-binary outcomes. *J Clin Epidemiol* 2013;66:158-72.
+    doi:10.1016/j.jclinepi.2012.01.012
+18. Schünemann HJ, Cuello C, Akl EA, et al. GRADE guidelines: 18. How ROBINS-I and other
+    tools to assess risk of bias in nonrandomized studies should be used to rate the
+    certainty of a body of evidence. *J Clin Epidemiol* 2019;111:105-114.
+    doi:10.1016/j.jclinepi.2018.01.012
+19. Iorio A, Spencer FA, Falavigna M, et al. Use of GRADE for assessment of evidence about
+    prognosis: rating confidence in estimates of event rates in broad categories of
+    patients. *BMJ* 2015;350:h870. doi:10.1136/bmj.h870
