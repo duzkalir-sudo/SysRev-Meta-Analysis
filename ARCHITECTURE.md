@@ -1052,9 +1052,12 @@ project row: it serialises reporting decisions with each other, but **evidence w
 code paths (extraction, risk of bias, study links, manuscript edits) are not serialised**
 against it, and no test covers that configuration.
 
-The local UI keeps each decision screen frozen in the Streamlit session (scoped by project and
-by checklist, GRADE analysis, synthesis group, group list or SWiM screen): it renders that
-snapshot and submits only its identifiers, because Streamlit reruns the script — and would
+The local UI keeps each decision screen frozen in the Streamlit session, in one namespace
+keyed by typed tuples `(kind, project, *scope)` — kinds checklist, GRADE analysis, synthesis
+group list, synthesis preview (per group id), active preview and SWiM. Kinds are internal
+literals in the first position, so a user-supplied id (e.g. a synthesis group named "active"
+or "groups", or an id containing ":") can never collide with a control key. The UI renders
+each snapshot and submits only its identifiers, because Streamlit reruns the script — and would
 otherwise fetch the current state — when a form is submitted. A synthesis preview is frozen at
 step 1 and step 2 submits that preview's identifiers. Only an explicit "Reload the current
 state", or the reviewer's own successful decision followed by a rerun, replaces a snapshot; a

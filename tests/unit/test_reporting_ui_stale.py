@@ -147,8 +147,15 @@ def test_checklist_form_from_an_old_screen_is_refused(env: Env) -> None:
 # --------------------------------------------------------------------------- synthesis
 
 
-def _fill_group(at: Any, arm_prefix: str, summary: str) -> None:
-    widget(at, "text_input", "Group id (letters, digits, -_.)").input("g1")
+T1 = (
+    "Complications occurred in 12 of 100 participants receiving X and in 20 of 100 "
+    "receiving placebo."
+)
+T3 = "Complications occurred in 5 of 60 participants receiving X and in 9 of 58 receiving placebo."
+
+
+def _fill_group(at: Any, arm_prefix: str, summary: str, gid: str = "g1", finding: str = T1) -> None:
+    widget(at, "text_input", "Group id (letters, digits, -_.)").input(gid)
     widget(at, "text_input", "Title").input("Trials reporting complications by severity")
     widget(at, "multiselect", "Grouped by").set_value(["outcome"])
     widget(at, "text_area", "Description of the group (SWiM 1a)").input(
@@ -174,10 +181,7 @@ def _fill_group(at: Any, arm_prefix: str, summary: str) -> None:
     )
     arms = widget(at, "multiselect", "Approved arms (source)")
     arms.set_value([o for o in arms.options if o.startswith(arm_prefix)])
-    widget(at, "text_area", "Finding (numbers only as extracted)").input(
-        "Complications occurred in 12 of 100 participants receiving X and in 20 of 100 "
-        "receiving placebo."
-    )
+    widget(at, "text_area", "Finding (numbers only as extracted)").input(finding)
     widget(at, "selectbox", "Direction of effect").set_value("favours_intervention")
     widget(
         at, "text_input", "Basis for the direction (observed direction, not significance)"
@@ -320,3 +324,82 @@ def test_synthesis_saves_when_nothing_changed_and_withdrawal_uses_the_frozen_lis
     with env.other_session() as s:
         latest = Repository(s).load_synthesis_groups("mc1")[-1]
         assert latest.status == "approved" and latest.summary.endswith("(B).")
+
+
+# --------------------------------------------------------------------------- key namespaces
+
+
+def _groups_shown(at: Any) -> list[str]:
+    return sorted(e.label.split(" · ")[0] for e in at.expander if " · revision " in e.label)
+
+
+def _no_frozen_preview(at: Any) -> bool:
+    return not [b for b in at.button if "Save the previewed group" in b.label]
+
+
+@pytest.mark.parametrize("gid", ["active", "groups"])
+def test_group_ids_never_collide_with_internal_screen_keys(env: Env, gid: str) -> None:
+    """Valid group ids equal to internal control words ('active', 'groups') must behave like
+    any other id: the preview, the active-preview pointer and the groups-list snapshot live in
+    separate namespaces."""
+    at = env.app("Synthesis without MA & SWiM")
+    # 1. preview -> save, nothing changed in between
+    _fill_group(at, "t1 ·", "The trial favoured the intervention (reviewer A).", gid=gid)
+    click(at, "Preview the linked evidence (step 1 of 2)")
+    assert not errors(at), errors(at)
+    assert any(f"Preview of group {gid} (frozen at step 1)" in m.value for m in at.markdown)
+    click(at, "Save the previewed group (step 2 of 2")
+    assert not errors(at), errors(at)
+    assert any(f"Synthesis group {gid} saved" in m.value for m in at.success)
+    # 2. the groups list and the active-preview pointer are intact (also after another rerun)
+    assert _groups_shown(at) == [gid] and _no_frozen_preview(at)
+    at.run()
+    assert not at.exception and _groups_shown(at) == [gid] and _no_frozen_preview(at)
+    # 3. opening and saving another group still works
+    _fill_group(
+        at, "t3 ·", "The trial favoured the intervention (second group).", gid="g2", finding=T3
+    )
+    click(at, "Preview the linked evidence (step 1 of 2)")
+    click(at, "Save the previewed group (step 2 of 2")
+    assert not errors(at), errors(at)
+    assert _groups_shown(at) == sorted([gid, "g2"]) and _no_frozen_preview(at)
+    # 4. an intervening revision still makes the frozen preview of the same group refused
+    _fill_group(at, "t1 ·", "The trial favoured the intervention (reviewer A, v2).", gid=gid)
+    click(at, "Preview the linked evidence (step 1 of 2)")
+    with env.other_session() as s:
+        repo = Repository(s)
+        save_group(
+            ReportingService(repo, "mc1"),
+            _group(repo, env.rid, group_id=gid, summary="The trial favoured the intervention (B)."),
+            env.rid,
+        )
+        s.commit()
+    click(at, "Save the previewed group (step 2 of 2")
+    assert any(STALE in e for e in errors(at)), errors(at)
+    at.run()  # the session is not corrupted
+    assert not at.exception
+    with env.other_session() as s:
+        mine = [g for g in Repository(s).load_synthesis_groups("mc1") if g.group_id == gid]
+        assert len(mine) == 2 and mine[-1].summary.endswith("(B).")  # not overwritten
+
+
+@pytest.mark.parametrize(
+    "gid", ["active", "groups", "synthesis_active", "synthesis_groups", "a:b", "mc1", ""]
+)
+def test_screen_keys_are_typed_and_disjoint(gid: str) -> None:
+    """Any user-supplied id lands in a data position of a typed key: it can never equal an
+    internal control key, and ':' inside an id cannot alias another key."""
+    from src.ui import reporting_pages as rp
+
+    controls = {
+        rp._key(rp.SYNTHESIS_ACTIVE, "mc1"),
+        rp._key(rp.SYNTHESIS_GROUPS, "mc1"),
+        rp._key(rp.SWIM, "mc1"),
+    }
+    preview = rp._key(rp.SYNTHESIS_PREVIEW, "mc1", gid)
+    assert preview not in controls
+    assert preview[0] == rp.SYNTHESIS_PREVIEW and preview[-1] == gid
+    assert rp._key(rp.GRADE, "p", "a:b") != rp._key(rp.GRADE, "p:a", "b")
+    assert rp._widget_key("reload", rp._key(rp.GRADE, "p", "a:b")) != rp._widget_key(
+        "reload", rp._key(rp.GRADE, "p:a", "b")
+    )

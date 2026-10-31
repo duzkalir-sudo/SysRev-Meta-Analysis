@@ -8,12 +8,16 @@ a whole checklist as reported. Read views use the same API.
 **Screens are frozen.** Streamlit reruns this script when a form is submitted, so anything
 fetched during that rerun is state the reviewer has *not* seen. Each decision screen
 (a checklist, one GRADE analysis, the synthesis groups, one synthesis preview, the SWiM
-decision) is therefore kept in ``st.session_state`` under a key scoped by project and by
-checklist, analysis, synthesis group or screen. It is rendered from that snapshot, and a
-decision sends only the snapshot's state identifiers; the API refuses them if the stored
-state changed. The snapshot is replaced only by an explicit "Reload the current state" or
-after the reviewer's own successful decision (followed by a rerun, so the display and the
-next submission agree). A live comparison warns when the stored state has moved on.
+decision) is therefore kept in one session-state namespace (``reporting_screens``) under a
+*typed* key ``(kind, project, *scope)``: the kind is a fixed internal literal in the first
+position and user-supplied identifiers (a synthesis group id, an analysis id) only ever fill
+data positions, so a group called "active" or "groups" can never overwrite the active-preview
+pointer or the groups-list snapshot, and ids containing ":" cannot alias other keys. A screen
+is rendered from its snapshot, and a decision sends only the snapshot's state identifiers;
+the API refuses them if the stored state changed. The snapshot is replaced only by an
+explicit "Reload the current state" or after the reviewer's own successful decision (followed
+by a rerun, so the display and the next submission agree). A live comparison warns when
+the stored state has moved on.
 """
 
 from __future__ import annotations
@@ -56,31 +60,52 @@ CHANGED = (
 )
 
 
-def _key(pid: str, *scope: str) -> str:
-    return ":".join(("screen", pid, *scope))
+STORE = "reporting_screens"  # one session-state entry holds every frozen screen
+ScreenKey = tuple[str, ...]
+# The kinds of frozen state. A key is (kind, project id, *scope); kinds are internal literals
+# and never come from user input.
+CHECKLIST, GRADE, SWIM = "checklist", "grade", "swim"
+SYNTHESIS_GROUPS = "synthesis_groups"  # the recorded groups (list snapshot)
+SYNTHESIS_PREVIEW = "synthesis_preview"  # one frozen preview per group id
+SYNTHESIS_ACTIVE = "synthesis_active"  # which group's preview is open (value: a group id)
 
 
-def _frozen(key: str, fetch: Callable[[], ApiResult]) -> tuple[Any, str | None]:
+def _key(kind: str, pid: str, *scope: str) -> ScreenKey:
+    return (kind, pid, *scope)
+
+
+def _store() -> dict[ScreenKey, Any]:
+    store: dict[ScreenKey, Any] = st.session_state.setdefault(STORE, {})
+    return store
+
+
+def _widget_key(prefix: str, key: ScreenKey) -> str:
+    """A Streamlit widget key for a screen key (JSON keeps the parts unambiguous)."""
+    return f"{prefix}:{json.dumps(key)}"
+
+
+def _frozen(key: ScreenKey, fetch: Callable[[], ApiResult]) -> tuple[Any, str | None]:
     """The screen the reviewer is looking at: fetched once, then kept until an explicit
     reload (never refreshed by the rerun that processes a submission)."""
-    if key not in st.session_state:
+    store = _store()
+    if key not in store:
         res = fetch()
         if not res.ok:
             return None, res.error
-        st.session_state[key] = res.data
-    return st.session_state[key], None
+        store[key] = res.data
+    return store[key], None
 
 
-def _reload_button(key: str) -> None:
-    if st.button(RELOAD, key=f"reload:{key}"):
-        st.session_state.pop(key, None)
+def _reload_button(key: ScreenKey) -> None:
+    if st.button(RELOAD, key=_widget_key("reload", key)):
+        _store().pop(key, None)
         st.rerun()
 
 
-def _accepted(key: str, message: str) -> None:
+def _accepted(key: ScreenKey, message: str) -> None:
     """After the reviewer's own successful decision: show the new state (rerun) so the next
     submission is made from what is displayed."""
-    st.session_state.pop(key, None)
+    _store().pop(key, None)
     st.session_state["reporting_flash"] = message
     st.rerun()
 
@@ -91,7 +116,7 @@ def _flash() -> None:
         st.success(message)
 
 
-def _submit(result: ApiResult, show: Show, key: str, message: str) -> None:
+def _submit(result: ApiResult, show: Show, key: ScreenKey, message: str) -> None:
     if result.ok:
         _accepted(key, message)
     elif result.status == 409 and "has changed" in (result.error or ""):
@@ -128,7 +153,7 @@ def _checklist_ids(data: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def checklist_panel(be: UIBackend, pid: str, name: str, token: str | None, show: Show) -> None:
-    key = _key(pid, "checklist", name)
+    key = _key(CHECKLIST, pid, name)
     url = f"/projects/{pid}/reporting/checklists/{name}"
     data, error = _frozen(key, lambda: be.api.get(url))
     if data is None:
@@ -276,9 +301,9 @@ def page_grade(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
         return
     aid = st.selectbox("Outcome analysis", [r["analysis_id"] for r in rows])
     live = next(r for r in rows if r["analysis_id"] == aid)
-    key = _key(pid, "grade", aid)
+    key = _key(GRADE, pid, aid)
     # the analysis screen the reviewer works on (frozen; reload to review a newer state)
-    row = st.session_state.setdefault(key, live)
+    row = _store().setdefault(key, live)
     if (row["inputs_sha256"], row["based_on_assessment_id"]) != (
         live["inputs_sha256"],
         live["based_on_assessment_id"],
@@ -521,16 +546,17 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
             }
             # step 1: freeze the preview response the reviewer is about to read
             preview = be.api.post(f"/projects/{pid}/reporting/synthesis/preview", json=draft)
-            gkey = _key(pid, "synthesis", str(draft["group_id"] or "(no id)"))
-            st.session_state[gkey] = {
+            gid = str(draft["group_id"])
+            store = _store()
+            store[_key(SYNTHESIS_PREVIEW, pid, gid)] = {
                 "draft": draft,
                 "preview": preview.data if preview.ok else None,
                 "error": None if preview.ok else preview.error,
             }
-            st.session_state[_key(pid, "synthesis", "active")] = gkey
+            store[_key(SYNTHESIS_ACTIVE, pid)] = gid
     _synthesis_preview(be, pid, token, show)
     st.subheader("SWiM reporting guideline")
-    key = _key(pid, "swim")
+    key = _key(SWIM, pid)
     data, error = _frozen(key, lambda: be.api.get(f"/projects/{pid}/reporting/swim"))
     if data is None:
         st.error(error)
@@ -578,7 +604,7 @@ def page_synthesis(be: UIBackend, pid: str, token: str | None, show: Show) -> No
 
 def _synthesis_groups(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
     """The recorded groups (frozen screen) and their withdrawal."""
-    key = _key(pid, "synthesis", "groups")
+    key = _key(SYNTHESIS_GROUPS, pid)
     url = f"/projects/{pid}/reporting/synthesis"
     groups, error = _frozen(key, lambda: be.api.get(url))
     if groups is None:
@@ -617,16 +643,19 @@ def _synthesis_groups(be: UIBackend, pid: str, token: str | None, show: Show) ->
 def _synthesis_preview(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
     """Step 2 shows the *frozen* preview (step 1's response) and submits its identifiers;
     nothing is previewed again during the submission."""
-    active = st.session_state.get(_key(pid, "synthesis", "active"))
-    gkey = str(active) if active else ""
-    frozen = st.session_state.get(gkey) if gkey else None
+    store = _store()
+    active = _key(SYNTHESIS_ACTIVE, pid)
+    if active not in store:
+        return
+    gkey = _key(SYNTHESIS_PREVIEW, pid, str(store[active]))
+    frozen = store.get(gkey)
     if not frozen:
         return
     draft, preview = frozen["draft"], frozen["preview"]
     st.markdown(f"**Preview of group {draft['group_id'] or '(no id)'} (frozen at step 1)**")
-    if st.button("Discard this preview", key=f"discard:{gkey}"):
-        st.session_state.pop(gkey, None)
-        st.session_state.pop(_key(pid, "synthesis", "active"), None)
+    if st.button("Discard this preview", key=_widget_key("discard", gkey)):
+        store.pop(gkey, None)
+        store.pop(active, None)
         st.rerun()
     if preview is None:
         st.error(frozen["error"])
@@ -649,9 +678,9 @@ def _synthesis_preview(be: UIBackend, pid: str, token: str | None, show: Show) -
             },
         )
         if result.ok:
-            st.session_state.pop(_key(pid, "synthesis", "active"), None)
-            st.session_state.pop(_key(pid, "synthesis", "groups"), None)
-            st.session_state.pop(_key(pid, "swim"), None)
+            store.pop(active, None)
+            store.pop(_key(SYNTHESIS_GROUPS, pid), None)
+            store.pop(_key(SWIM, pid), None)
             _accepted(gkey, f"Synthesis group {draft['group_id']} saved.")
         else:
             _submit(result, show, gkey, "")
