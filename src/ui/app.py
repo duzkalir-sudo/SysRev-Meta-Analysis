@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
@@ -30,6 +31,7 @@ from src.core.schemas.protocol import ALLOWED_MEASURES
 from src.llm.credentials import BILLING_NOTE, ENV_VARS, CredentialResolver, install_log_redaction
 from src.llm.tasks import TASK_LABELS, AITask, ProjectAISettings, TaskModelSettings
 from src.search.databases import DATABASES
+from src.stats_engine.stage5 import verified_plots
 from src.ui import operations_pages as op
 from src.ui import protocol_form as pf
 from src.ui import reporting_pages as rp
@@ -1013,19 +1015,33 @@ def page_extraction(be: UIBackend) -> None:
     manifest = be.api.get(f"/projects/{pid}/fulltext/manifest", params={"only_open": False})
     st.subheader("Full-text manifest")
     st.dataframe(manifest.data if manifest.ok else [])
+    # Session 9 (H3): uploads that replace a linked PDF, and identity confirmations, are bound
+    # to the PDF hash shown in this manifest; a screen loaded before a change is refused.
+    shown_sha = {r["record_id"]: r.get("pdf_sha256") for r in (manifest.data or [])}
     with st.form("upload"):
         record = st.text_input("Record ID for PDF upload")
         pdf = st.file_uploader("PDF", type=["pdf"])
+        replaces = shown_sha.get(record)
+        if replaces:
+            st.caption(f"Replaces the linked PDF {replaces[:12]}…; its arms will be invalidated.")
         if st.form_submit_button("Upload (authenticated)") and record and pdf is not None:
+            headers = {"X-Filename": pdf.name} | (
+                {"X-Replaces-SHA256": replaces} if replaces else {}
+            )
             show(be.api.request("PUT", f"/projects/{pid}/fulltext/{record}/pdf", token=token(),
-                                content=pdf.getvalue(), headers={"X-Filename": pdf.name}),
+                                content=pdf.getvalue(), headers=headers),
                  "PDF stored.")  # fmt: skip
     with st.form("confirm"):
         record = st.text_input("Record ID whose PDF identity you confirm")
         note = st.text_input("Note")
+        examined = shown_sha.get(record)
         if st.form_submit_button("Confirm PDF identity (authenticated)") and record and note:
-            show(be.api.post(f"/projects/{pid}/fulltext/{record}/confirm-match", token=token(),
-                             json={"note": note}))  # fmt: skip
+            if not examined:
+                st.error(f"{record} has no linked PDF in the manifest shown")
+            else:
+                body = {"note": note, "expected_pdf_sha256": examined}
+                show(be.api.post(f"/projects/{pid}/fulltext/{record}/confirm-match",
+                                 token=token(), json=body))  # fmt: skip
     st.subheader("Extraction items")
     items = be.api.get(f"/projects/{pid}/extraction/items").data or []
     advisories: dict[str, list[str]] = {}
@@ -1034,6 +1050,8 @@ def page_extraction(be: UIBackend) -> None:
     st.dataframe([
         {"item": i["item_id"], "record": i["record_id"], "field": i["field_name"],
          "outcome": i["outcome_id"], "arm": i["arm_label"], "as printed": i["reported_text"],
+         "interpreted value": i.get("value"), "number format": i.get("number_format"),
+         "format status": i.get("format_status"),
          "status": i["data_status"], "review": i["review_status"],
          "proposed by": i["proposer_identity"],
          "evidence check": (i.get("verification") or {}).get("status"),
@@ -1092,15 +1110,23 @@ def page_stats(be: UIBackend) -> None:
             except Exception as exc:
                 st.error(str(exc))
     output = be.api.get(f"/projects/{pid}/stats/output")
+    plots: list[tuple[str, Path]] = []
     if output.ok:
         if output.data["problems"]:
             st.error("Not a valid basis for Stage 6: " + "; ".join(output.data["problems"]))
         for analysis in output.data["stats_output"].get("analyses", []):
             with st.expander(f"Analysis {analysis.get('analysis_id')}"):
                 st.json(analysis)
-    plots = sorted((be.stats_dir(pid) / "plots").glob("*.svg"))
-    for svg in plots:
-        st.markdown(f"**Forest plot: {svg.stem}**")
+        # Session 9 (M4): only plots of the current, valid output whose files still match
+        # its manifest are shown; leftovers of earlier runs never appear as current.
+        if output.data["problems"]:
+            st.warning("Forest plots are not shown: the statistics output is not valid.")
+        else:
+            plots, withheld = verified_plots(be.stats_dir(pid), output.data["sha256"])
+            for reason in withheld:
+                st.warning(f"Forest plot withheld: {reason}")
+    for name, svg in plots:
+        st.markdown(f"**Forest plot: {name}**")
         encoded = base64.b64encode(svg.read_bytes()).decode("ascii")
         st.markdown(f'<img src="data:image/svg+xml;base64,{encoded}" style="max-width:100%">',
                     unsafe_allow_html=True)  # fmt: skip

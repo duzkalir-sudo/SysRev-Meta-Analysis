@@ -28,6 +28,9 @@ class ManifestRow:
     match_status: str | None
     last_attempt: str | None
     notes: str
+    # Session 9 (H3): the linked PDF a reviewer examines; identity confirmations and
+    # replacements are bound to this hash.
+    pdf_sha256: str | None = None
 
 
 def build_manifest(
@@ -63,6 +66,7 @@ def build_manifest(
                 match_status=item.match_status.value if item and item.match_status else None,
                 last_attempt=f"{last.service}: {last.outcome}" if last else None,
                 notes=" | ".join(item.match_notes) if item else "",
+                pdf_sha256=item.pdf_sha256 if item else None,
             )
         )
     return rows

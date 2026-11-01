@@ -123,7 +123,9 @@ def include_everywhere(
                 title=rec.title,
                 status=FullTextStatus.OA_DOWNLOADED,
                 pdf_filename=f"{rec.record_id}.pdf",
-                pdf_sha256="b" * 64,
+                # the hash the synthetic arm evidence cites (tests.conftest.make_evidence):
+                # since Session 9 (H3) values citing another PDF block Gate 3 and Stage 6
+                pdf_sha256="a" * 64,
                 match_status=UploadMatchStatus.CONFIRMED,
             ),
         )
@@ -313,13 +315,15 @@ def _to_stage6(repo: Repository, pid: str, rid: str, specs: list[AnalysisSpec]) 
 
 @contextmanager
 def out_of_band(repo: Repository, pid: str) -> Iterator[None]:
-    """Simulate a change to Stage 5 inputs made *outside* the application in Stage 6 (e.g. a
-    direct database write, which the threat model does not exclude). Since the review of
-    PR #13 (finding 5) the application refuses such changes from Stage 6 on; the tests using
-    this helper check that the audit, the evidence package and syntheses still *detect* them."""
+    """Simulate a change made *outside* the application after Gate 3 (e.g. a direct database
+    write, which the threat model does not exclude). Since the review of PR #13 (finding 5) the
+    application refuses changes to Stage 5 inputs from Stage 6 on, and since Session 9 (H2) it
+    refuses changes to any Gate 3-approved data (screening, full text, extraction, arms, risk
+    of bias) from Stage 5 on. The tests using this helper check that the audit, the evidence
+    package, syntheses and the Stage 5 -> 6 guard still *detect* such changes."""
     project = repo.get_project(pid)
     phase = project.phase
-    project.phase = Phase.STAGE5_META_ANALYSIS.value
+    project.phase = Phase.STAGE4_EXTRACTION_ROB.value
     repo.session.flush()
     try:
         yield

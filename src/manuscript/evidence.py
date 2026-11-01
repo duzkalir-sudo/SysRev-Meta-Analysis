@@ -108,6 +108,8 @@ EXCLUSION_TEXT = {
     "confirmed_not_reported": "outcome not reported, as confirmed by a reviewer",
     "recorded_unavailable": "data recorded by a reviewer as unusable for this outcome",
     "ci_inconsistent": "reported confidence interval inconsistent with the declared scale",
+    "ci_bound_not_transformable": "a confidence limit at 0% or 100%, where the declared "
+    "transformation is undefined",
     "timepoint_mismatch": "no estimate at the analysed timepoint",
     "timepoint_missing": "follow-up timepoint not reported",
     "incompatible_estimator": "estimate of a different type (e.g. Kaplan–Meier vs crude)",

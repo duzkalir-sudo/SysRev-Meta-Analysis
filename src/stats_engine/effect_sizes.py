@@ -129,10 +129,27 @@ def expit(x: float) -> float:
 # --------------------------------------------------------------------------- probabilities at t
 
 
+def scale_domain_contains(p: float, scale: ProbabilityScale) -> bool:
+    """Whether ``p`` can be expressed on ``scale``.
+
+    The identity (``plain``) scale is defined on the closed interval [0, 1], so a reported
+    confidence limit of exactly 0 % or 100 % is usable there (Session 9, M1). The
+    log(−log), log and logit transformations are undefined at 0 and/or 1, so only the open
+    interval (0, 1) is admissible on those scales.
+    """
+    if scale == "plain":
+        return 0.0 <= p <= 1.0
+    return 0.0 < p < 1.0
+
+
 def to_scale(p: float, scale: ProbabilityScale) -> float:
-    """Transform a probability in (0, 1) to the declared CI scale."""
-    if not 0.0 < p < 1.0:
-        raise EstimationError(f"probability {p} is at or outside the boundary (0, 1)")
+    """Transform a probability to the declared CI scale (identity on [0, 1] for ``plain``;
+    the open interval (0, 1) for the transformed scales)."""
+    if not scale_domain_contains(p, scale):
+        domain = "[0, 1]" if scale == "plain" else "(0, 1)"
+        raise EstimationError(
+            f"probability {p} is outside the domain {domain} of the {scale} scale"
+        )
     if scale == "log_log":
         return math.log(-math.log(p))
     if scale == "log":

@@ -204,8 +204,18 @@ class StudyResult(FrozenModel):
     ci_lower_natural: float | None = None
     ci_upper_natural: float | None = None
     ci_method: str
+    # Weights belong to the model they are shown with (Session 9, M3):
+    # * ``weight_common_pct`` — the reported ``common_effect`` model: Mantel-Haenszel weights
+    #   when that model is Mantel-Haenszel, inverse-variance weights when it is IV, ``None``
+    #   when the model has no study weights (binomial ML for proportions) or was not estimable;
+    # * ``weight_random_pct`` — the reported ``random_effects`` model: inverse-variance
+    #   random-effects weights, ``None`` for the binomial-normal GLMM (it has no study
+    #   weights; metafor's ``weights()`` is likewise not available for ``rma.glmm``);
+    # * ``weight_sensitivity_pct`` — weights of sensitivity models, keyed by a label that
+    #   names the model (e.g. "inverse-variance common effect").
     weight_common_pct: float | None = None
     weight_random_pct: float | None = None
+    weight_sensitivity_pct: dict[str, float] = Field(default_factory=dict)
     continuity_corrected: bool = False
     notes: list[str] = Field(default_factory=list)
 
@@ -228,6 +238,9 @@ ExclusionCode = Literal[
     "non_informative",
     "boundary_estimate",
     "ci_inconsistent",
+    # A confidence limit at 0 or 1 on a scale whose transformation is undefined there
+    # (log(-log), log, logit). Never used on the identity scale (Session 9, M1).
+    "ci_bound_not_transformable",
     "unit_mismatch",
     "invalid_data",
     "unsupported_measure",

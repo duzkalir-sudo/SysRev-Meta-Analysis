@@ -29,6 +29,7 @@ from src.stats_engine.engine import run_plan
 from src.stats_engine.stage5 import run_stage5, write_artifacts
 from tests.conftest import NOW, make_protocol, make_record
 from tests.fakes import include_at_title_abstract
+from tests.manuscript_helpers import out_of_band
 from tests.stats_helpers import LAST_FU, NECROSIS, OUTCOMES, REVIEWER, plan, stats_arm
 
 PID = "p5"
@@ -68,7 +69,7 @@ def include_at_full_text(repo: Repository, records: list[StudyRecord]) -> None:
             PID,
             FullTextItem(record_id=rec.record_id, title=rec.title,
                          status=FullTextStatus.OA_DOWNLOADED, pdf_filename=f"{rec.record_id}.pdf",
-                         pdf_sha256="b" * 64),
+                         pdf_sha256="a" * 64),  # cited by make_evidence (Session 9, H3)
         )  # fmt: skip
         for role in (ReviewerRole.REVIEWER_1, ReviewerRole.REVIEWER_2):
             repo.save_screening_decision(
@@ -135,7 +136,11 @@ def test_valid_artifact_opens_stage6(repo: Repository) -> None:
     ctx = repo.build_guard_context(PID)
     assert ctx.stats_output_present and ctx.stats_output_problems == ()
     m = PipelineStateMachine(PID, Phase.STAGE5_META_ANALYSIS)
-    assert m.check(Phase.STAGE6_MANUSCRIPT, ctx) == []
+    # The artifact itself is valid. Since Session 9 (H2) Stage 5 -> 6 also re-checks the Gate 3
+    # conditions, which this minimal fixture does not meet (it sets the phase directly);
+    # tests/unit/test_session9_remediation.py covers a complete Gate 3-valid project.
+    violations = m.check(Phase.STAGE6_MANUSCRIPT, ctx)
+    assert violations and all(v.startswith("Gate 3 condition no longer met") for v in violations)
     current = repo.current_stats_output(PID)
     assert current is not None and current.sha256() == sha
     assert current.analyses[0].status == "pooled"
@@ -146,15 +151,17 @@ def test_changed_data_after_stats_blocks_stage6(repo: Repository) -> None:
     _to_stage5(repo)
     _record(repo, rid)
     repo.save_records(PID, [make_record("s7", "Synthetic case series s7")])
-    repo.save_extracted_arm(
-        PID, stats_arm("s7", "necrosis", follow_up=LAST_FU, events="1", n_analyzed="9")
-    )
+    arm = stats_arm("s7", "necrosis", follow_up=LAST_FU, events="1", n_analyzed="9")
+    with pytest.raises(SysRevError, match="approved at Gate 3"):  # Session 9 (H2)
+        repo.save_extracted_arm(PID, arm)
+    with out_of_band(repo, PID):  # a write outside the application is still detected
+        repo.save_extracted_arm(PID, arm)
     ctx = repo.build_guard_context(PID)
     assert any("changed after the statistics" in p for p in ctx.stats_output_problems)
     violations = PipelineStateMachine(PID, Phase.STAGE5_META_ANALYSIS).check(
         Phase.STAGE6_MANUSCRIPT, ctx
     )
-    assert violations and violations[0].startswith("stats_output.json:")
+    assert any(v.startswith("stats_output.json:") for v in violations)
 
 
 def test_new_plan_invalidates_old_stats(repo: Repository) -> None:
@@ -210,9 +217,10 @@ def test_run_stage5_refusals(repo: Repository, tmp_path: Path) -> None:
     repo.save_analysis_plan(PID, plan(NEC, reviewer_id=_reviewer(repo)))
     # an arm for a report that was never included at full-text assessment
     repo.save_records(PID, [make_record("stray", "Synthetic excluded report")])
-    repo.save_extracted_arm(
-        PID, stats_arm("stray", "necrosis", follow_up=LAST_FU, events="1", n_analyzed="9")
-    )
+    with out_of_band(repo, PID):  # refused by the application after Gate 3 (Session 9)
+        repo.save_extracted_arm(
+            PID, stats_arm("stray", "necrosis", follow_up=LAST_FU, events="1", n_analyzed="9")
+        )
     with pytest.raises(StatisticsInputError, match="not included at full text"):
         run_stage5(repo, PID, output_dir=tmp_path)
 

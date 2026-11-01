@@ -269,6 +269,10 @@ class FullTextRetriever:
 # --------------------------------------------------------------------------- manual steps
 
 
+class StaleSourceError(SysRevError):
+    """A full-text decision was made on a screen showing a PDF that is no longer linked."""
+
+
 def register_upload(
     repo: Repository,
     store: DocumentStore,
@@ -278,14 +282,32 @@ def register_upload(
     *,
     original_filename: str,
     reviewer: ReviewerORM,
+    replaces_sha256: str | None = None,
 ) -> FullTextItem:
-    """Link a user-supplied PDF to ``record_id`` after validation and an identity check."""
+    """Link a user-supplied PDF to ``record_id`` after validation and an identity check.
+
+    Session 9 (H3): replacing an already linked PDF must name the PDF being replaced
+    (``replaces_sha256``, the hash shown to the reviewer), so a screen loaded before another
+    replacement cannot overwrite it. After Gate 3 the linked PDF is frozen and the upload is
+    refused before anything is stored. In earlier phases a replacement invalidates the active
+    arms of the report (kept as history); accepted values that cite the old PDF must then be
+    re-verified against the new one before Gate 3 (``source_replacement_problems``).
+    """
     reviewer = repo.require_active_reviewer(reviewer.id)
     record = repo.get_record(project_id, record_id)
+    repo.require_gate3_open(project_id, f"uploading a PDF for {record_id}")
+    previous = repo.get_fulltext_item(project_id, record_id)
+    old_sha = previous.pdf_sha256 if previous is not None else None
+    if old_sha is not None and replaces_sha256 != old_sha:
+        raise StaleSourceError(
+            f"{record_id} already has a linked PDF ({old_sha[:12]}…); a replacement must name "
+            "that PDF as the one it replaces (it was "
+            + ("not named" if replaces_sha256 is None else f"{replaces_sha256[:12]}…")
+            + "): reload, then upload again; nothing was stored"
+        )
     stored, problem = validate_pdf_bytes(data, store)
     if stored is None:
         raise UploadRejectedError(f"{original_filename}: {problem}")
-    previous = repo.get_fulltext_item(project_id, record_id)
     status, notes = _check_pdf(repo, project_id, record, stored, data)
     repo.add_fulltext_document(
         project_id, record_id, kind="pdf", filename=stored.filename, sha256=stored.sha256,
@@ -314,19 +336,63 @@ def register_upload(
         }
     )
     repo.save_fulltext_item(project_id, item)
+    if old_sha is not None and old_sha != stored.sha256:
+        invalidate_after_replacement(repo, project_id, record_id, old_sha, stored.sha256,
+                                     reviewer=reviewer)  # fmt: skip
     return item
 
 
+def invalidate_after_replacement(
+    repo: Repository, project_id: str, record_id: str, old_sha: str, new_sha: str, *,
+    reviewer: ReviewerORM,
+) -> list[str]:  # fmt: skip
+    """Session 9 (H3): the arms of a report rest on its linked PDF. When that PDF is replaced,
+    every active arm of the report is invalidated (the rows stay stored as history) and the
+    replacement is recorded; the arms must be rebuilt from values verified against the new
+    PDF and approved again."""
+    arms = [a.arm_id for a in repo.load_extracted_arms(project_id) if a.record_id == record_id]
+    for arm_id in arms:
+        repo.invalidate_arm(
+            project_id, arm_id, reviewer_id=reviewer.id, item_id=None,
+            reason=f"source PDF replaced ({old_sha[:12]}… → {new_sha[:12]}…)",
+            kind="source_replaced",
+        )  # fmt: skip
+    repo.add_governance_record(
+        project_id, "source_replacement", record_id,
+        {"record_id": record_id, "old_sha256": old_sha, "new_sha256": new_sha,
+         "invalidated_arms": arms, "reviewer_id": reviewer.id},
+        reviewer_id=reviewer.id,
+    )  # fmt: skip
+    return arms
+
+
 def confirm_pdf_match(
-    repo: Repository, project_id: str, record_id: str, *, reviewer: ReviewerORM, note: str
+    repo: Repository,
+    project_id: str,
+    record_id: str,
+    *,
+    reviewer: ReviewerORM,
+    note: str,
+    expected_pdf_sha256: str | None = None,
 ) -> FullTextItem:
-    """A human confirms that the linked PDF really is this report (uncertain/mismatch)."""
+    """A human confirms that the linked PDF really is this report (uncertain/mismatch).
+
+    Session 9 (H3): ``expected_pdf_sha256`` binds the confirmation to the PDF the reviewer
+    examined (required over HTTP); a confirmation from a screen showing a PDF that has since
+    been replaced is refused with nothing written."""
     reviewer = repo.require_active_reviewer(reviewer.id)
     if not note.strip():
         raise ValueError("a confirmation note is required (what was checked)")
+    repo.require_gate3_open(project_id, f"confirming the identity of the PDF of {record_id}")
     item = repo.get_fulltext_item(project_id, record_id)
     if item is None or item.pdf_sha256 is None:
         raise NotFoundError(f"record {record_id} has no linked PDF to confirm")
+    if expected_pdf_sha256 is not None and expected_pdf_sha256 != item.pdf_sha256:
+        raise StaleSourceError(
+            f"the PDF linked to {record_id} is now {item.pdf_sha256[:12]}…, not the "
+            f"{expected_pdf_sha256[:12]}… that was examined; reload and check the current PDF "
+            "(nothing was saved)"
+        )
     confirmed = FullTextItem.model_validate(
         item.model_dump()
         | {
@@ -346,6 +412,7 @@ def mark_unobtainable(
     """Record that a report could not be obtained (PRISMA "not retrieved", not excluded)."""
     reviewer = repo.require_active_reviewer(reviewer.id)
     record = repo.get_record(project_id, record_id)
+    repo.require_gate3_open(project_id, f"marking {record_id} unobtainable")
     previous = repo.get_fulltext_item(project_id, record_id)
     if previous is not None and previous.is_retrieved:
         raise SysRevError(f"record {record_id} already has a retrieved full text")
@@ -375,6 +442,7 @@ def acknowledge_xml_only(
     reviewer = repo.require_active_reviewer(reviewer.id)
     if not note.strip():
         raise ValueError("an acknowledgement note is required (e.g. which sources were tried)")
+    repo.require_gate3_open(project_id, f"acknowledging XML-only full text for {record_id}")
     item = repo.get_fulltext_item(project_id, record_id)
     if item is None or item.status != FullTextStatus.OA_STRUCTURED_TEXT:
         raise SysRevError(f"record {record_id} is not an XML-only full-text item")

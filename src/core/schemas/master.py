@@ -36,7 +36,14 @@ from src.core.schemas.base import (
     new_id,
     utc_now,
 )
-from src.core.schemas.extraction import ExtractedStudyArm, ExtractedValue, SourceEvidence
+from src.core.schemas.extraction import (
+    ExtractedStudyArm,
+    ExtractedValue,
+    NumberFormat,
+    NumberFormatStatus,
+    SourceEvidence,
+    number_format_status,
+)
 from src.core.schemas.protocol import FollowUpTimepoint
 
 ARM_FIELDS = frozenset(ExtractedStudyArm.numeric_field_names())
@@ -80,6 +87,8 @@ class ExtractionItem(StrictModel):
     data_status: DataStatus
     reported_text: str | None = Field(default=None, description="number exactly as printed")
     value: float | None = None
+    # Session 9 (M5): the recorded reading of an ambiguous printed number; None = default rules
+    number_format: NumberFormat | None = None
     unit: str | None = None
     text_value: str | None = None
     evidence: SourceEvidence | None = None
@@ -151,6 +160,7 @@ class ExtractionItem(StrictModel):
                 reported_text=self.reported_text,
                 unit=self.unit,
                 evidence=self.evidence,
+                number_format=self.number_format,
             )
             if not math.isfinite(self.value):
                 raise ValueError("value must be finite")
@@ -173,8 +183,15 @@ class ExtractionItem(StrictModel):
         assert self.reported_text is not None
         return ExtractedValue(
             value=self.value, reported_text=self.reported_text, unit=self.unit,
-            evidence=self.evidence,
+            evidence=self.evidence, number_format=self.number_format,
         )  # fmt: skip
+
+    @property
+    def format_status(self) -> NumberFormatStatus | None:
+        """How the stored value reads its printed text (``None`` for non-numeric items)."""
+        if self.data_status != DataStatus.REPORTED or self.value is None or not self.reported_text:
+            return None
+        return number_format_status(self.reported_text, self.value, self.number_format)
 
 
 class ExtractionReviewEvent(FrozenModel):

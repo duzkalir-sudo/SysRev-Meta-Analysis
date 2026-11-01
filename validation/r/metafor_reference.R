@@ -89,8 +89,13 @@ tbl_case <- function(id, ai, n1i, ci, n2i, source) {
     blk <- iv_block(es$yi[keep], es$vi[keep])
     blk$kept <- which(keep) - 1  # zero-based indices
     mh <- rma.mh(measure = measure, ai = ai, n1i = n1i, ci = ci, n2i = n2i, drop00 = TRUE)
+    # Mantel-Haenszel study weights (weights.rma.mh), renormalised over the studies the
+    # Python engine keeps (escalc drop00); see VALIDATION_REPORT.md for the difference in
+    # double-all-event RR studies (Session 9, M3).
+    w <- unname(weights(mh))[keep]
     blk$mh <- list(estimate = unname(c(mh$beta)), se = mh$se, ci_lower = mh$ci.lb,
-                   ci_upper = mh$ci.ub, statistic = mh$zval, p_value = mh$pval)
+                   ci_upper = mh$ci.ub, statistic = mh$zval, p_value = mh$pval,
+                   weights = as.list(100 * w / sum(w)))
     out$expected[[measure]] <- blk
   }
   out

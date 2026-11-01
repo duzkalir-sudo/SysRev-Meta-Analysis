@@ -628,7 +628,8 @@ def test_km_ci_at_boundary_or_zero_width_excluded() -> None:
         km_arm("flat", "90.0", "90.0", "90.0"),
     ]
     codes = {e.study_id: e.reason_code for e in run(KM, arms).excluded}
-    assert codes == {"edge": "ci_inconsistent", "flat": "invalid_data"}
+    # 100 % cannot be transformed to log(-log): a specific reason, not "inconsistent" (M1)
+    assert codes == {"edge": "ci_bound_not_transformable", "flat": "invalid_data"}
 
 
 # --------------------------------------------------------------------------- review fixes

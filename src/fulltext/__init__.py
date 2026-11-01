@@ -13,6 +13,7 @@ from src.fulltext.matching import MatchAssessment, assess_match
 from src.fulltext.retrieval import (
     FullTextRetriever,
     RetrievalSummary,
+    StaleSourceError,
     UploadRejectedError,
     acknowledge_xml_only,
     confirm_pdf_match,
@@ -31,6 +32,7 @@ __all__ = [
     "PDFDownloader",
     "ReportFlow",
     "RetrievalSummary",
+    "StaleSourceError",
     "StoredFile",
     "UploadRejectedError",
     "acknowledge_xml_only",

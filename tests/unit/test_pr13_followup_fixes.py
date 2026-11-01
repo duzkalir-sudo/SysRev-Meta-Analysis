@@ -27,6 +27,7 @@ from src.extraction import (
     accept_item,
     correction_state_sha256,
     links_state_sha256,
+    resolve_double_counting,
     source_state,
     submit_proposals,
     unlink_reports,
@@ -49,8 +50,9 @@ from src.state.db import (
 )
 from src.state.repository import Repository
 from src.stats_engine import plan_service
+from src.stats_engine.engine import run_plan
 from src.stats_engine.stage5 import run_stage5
-from tests.conftest import approved_by, make_record
+from tests.conftest import NOW, approved_by, make_record
 from tests.fakes import include_at_title_abstract
 from tests.fixtures.pdf_factory import SYNTHETIC_DOI, SYNTHETIC_TITLE, synthetic_article
 from tests.manuscript_helpers import comparative_project
@@ -145,8 +147,16 @@ def test_pdf_screen_hash_must_describe_the_source_in_the_same_response(
         with db.session() as s2:
             r2 = Repository(s2)
             rv2 = r2.require_active_reviewer(rid)
+            current = r2.get_fulltext_item("p", "r1")
             replaced = register_upload(
-                r2, store, "p", "r1", PDF_B, original_filename="b.pdf", reviewer=rv2
+                r2,
+                store,
+                "p",
+                "r1",
+                PDF_B,
+                original_filename="b.pdf",
+                reviewer=rv2,
+                replaces_sha256=current.pdf_sha256 if current else None,
             )
             if replaced.match_unconfirmed:
                 confirm_pdf_match(r2, "p", "r1", reviewer=rv2, note="revised edition checked")
@@ -352,7 +362,7 @@ def test_late_http_title_abstract_exclusion_must_be_refused(db: Db) -> None:
                 "exclusion_reason": "E1: late reconsideration",
             },
         )
-        assert r.status_code == 409 and "cannot be recomputed" in r.json()["detail"]
+        assert r.status_code == 409 and "approved at Gate 3" in r.json()["detail"]  # Session 9
     with db.session() as s:
         repo = Repository(s)
         assert counts(s, ScreeningDecisionORM, ScreeningConflictORM) == rows_before
@@ -367,18 +377,29 @@ def test_late_http_title_abstract_exclusion_must_be_refused(db: Db) -> None:
         assert repo.stats_output_problems("mc1") == []
 
 
-def test_title_abstract_decision_in_stage5_remains_supported(db: Db) -> None:
+def test_title_abstract_decision_in_stage5_is_refused_after_gate3(db: Db) -> None:
+    """Session 9 (H2) deliberately reverses the earlier "still supported in Stage 5" rule:
+    an eligibility decision after Gate 3 changes the set of reports a human approved at
+    Gate 3 (extraction, risk of bias and PRISMA would no longer have been reviewed for it),
+    and the pipeline has no route back to Stage 4. It is refused before anything is written;
+    the Stage 4 / Gate 3 control below shows the decision itself is still accepted there."""
     with db.session() as s:
         repo, _, token = comparative_project(s)
         repo.get_project("mc1").phase = Phase.STAGE5_META_ANALYSIS.value
         s.commit()
+        rows_before = counts(s, ScreeningDecisionORM, ScreeningConflictORM)
+    body = {"verdict": "include", "rationale": "confirmed by a human"}
+    headers = {"Authorization": f"Bearer {token}"}
+    path = "/projects/mc1/screening/title_abstract/records/t1/adjudication"
     with TestClient(create_app(db.url, data_dir=db.tmp)) as c:
-        r = c.post(
-            "/projects/mc1/screening/title_abstract/records/t1/adjudication",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"verdict": "include", "rationale": "confirmed by a human"},
-        )
-        assert r.status_code == 201
+        r = c.post(path, headers=headers, json=body)
+        assert r.status_code == 409 and "approved at Gate 3" in r.json()["detail"]
+    with db.session() as s:
+        assert counts(s, ScreeningDecisionORM, ScreeningConflictORM) == rows_before
+        Repository(s).get_project("mc1").phase = Phase.GATE3_EXTRACTION_APPROVAL.value
+        s.commit()
+    with TestClient(create_app(db.url, data_dir=db.tmp)) as c:
+        assert c.post(path, headers=headers, json=body).status_code == 201
 
 
 # =========================================================================== finding 4
@@ -386,6 +407,20 @@ def _stage5_with_link(db: Db) -> str:
     with db.session() as s:
         repo, rid, _ = comparative_project(s, study_links=[["t1", "t2"]])
         repo.get_project("mc1").phase = Phase.STAGE5_META_ANALYSIS.value
+        # Session 9 (H2): Stage 5 -> 6 re-checks Gate 3, so the double counting the link
+        # creates is resolved (a decision that stays possible in Stage 5)
+        resolve_double_counting(
+            repo, "mc1", study_id="study-t1", outcome_id="complication",
+            reviewer=repo.require_active_reviewer(rid),
+            justification="synthetic: distinct recruitment periods",
+            non_overlapping_record_ids=["t1", "t2"],
+        )  # fmt: skip
+        approved = repo.latest_analysis_plan("mc1")
+        assert approved is not None  # the decision changed the inputs: re-run Stage 5
+        repo.record_stats_output(
+            "mc1",
+            run_plan(approved, repo.load_stage5_inputs("mc1"), project_id="mc1", generated_at=NOW),
+        )
         s.commit()
     return rid
 

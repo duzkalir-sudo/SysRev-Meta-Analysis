@@ -87,6 +87,13 @@ class ReasonBody(_Body):
     reason: str = Field(min_length=1)
 
 
+class ConfirmMatchBody(_Body):
+    note: str = Field(min_length=1)
+    # Session 9 (H3): the PDF the reviewer examined (``pdf_sha256`` of the manifest row);
+    # a confirmation from a screen showing a since-replaced PDF is refused.
+    expected_pdf_sha256: str = Field(min_length=64, max_length=64)
+
+
 class CorrectionBody(_Body):
     correction: ProposedValue
     note: str = Field(min_length=1)
@@ -253,7 +260,10 @@ def build_review_router(store: DocumentStore) -> APIRouter:
     async def upload(
         project_id: str, record_id: str, request: Request, session: SessionDep,
         reviewer: ReviewerDep, x_filename: Annotated[str, Header()] = "upload.pdf",
+        x_replaces_sha256: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:  # fmt: skip
+        """Upload a PDF. Replacing a linked PDF requires ``X-Replaces-SHA256`` naming it
+        (Session 9, H3); after Gate 3 every upload is refused before anything is stored."""
         data = await request.body()
         if len(data) > MAX_UPLOAD_BYTES:
             raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "PDF too large")
@@ -263,6 +273,7 @@ def build_review_router(store: DocumentStore) -> APIRouter:
                 lambda: register_upload(
                     repo, store, project_id, record_id, data,
                     original_filename=x_filename, reviewer=reviewer,
+                    replaces_sha256=x_replaces_sha256,
                 )
             )  # fmt: skip
         except HTTPException as exc:
@@ -272,11 +283,12 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         return item.model_dump(mode="json")
 
     @router.post("/fulltext/{record_id}/confirm-match")
-    def confirm(project_id: str, record_id: str, body: NoteBody, session: SessionDep,
+    def confirm(project_id: str, record_id: str, body: ConfirmMatchBody, session: SessionDep,
                 reviewer: ReviewerDep) -> dict[str, Any]:  # fmt: skip
         repo = Repository(session)
-        item = _call(lambda: confirm_pdf_match(repo, project_id, record_id, reviewer=reviewer,
-                                               note=body.note))  # fmt: skip
+        item = _call(lambda: confirm_pdf_match(
+            repo, project_id, record_id, reviewer=reviewer, note=body.note,
+            expected_pdf_sha256=body.expected_pdf_sha256))  # fmt: skip
         return item.model_dump(mode="json")
 
     @router.post("/fulltext/{record_id}/acknowledge-xml-only")
@@ -306,6 +318,8 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         return [
             i.model_dump(mode="json")
             | {
+                # Session 9 (M5): how the stored value reads its printed text
+                "format_status": i.format_status,
                 "item_state_sha256": item_state_sha256(i),
                 # one captured source per report: displayed *and* hashed (no second read)
                 "state_sha256": correction_state_sha256(repo, project_id, i, sources[i.record_id]),

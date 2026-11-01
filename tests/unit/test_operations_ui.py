@@ -475,3 +475,16 @@ def test_plan_approval_from_a_screen_of_the_old_protocol_is_refused_until_reload
     click(at, "Approve this draft (authenticated)")
     assert any("Plan approved" in m for m in successes(at)), errors(at)
     assert plan_obligation() == "resolved"
+
+
+# --------------------------------------------------------------------------- Session 9 (M5)
+def test_correction_screen_shows_verbatim_text_and_interpreted_value(stage4: Env) -> None:
+    import json
+
+    at = stage4.app("Corrections, links & double counting")
+    shown = [json.loads(j.value) if isinstance(j.value, str) else j.value for j in at.json]
+    detail = next(d for d in shown if isinstance(d, dict) and "as printed" in d)
+    assert detail["as printed"] == "62.1" and detail["interpreted value"] == 62.1
+    assert detail["number format"] == "default reading" and detail["format status"] == "ok"
+    (fmt,) = [w for w in at.selectbox if w.label.startswith("Number format of the source")]
+    assert "thousands_comma" in fmt.options and "decimal_comma" in fmt.options

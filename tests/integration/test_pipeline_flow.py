@@ -274,7 +274,7 @@ async def test_full_pipeline(
             pmid=by_id[main_id].pmid,
             status=FullTextStatus.OA_DOWNLOADED,
             pdf_filename="main.pdf",
-            pdf_sha256="e" * 64,
+            pdf_sha256="a" * 64,  # the PDF the main report's evidence cites (make_evidence)
             match_status=UploadMatchStatus.CONFIRMED,  # synthetic: DOI matched on page 1
         ),
     )
@@ -351,6 +351,15 @@ async def test_full_pipeline(
     with pytest.raises(GuardViolationError, match="1 included report"):
         advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     follow_arm = make_arm(follow_id)
+    # Session 9 (H3): the follow-up's values cite the follow-up's own linked PDF
+    follow_arm = follow_arm.model_copy(
+        update={
+            k: v.model_copy(
+                update={"evidence": v.evidence.model_copy(update={"pdf_sha256": "f" * 64})}
+            )
+            for k, v in follow_arm.extracted_values().items()
+        }
+    )
     repo.save_extracted_arm(PID, follow_arm)
     advance(repo, Phase.GATE3_EXTRACTION_APPROVAL)
     with pytest.raises(GuardViolationError, match="not approved by a human"):

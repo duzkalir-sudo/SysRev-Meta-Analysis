@@ -17,7 +17,7 @@ from typing import Any
 
 from src.stats_engine import effect_sizes as es
 from src.stats_engine.glmm import glmm_logit
-from src.stats_engine.mantel_haenszel import mantel_haenszel
+from src.stats_engine.mantel_haenszel import mantel_haenszel, mantel_haenszel_weights
 from src.stats_engine.numerics import fixed_effect, heterogeneity, random_effects
 
 DEFAULT_REFERENCE = Path(__file__).parent.parent / "tests/fixtures/stats/metafor_reference.json"
@@ -120,6 +120,10 @@ def comparisons(reference: dict[str, Any]) -> Iterator[Comparison]:
                 mh = mantel_haenszel(measure, [tables[i] for i in kept])
                 for f in ("estimate", "se", "ci_lower", "ci_upper", "statistic", "p_value"):
                     yield f"{cid}.{measure}", f"mh.{f}", getattr(mh, f), ref["mh"][f], "closed"
+                if "weights" in ref["mh"]:  # Session 9 (M3): weights.rma.mh
+                    mh_w = mantel_haenszel_weights(measure, [tables[i] for i in kept])
+                    for i, (got, want) in enumerate(zip(mh_w, ref["mh"]["weights"], strict=True)):
+                        yield f"{cid}.{measure}", f"mh.weights[{i}]", got, want, "closed"
         elif kind == "continuous":
             rows = list(
                 zip(

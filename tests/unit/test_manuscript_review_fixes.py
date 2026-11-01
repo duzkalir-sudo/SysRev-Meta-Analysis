@@ -335,7 +335,8 @@ def test_attestation_preconditions(session: Session) -> None:
         )
     item = svc.repo.get_fulltext_item("ms1", "s1")
     assert item is not None
-    svc.repo.save_fulltext_item("ms1", item.model_copy(update={"match_status": None}))
+    with out_of_band(svc.repo, "ms1"):  # Session 9: refused by the application after Gate 3
+        svc.repo.save_fulltext_item("ms1", item.model_copy(update={"match_status": None}))
     with pytest.raises(SysRevError, match="confirmed identity"):
         svc.attest_reference(
             "study-s1",
@@ -508,7 +509,8 @@ def test_unchanged_pdf_evidence_remains_valid(session: Session) -> None:
     _sign_off(svc, rid)
     item = svc.repo.get_fulltext_item("ms1", "s1")
     assert item is not None
-    svc.repo.save_fulltext_item("ms1", item)  # re-saving identical evidence changes nothing
+    with out_of_band(svc.repo, "ms1"):  # re-saving identical evidence changes nothing
+        svc.repo.save_fulltext_item("ms1", item)
     assert completion_problems(svc.repo, "ms1") == []
 
 
@@ -518,7 +520,10 @@ def test_replaced_pdf_invalidates_attestation_audit_and_approval(session: Sessio
     item = svc.repo.get_fulltext_item("ms1", "s1")
     assert item is not None
     replaced = item.model_copy(update={"pdf_sha256": "c" * 64, "pdf_filename": "s1_v2.pdf"})
-    svc.repo.save_fulltext_item("ms1", replaced)  # a new PDF, even with a confirmed identity
+    with pytest.raises(SysRevError, match="approved at Gate 3"):  # Session 9 (H3)
+        svc.repo.save_fulltext_item("ms1", replaced)
+    with out_of_band(svc.repo, "ms1"):  # a new PDF written outside the application
+        svc.repo.save_fulltext_item("ms1", replaced)
     problems = completion_problems(svc.repo, "ms1")
     assert any("evidence changed" in p and "references_sha256" in p for p in problems)
     svc.rerender(human(svc.repo, rid))
@@ -558,7 +563,8 @@ def test_revoked_pdf_identity_invalidates_attestation(session: Session) -> None:
     _sign_off(svc, rid)
     item = svc.repo.get_fulltext_item("ms1", "s1")
     assert item is not None
-    svc.repo.save_fulltext_item("ms1", item.model_copy(update={"match_status": None}))
+    with out_of_band(svc.repo, "ms1"):  # Session 9: refused by the application after Gate 3
+        svc.repo.save_fulltext_item("ms1", item.model_copy(update={"match_status": None}))
     assert any("evidence changed" in p for p in completion_problems(svc.repo, "ms1"))
     svc.rerender(human(svc.repo, rid))
     confirm_checklists(svc.repo, svc.project_id, rid)

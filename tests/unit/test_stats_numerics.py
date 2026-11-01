@@ -144,8 +144,14 @@ def test_clopper_pearson_boundaries() -> None:
 def test_probability_scales_round_trip(scale: es.ProbabilityScale) -> None:
     for p in (0.01, 0.3, 0.92, 0.999):
         assert es.from_scale(es.to_scale(p, scale), scale) == pytest.approx(p, rel=1e-12)
-    with pytest.raises(EstimationError):
-        es.to_scale(1.0, scale)
+    if scale == "plain":  # identity on the closed interval [0, 1] (Session 9, M1)
+        assert es.to_scale(0.0, scale) == 0.0 and es.to_scale(1.0, scale) == 1.0
+        for bad in (-0.01, 1.01):
+            with pytest.raises(EstimationError):
+                es.to_scale(bad, scale)
+    else:  # log(-log), log and logit are undefined at the boundary
+        with pytest.raises(EstimationError):
+            es.to_scale(1.0, scale)
 
 
 def test_logit_correction_for_boundary_proportions() -> None:
