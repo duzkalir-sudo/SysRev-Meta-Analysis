@@ -450,7 +450,7 @@ def test_p2b_forest_plot_marks_the_mh_only_study(tmp_path: Path) -> None:
     a = _ratio(REVIEW_TABLES, "RR", primary_model="common_effect")
     svg = forest_plot(a, tmp_path / "r.svg")
     assert svg is not None
-    content = svg.read_text()
+    content = svg.read_text(encoding="utf-8")
     assert "no study-level estimate" in content and "(Mantel-Haenszel only)" in content
 
 
@@ -458,11 +458,11 @@ def test_p2b_reference_case_is_in_the_live_r_validation() -> None:
     cases = json.loads(
         (
             Path(__file__).resolve().parents[2] / "validation" / "r" / "synthetic_cases.json"
-        ).read_text()
+        ).read_text(encoding="utf-8")
     )
     assert cases["two_by_two"]["mh_double_all_event"]["ai"] == [30, 10, 100]
     ref = json.loads((Path(__file__).resolve().parents[1] / "fixtures" / "stats"
-                      / "metafor_reference.json").read_text())  # fmt: skip
+                      / "metafor_reference.json").read_text(encoding="utf-8"))  # fmt: skip
     case = next(c for c in ref["cases"] if c["id"] == "mh_double_all_event")
     assert math.exp(case["expected"]["RR"]["mh"]["estimate"]) == pytest.approx(70 / 65)
     assert case["expected"]["RR"]["mh"]["weights_all"][2] == pytest.approx(100 * 50 / 65)

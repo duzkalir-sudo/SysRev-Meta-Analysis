@@ -186,7 +186,7 @@ def within(a: float, b: float, cls: str) -> bool:
 
 
 def main(path: Path = DEFAULT_REFERENCE) -> int:
-    ref = json.loads(path.read_text())
+    ref = json.loads(path.read_text(encoding="utf-8"))
     worst: dict[str, tuple[float, float, str]] = {}
     failures = []
     n = 0

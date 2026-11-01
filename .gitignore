@@ -17,3 +17,4 @@ data/
 *.sqlite
 *.pdf
 !tests/fixtures/*.pdf
+session10_results/

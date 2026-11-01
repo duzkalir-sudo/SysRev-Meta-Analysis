@@ -366,7 +366,8 @@ agent) could impersonate the reviewer.
    decision whose `reviewer_id` is missing, unknown, revoked, or whose name does not match
    the enrolled reviewer; `gate_decisions.reviewer_id` is a `NOT NULL` foreign key.
 5. **Hygiene.** The server is meant to bind to loopback (uvicorn's default
-   `127.0.0.1`); file-based SQLite directories are created with mode `0700`. Tokens
+   `127.0.0.1`); file-based SQLite directories are created with mode `0700` (on Windows,
+   where POSIX modes do not apply, with an explicit owner-only ACL — Session 10). Tokens
    must not be placed in `.env`, the repository, or anywhere an agent process can read.
 
 **Remaining limitations (threat model).** These measures stop an agent that can only
@@ -1512,6 +1513,33 @@ Remaining limitations: a historical value flagged under M5 in a project already 
 blocks Stage 6 with no route back to correct it (the state machine has none); arm building is
 not bound to a displayed-state hash (triage L2); the atomicity guarantee relies on SQLite's
 single writer (other databases lock the project row, as for the reporting decisions).
+
+### 9.12 Session 10 — preparation of the real-world Windows pilot
+
+Session 10 validates the existing product on Windows with a real review. The defects
+confirmed while preparing it are fixed with regressions in `tests/unit/test_session10_fixes.py`;
+the pilot tooling is in `validation/session10/` (tested in `tests/unit/test_session10_tooling.py`).
+The status of each validation step (prepared, executed, blocked) is recorded in
+`SESSION10_VALIDATION_TR.md`.
+
+* **Sensitivity-analysis sentence.** The results paragraph selected every fact whose key began
+  with `stats.<analysis>.sensitivity.`, which since the Session 9 review includes the
+  sensitivity model's own population counts; the draft could read "Sensitivity analysis: 2;
+  400; 70; 1.35 (…)". Estimates are now selected by their role (`sensitivity_estimate`); when
+  the sensitivity model has its own population, its counts follow the estimate with their units
+  ("(population of this model: 2 studies, 400 participants, 70 events)"). Calculations, facts
+  and their hashes are unchanged; stored manuscript versions are never rewritten. A stored
+  version that still contains the old sentence is no longer recognised as template text when it
+  is audited again, so the Auditor routes it to human review (not blocking).
+* **Owner-only database directory on Windows.** `mkdir(mode=0o700)` has no effect on Windows;
+  the directory inherited its parent's ACL. A newly created SQLite directory now gets an
+  explicit ACL (`icacls /inheritance:r /grant:r *<current user SID>:(OI)(CI)F`, system tools
+  called by absolute path). If it cannot be applied, startup fails closed. As on POSIX, an
+  existing directory is not changed; the preflight reports whether it is owner-only.
+* **Text encoding.** The application already wrote and read its files as UTF-8. Seventeen test
+  and validation reads/writes relied on the locale encoding; two tests failed on a Windows
+  code page (reproduced on Linux with a cp1254 locale). Every text I/O call now names its
+  encoding, and a test enforces that for `src`, `tests` and `validation`.
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

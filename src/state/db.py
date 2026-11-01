@@ -13,6 +13,10 @@ Design choices:
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -41,6 +45,8 @@ from sqlalchemy.orm import (
     relationship,
     sessionmaker,
 )
+
+from src.core.exceptions import SysRevError
 
 
 class UTCDateTime(TypeDecorator[datetime]):
@@ -767,7 +773,64 @@ def prepare_sqlite_path(url: str) -> None:
     if not url.startswith("sqlite:///") or ":memory:" in url:
         return
     path = Path(url.removeprefix("sqlite:///"))
+    created = not path.parent.exists()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if created and os.name == "nt":
+        # Windows ignores the POSIX mode: a new directory inherits its parent's ACL (under
+        # C:\ that usually lets every authenticated user modify it). Apply the equivalent of
+        # 0700 explicitly (Session 10). Like the POSIX mode, only new directories are changed.
+        restrict_directory_to_current_user(path.parent)
+
+
+def _windows_tool(name: str) -> str:
+    """Absolute path of a Windows system tool (never resolved through PATH)."""
+    return str(Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / name)
+
+
+def current_user_sid(run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> str:
+    """SID of the current Windows user (``whoami /user``)."""
+    out = run(
+        [_windows_tool("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    ).stdout
+    sids = re.findall(r'"(S-1-[0-9-]+)"', out)
+    if len(sids) != 1:
+        raise SysRevError(f"could not determine the current Windows user's SID from {out!r}")
+    return str(sids[0])
+
+
+def restrict_directory_to_current_user(
+    directory: Path, run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
+) -> None:
+    """Windows equivalent of ``chmod 0700``: remove inherited entries and grant full control
+    to the current user only (inherited by files and subdirectories). Fails closed: if the
+    ACL cannot be applied, the database is not opened there."""
+    sid = current_user_sid(run)
+    result = run(
+        [
+            _windows_tool("icacls.exe"),
+            str(directory),
+            "/inheritance:r",
+            "/grant:r",
+            f"*{sid}:(OI)(CI)F",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SysRevError(
+            f"could not restrict {directory} to the current user (icacls exit "
+            f"{result.returncode}: {(result.stdout + result.stderr).strip()}); the database "
+            "directory would be readable by other accounts. Choose a database location in "
+            "your user profile or fix the folder permissions, then start again."
+        )
 
 
 # Nullable columns added after a table was first released. ``create_all`` never alters an

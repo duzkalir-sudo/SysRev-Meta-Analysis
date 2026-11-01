@@ -171,6 +171,39 @@ TABLE_CAPTIONS = {
 }
 
 
+COUNT_UNITS = (("k", "studies"), ("participants", "participants"), ("events", "events"))
+
+
+def _sensitivity_clauses(p: EvidencePackage, k: str) -> list[str]:
+    """One clause per sensitivity estimate of analysis ``k`` (``stats.<analysis>``).
+
+    Facts are selected by their role, never by key prefix: ``<k>.sensitivity.<i>`` is the
+    estimate (its text names the model), while ``<k>.sensitivity.<i>.k/.participants/.events``
+    are that model's own population counts (Session 9 review), which are added with their
+    units next to the estimate they describe (Session 10)."""
+    estimates = sorted(
+        (
+            f
+            for f in p.facts.values()
+            if f.role == "sensitivity_estimate"
+            and re.fullmatch(rf"{re.escape(k)}\.sensitivity\.\d+", f.key)
+        ),
+        key=lambda f: int(f.key.rsplit(".", 1)[1]),
+    )
+    clauses = []
+    for f in estimates:
+        counts = [
+            f"{{{{{f.key}.{part}}}}} {unit}"
+            for part, unit in COUNT_UNITS
+            if f"{f.key}.{part}" in p.facts and p.facts[f"{f.key}.{part}"].role == "count"
+        ]
+        clause = f"{{{{{f.key}}}}}"
+        if counts:
+            clause += " (population of this model: " + ", ".join(counts) + ")"
+        clauses.append(clause)
+    return clauses
+
+
 def _results(p: EvidencePackage) -> str:
     included = "; ".join(f"@{k}" for k in sorted(p.included_ref_keys.values()))
     paras = [
@@ -209,9 +242,9 @@ def _results(p: EvidencePackage) -> str:
                 )
             if f"{k}.prediction_interval" in p.facts:
                 s += f" The {{{{{k}.prediction_interval}}}}."
-            sens = [x for x in p.facts if x.startswith(f"{k}.sensitivity.")]
+            sens = _sensitivity_clauses(p, k)
             if sens:
-                s += " Sensitivity analysis: " + "; ".join(f"{{{{{x}}}}}" for x in sens) + "."
+                s += " Sensitivity analysis: " + "; ".join(sens) + "."
         elif f"{k}.single_study_estimate" in p.facts:
             fig += 1
             rids = p.facts[f"{k}.single_study_estimate"].record_ids

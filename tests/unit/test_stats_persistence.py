@@ -239,8 +239,10 @@ def test_artifacts_written_with_manifest(repo: Repository, tmp_path: Path) -> No
         "tables/nec.csv",
         "plots/nec.svg",
     } <= set(files)
-    assert (tmp_path / "stats_output.json").read_text() == output.to_canonical_json()
-    assert output.sha256() in (tmp_path / "manifest.json").read_text()
+    assert (tmp_path / "stats_output.json").read_text(
+        encoding="utf-8"
+    ) == output.to_canonical_json()
+    assert output.sha256() in (tmp_path / "manifest.json").read_text(encoding="utf-8")
 
 
 def _forged(output: StatsOutput, path: tuple[str, ...], delta: float) -> StatsOutput:

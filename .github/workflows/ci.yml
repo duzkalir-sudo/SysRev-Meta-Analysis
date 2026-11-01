@@ -36,9 +36,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends r-base-core r-cran-metafor r-cran-lme4 r-cran-jsonlite
           Rscript -e 'for (p in c("metafor","lme4","jsonlite")) cat(p, as.character(packageVersion(p)), "\n")'
-      - run: pip install -e ".[dev]"
+      - run: pip install -e ".[dev,stats]"
       - name: Regenerate references with R and compare
         run: |
           Rscript validation/r/metafor_reference.R validation/r/synthetic_cases.json /tmp/metafor_reference_ci.json
           python -m validation.compare_metafor /tmp/metafor_reference_ci.json
           pytest -v tests/unit/test_stats_metafor_reference.py -k "live_r or matches_metafor" -rs
+      - name: Session 10 pilot statistics checker against R metafor
+        env:
+          SYSREV_REQUIRE_R: "1"
+        run: pytest -v tests/unit/test_session10_tooling.py -rs

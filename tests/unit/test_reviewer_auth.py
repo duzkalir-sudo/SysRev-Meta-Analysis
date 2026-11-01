@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -184,5 +186,12 @@ def test_sqlite_directory_created_owner_only(tmp_path: object) -> None:
 
     target = Path(str(tmp_path)) / "nested" / "db"
     prepare_sqlite_path(f"sqlite:///{target}/sysrev.db")
-    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    if os.name == "nt":  # Session 10: POSIX modes do not exist on Windows; the ACL does
+        from tests.unit.test_session10_fixes import windows_acl_entries
+
+        entries = windows_acl_entries(target)
+        assert len(entries) == 1, entries
+        assert "(I)" not in entries[0] and "(F)" in entries[0], entries
+    else:
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
     prepare_sqlite_path("sqlite:///:memory:")  # no-op
