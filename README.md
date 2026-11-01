@@ -44,6 +44,11 @@ and approval), protocol amendments after Gate 1 with re-review of affected work,
 searches after screening has begun, and runtime safeguards for issues #3/#4 (parse-once
 cache, opt-in Anthropic prompt caching, catalogue provenance per call, cost status that never
 shows unknown prices as zero). See "Session 8" below for what is and is not supported.
+Session 9 fixes the findings of an independent audit: arms always represent exactly the
+accepted values, Gate 3-approved data are frozen after Gate 3 and re-checked before Stage 6,
+evidence is bound to the currently linked PDF, KM/CIF boundary and rounding handling,
+model-appropriate weights (Mantel-Haenszel, none for the GLMM), plots bound to the verified
+output, and explicit number-format readings (ARCHITECTURE.md §9.11).
 
 ## Quick start
 
@@ -483,3 +488,28 @@ re-read from the database under the write lock before any late-stage mutation.
 * Multi-reviewer sign-off is not implemented: the same enrolled reviewer may propose and
   approve an amendment (both identities are recorded).
 
+## Session 9: remediation of the independent audit
+
+What changes for a reviewer (details and remaining limitations: ARCHITECTURE.md §9.11):
+
+* Accepting or correcting a value after the arms of a report were built invalidates the arm
+  that no longer matches; rebuild the arms (the old arm stays in the history).
+* After Gate 3, screening decisions, PDFs and identity confirmations, extraction items, arms
+  and risk-of-bias assessments can no longer be changed. Links, double-counting decisions,
+  unavailability records and analysis-plan revisions remain possible in Stage 5; re-run
+  Stage 5 afterwards. Stage 5 → 6 re-checks every Gate 3 condition.
+* Replacing a linked PDF requires the hash of the PDF being replaced, and confirming a PDF's
+  identity requires the hash of the PDF examined:
+
+  ```bash
+  curl -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Filename: smith2019_v2.pdf" \
+       -H "X-Replaces-SHA256: $OLD_SHA" --data-binary @smith2019_v2.pdf \
+       http://127.0.0.1:8000/projects/$PID/fulltext/$RECORD/pdf
+  ```
+
+  Values verified against the old PDF must be re-verified (corrected) against the new one.
+* An ambiguous printed number such as `1,250` needs an explicit `number_format`
+  (`thousands_comma` or `decimal_comma`) and a note citing the source; `0,500` is read as 0.5.
+* Statistics engine 1.1.0: weight columns name their model (Mantel-Haenszel weights for the
+  MH common effect; no study weights for the GLMM); forest plots are shown only when they
+  belong to the current, valid statistics output.
