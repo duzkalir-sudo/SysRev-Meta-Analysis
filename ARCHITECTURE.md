@@ -1485,6 +1485,29 @@ the review required it).
   `mh_double_all_event` (complete-table MH RR 70/65) and `mh_boundaries` are part of the live
   metafor validation, which compares the MH estimates and the MH weights of every table.
 
+**Review of `d364c0f`: model-specific populations reach every report.** Since P2b the
+models of one analysis can use different studies: the Mantel-Haenszel risk ratio includes a
+double-all-event table that no inverse-variance model uses. Each `PooledResult` therefore
+carries its own population: `study_ids`, `record_ids`, `total_events` and
+`total_participants`, consistent with its `k` and validated against the listed studies.
+`AnalysisResult.population(model)` returns it; for engine 1.0.0 outputs, which have none, it
+falls back to every listed study and the analysis totals, which is what that engine used. The
+ledger names the models each included report contributes to (`ReportAccount.models`). The new
+fields are serialised only when present, so legacy outputs keep their hashes, and a 1.0.0
+output may not carry them.
+
+Reporting uses the **primary** model's population wherever counts appear next to the primary
+estimate: GRADE decision support (k, participants, events, imprecision, publication-bias k),
+the reports whose risk of bias GRADE rates (`contributing_records`), the manuscript facts
+`stats.<a>.k/.participants/.events` and their record ids, and therefore the Summary of
+Findings row, the results table and the narrative. The status text and `status_reason` name
+the primary model and its k. Non-primary models with a different population stay visible and
+labelled as auxiliary: `auxiliary_models` in decision support,
+`stats.<a>.<model>.k/.participants/.events` facts, the status text, the figure legend, the
+statistics report ("Model population") and the forest-plot model rows (k per model). The
+analysis-level `k` and totals still count every listed study, as the complete ledger does.
+When every model uses every listed study, facts and texts are worded exactly as before.
+
 Remaining limitations: a historical value flagged under M5 in a project already past Gate 3
 blocks Stage 6 with no route back to correct it (the state machine has none); arm building is
 not bound to a displayed-state hash (triage L2); the atomicity guarantee relies on SQLite's

@@ -244,8 +244,18 @@ def single_arm_project(
 
 
 def comparative_project(
-    session: Session, pid: str = "mc1", *, study_links: list[list[str]] | None = None
+    session: Session,
+    pid: str = "mc1",
+    *,
+    study_links: list[list[str]] | None = None,
+    trials: list[tuple[str, str, str, str, str]] | None = None,
+    primary_model: str = "random_effects",
+    stop_at_gate3: bool = False,
 ) -> tuple[Repository, str, str]:
+    """A comparative review with an approved RR plan, by default taken (directly) to Stage 6
+    with verified statistics. ``trials`` replaces the 2x2 tables (record id, intervention
+    events, intervention n, control events, control n). With ``stop_at_gate3`` the project
+    is left at Gate 3 with the plan approved, for a real Gate 3 -> Stage 5 -> Stage 6 run."""
     repo = Repository(session)
     repo.create_project(pid, "Synthetic comparative review")
     rid, token = repo.enroll_reviewer(REVIEWER)
@@ -259,7 +269,7 @@ def comparative_project(
         ),
     )
     run_id = _search_run(repo, pid, rid, REVIEWER)
-    trials = [
+    trials = trials or [
         ("t1", "12", "100", "20", "100"),
         ("t2", "8", "80", "15", "82"),
         ("t3", "5", "60", "9", "58"),
@@ -293,12 +303,16 @@ def comparative_project(
             note="synthetic: reports of one study",
         )
     repo.save_prisma(pid, derive_prisma(repo, pid))
-    _to_stage6(
-        repo,
-        pid,
-        rid,
-        [AnalysisSpec(analysis_id="comp", outcome_id="complication", effect_measure="RR")],
-    )
+    spec = AnalysisSpec(
+        analysis_id="comp", outcome_id="complication", effect_measure="RR",
+        primary_model=primary_model,  # type: ignore[arg-type]
+    )  # fmt: skip
+    if stop_at_gate3:
+        repo.save_analysis_plan(pid, plan(spec, reviewer_id=rid))
+        repo.get_project(pid).phase = Phase.GATE3_EXTRACTION_APPROVAL.value
+        session.flush()
+        return repo, rid, token
+    _to_stage6(repo, pid, rid, [spec])
     return repo, rid, token
 
 

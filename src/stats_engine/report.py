@@ -104,6 +104,18 @@ def analysis_markdown(a: AnalysisResult) -> str:
         f"* Timepoint(s): {', '.join(a.timepoints) or 'not specified (comparative outcome)'}",
         f"* Studies included: {a.k}; excluded: {len(a.excluded)}",
     ]
+    if any(r.study_ids is not None for r in a.pooled_models()):
+        # Session 9 review: each model's own population (they can differ, e.g. the
+        # Mantel-Haenszel risk ratio includes tables without a study-level estimate)
+        for r in a.pooled_models():
+            pop = a.population(r)
+            role = "primary" if r == a.primary else "auxiliary"
+            totals = (
+                f"; {pop.total_events} events / {pop.total_participants} participants"
+                if pop.total_participants is not None
+                else ""
+            )
+            lines.append(f"* Model population — {r.label} ({role}): k = {pop.k}{totals}")
     if a.total_events is not None:
         lines.append(
             f"* Events / participants in included studies: "
@@ -358,7 +370,7 @@ def forest_plot(a: AnalysisResult, path: Path) -> Path | None:
         if r is not None:
             rows.append(
                 {
-                    "label": f"{name} ({r.method.split(',')[0]})",
+                    "label": f"{name} ({r.method.split(',')[0]}), k = {r.k}",
                     "est": r.estimate_natural,
                     "lo": r.ci_lower_natural,
                     "hi": r.ci_upper_natural,

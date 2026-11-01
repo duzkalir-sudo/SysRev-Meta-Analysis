@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
@@ -285,6 +286,16 @@ class ReportAccount(FrozenModel):
     unit_id: Identifier | None = Field(default=None, description="analysis unit it enters")
     reason_code: ExclusionCode | None = None
     reason: str | None = None
+    # Session 9 review: the reported models an included report contributes to (labels as
+    # ``PooledResult.label``); serialised only when present (engine 1.0.0 has none).
+    models: list[str] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_models(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        if self.models is None:
+            data.pop("models", None)
+        return data
 
     @model_validator(mode="after")
     def _shape(self) -> ReportAccount:
@@ -319,6 +330,50 @@ class PooledResult(FrozenModel):
     prediction_interval_natural: tuple[float, float] | None = None
     prediction_df: int | None = None
     k: int = Field(ge=1)
+    # Session 9 review of d364c0f: the population of *this* model. Models of one analysis can
+    # use different studies (the Mantel-Haenszel risk ratio includes tables without a
+    # study-level estimate that no inverse-variance model uses), so counts shown next to an
+    # estimate come from its own model. Absent in engine 1.0.0 outputs, where every reported
+    # model used every listed study (see ``AnalysisResult.population``).
+    study_ids: list[Identifier] | None = None
+    record_ids: list[Identifier] | None = None
+    total_events: int | None = None
+    total_participants: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_population(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Serialised only when present, so engine 1.0.0 outputs keep their hashes (P1a)."""
+        data: dict[str, Any] = handler(self)
+        for name in ("study_ids", "record_ids", "total_events", "total_participants"):
+            if getattr(self, name) is None:
+                data.pop(name, None)
+        return data
+
+    @property
+    def label(self) -> str:
+        """Short, stable name of the model (e.g. "common-effect (Mantel-Haenszel)")."""
+        if self.method.startswith("Mantel-Haenszel"):
+            how = "Mantel-Haenszel"
+        elif self.method.startswith("binomial-normal GLMM"):
+            how = "binomial-normal GLMM"
+        elif self.method.startswith("binomial maximum likelihood"):
+            how = "binomial maximum likelihood"
+        elif self.method.startswith("logit transform"):
+            how = "inverse-variance logit"
+        else:
+            how = "inverse variance"
+        return f"{self.model.replace('_', '-')} ({how})"
+
+
+@dataclass(frozen=True)
+class ModelPopulation:
+    """Studies, reports and totals behind one model's estimate (Session 9 review)."""
+
+    k: int
+    study_ids: tuple[str, ...]
+    record_ids: tuple[str, ...]
+    total_events: int | None
+    total_participants: int | None
 
 
 class HeterogeneityResult(FrozenModel):
@@ -379,7 +434,64 @@ class AnalysisResult(FrozenModel):
             raise ValueError("included reports in the ledger must match the included studies")
         if any(rid not in ledger for e in self.excluded for rid in e.record_ids):
             raise ValueError("every excluded report must appear in the report ledger")
+        self._check_populations()
         return self
+
+    def pooled_models(self) -> list[PooledResult]:
+        """Every reported model once (the primary is the common- or random-effects one)."""
+        out = [r for r in (self.common_effect, self.random_effects) if r is not None]
+        return out + list(self.sensitivity)
+
+    def _check_populations(self) -> None:
+        """A model's explicit population must name listed studies, its k and their reports."""
+        by_id = {s.study_id: s for s in self.studies}
+        for r in [*self.pooled_models(), *([self.primary] if self.primary else [])]:
+            if r.study_ids is None:
+                continue
+            if len(r.study_ids) != r.k or len(set(r.study_ids)) != r.k:
+                raise ValueError(f"{r.label}: study_ids must list k = {r.k} distinct studies")
+            if any(sid not in by_id for sid in r.study_ids):
+                raise ValueError(f"{r.label}: study_ids must name included studies")
+            expected = sorted(rid for sid in r.study_ids for rid in by_id[sid].record_ids)
+            if r.record_ids is None or sorted(r.record_ids) != expected:
+                raise ValueError(f"{r.label}: record_ids must be the reports of its studies")
+
+    def population(self, r: PooledResult | None = None) -> ModelPopulation:
+        """Population behind model ``r`` (default: the primary model; for an analysis without
+        a pooled model, every listed study). Outputs of engine 1.0.0 carry no explicit
+        populations; there every reported model used every listed study and the analysis
+        totals (that engine had no model-specific study selection)."""
+        r = r if r is not None else self.primary
+        if r is None or r.study_ids is None:
+            return ModelPopulation(
+                k=self.k,
+                study_ids=tuple(s.study_id for s in self.studies),
+                record_ids=tuple(sorted({rid for s in self.studies for rid in s.record_ids})),
+                total_events=self.total_events,
+                total_participants=self.total_participants,
+            )
+        return ModelPopulation(
+            k=r.k,
+            study_ids=tuple(r.study_ids),
+            record_ids=tuple(sorted(r.record_ids or ())),
+            total_events=r.total_events,
+            total_participants=r.total_participants,
+        )
+
+    def auxiliary_populations(self) -> list[tuple[PooledResult, ModelPopulation]]:
+        """Reported non-primary models whose population differs from the primary's."""
+        primary = self.population()
+        out: list[tuple[PooledResult, ModelPopulation]] = []
+        for r in self.pooled_models():
+            if self.primary is not None and r == self.primary:
+                continue
+            pop = self.population(r)
+            if pop.study_ids != primary.study_ids or (
+                pop.total_participants,
+                pop.total_events,
+            ) != (primary.total_participants, primary.total_events):
+                out.append((r, pop))
+        return out
 
 
 class StatsOutput(FrozenModel):
@@ -413,6 +525,10 @@ class StatsOutput(FrozenModel):
                     raise ValueError("engine 1.0.0 outputs have no ci_bound_not_transformable")
                 if "weight_convention" in a.settings:
                     raise ValueError("engine 1.0.0 outputs have no weight_convention setting")
+                if any(r.study_ids is not None for r in a.pooled_models()) or any(
+                    r.models is not None for r in a.reports
+                ):
+                    raise ValueError("engine 1.0.0 outputs have no model-specific populations")
         return self
 
     @model_validator(mode="after")

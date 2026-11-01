@@ -62,7 +62,10 @@ def question_type(a: AnalysisResult) -> QuestionType:
 
 
 def contributing_records(a: AnalysisResult) -> list[str]:
-    return sorted({r for s in a.studies for r in s.record_ids})
+    """Reports behind the estimate that GRADE rates: the primary model's population
+    (Session 9 review; an auxiliary model can use other studies, e.g. the Mantel-Haenszel
+    risk ratio's tables without a study-level estimate). Engine 1.0.0 outputs: every study."""
+    return list(a.population().record_ids)
 
 
 def latest_approved_rob(
@@ -159,6 +162,7 @@ def decision_support(a: AnalysisResult, rob: dict[str, RiskOfBiasAssessment]) ->
             "ci_upper": r.ci_upper_natural,
             "model": r.model,
             "method": r.method,
+            "model_label": r.label,
         }
     elif a.status == "single_study" and a.studies:
         s = a.studies[0]
@@ -178,15 +182,33 @@ def decision_support(a: AnalysisResult, rob: dict[str, RiskOfBiasAssessment]) ->
         crosses = est["ci_lower"] <= null <= est["ci_upper"]
     h = a.heterogeneity
     pi = a.random_effects.prediction_interval_natural if a.random_effects else None
+    # Counts shown with the estimate describe the primary model (Session 9 review); other
+    # reported models with a different population stay visible, labelled as auxiliary.
+    pop = a.population()
+    auxiliary = [
+        {
+            "model": r.label,
+            "role": "auxiliary (not the estimate rated here)",
+            "estimate": r.estimate_natural,
+            "ci_lower": r.ci_lower_natural,
+            "ci_upper": r.ci_upper_natural,
+            "k": aux.k,
+            "participants": aux.total_participants,
+            "events": aux.total_events,
+        }
+        for r, aux in a.auxiliary_populations()
+    ]
     return {
         "analysis_id": a.analysis_id,
         "outcome": a.outcome_name,
         "measure": a.effect_measure.value,
         "question_type": question_type(a),
         "status": a.status,
-        "k": a.k,
-        "participants": a.total_participants,
-        "events": a.total_events,
+        "k": pop.k,
+        "participants": pop.total_participants,
+        "events": pop.total_events,
+        "population_model": a.primary.label if a.primary is not None else "all listed studies",
+        "auxiliary_models": auxiliary,
         "estimate": est,
         "domains": {
             "risk_of_bias": {
@@ -216,13 +238,13 @@ def decision_support(a: AnalysisResult, rob: dict[str, RiskOfBiasAssessment]) ->
             "imprecision": {
                 "ci_includes_null": crosses,
                 "null_value": null,
-                "participants": a.total_participants,
-                "events": a.total_events,
+                "participants": pop.total_participants,
+                "events": pop.total_events,
                 "note": "no minimally important difference, decision threshold or optimal "
                 "information size is recorded in this project, and none is assumed",
             },
             "publication_bias": {
-                "k": a.k,
+                "k": pop.k,
                 "note": "no test for small-study effects or funnel-plot asymmetry was "
                 "performed by the statistics engine; the absence of a test, or a "
                 "non-significant one, is not evidence that publication bias is absent",

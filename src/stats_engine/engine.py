@@ -269,6 +269,24 @@ class _Analysis:
         )
         included = {rid: s.study_id for s in studies for rid in s.record_ids}
         excluded, reports = account_reports(self.inputs, selection, included, self.excluded)
+        # Session 9 review of d364c0f: every model carries its own population, and the ledger
+        # names the models each included report contributes to.
+        totals_known = kw.get("total_events") is not None
+        for name in ("primary", "common_effect", "random_effects"):
+            if kw.get(name) is not None:
+                kw[name] = _with_population(kw[name], studies, totals_known)
+        self.sensitivity = [_with_population(r, studies, totals_known) for r in self.sensitivity]
+        models = [
+            r for r in (kw.get("common_effect"), kw.get("random_effects"), *self.sensitivity)
+            if r is not None
+        ]  # fmt: skip
+        if models:
+            reports = [
+                r.model_copy(update={"models": [m.label for m in models
+                                                if r.unit_id in (m.study_ids or [])]})
+                if r.status == "included" else r
+                for r in reports
+            ]  # fmt: skip
         return AnalysisResult.model_validate(
             {
                 "analysis_id": self.spec.analysis_id,
@@ -417,7 +435,7 @@ class _Analysis:
                 )
         return self._result(
             "pooled",
-            f"{len(d.yi)} studies pooled ({self.spec.primary_model} primary)",
+            f"{primary.k} studies pooled by the primary {primary.label} model",
             scale=scale,
             k_data=d,
             primary=primary,
@@ -992,6 +1010,38 @@ _UNSUPPORTED: dict[EffectMeasure, str] = {
     EffectMeasure.MEDIAN_TIME_TO_EVENT: "Median times to event are not pooled (no validated "
     "method without individual participant data).",
 }
+
+
+def _study_totals(study: StudyResult) -> tuple[int, int] | None:
+    """(events, participants) of one study's data, for count-based measures."""
+    d = study.data
+    if "events_intervention" in d:
+        return (int(d["events_intervention"] + d["events_control"]),
+                int(d["n_intervention"] + d["n_control"]))  # fmt: skip
+    if "events" in d and "n" in d:
+        return int(d["events"]), int(d["n"])
+    return None
+
+
+def _with_population(r: PooledResult, studies: list[StudyResult], totals: bool) -> PooledResult:
+    """Attach the population of model ``r``: the Mantel-Haenszel risk ratio uses every listed
+    table, every other model the studies with a study-level estimate (Session 9 review)."""
+    if r.method.startswith("Mantel-Haenszel"):
+        members = studies
+    else:
+        members = [s for s in studies if s.yi is not None]
+    if len(members) != r.k:  # pragma: no cover - internal invariant of the handlers
+        raise EstimationError(f"{r.label}: {len(members)} studies listed, k = {r.k}")
+    counts = [_study_totals(s) for s in members]
+    known = totals and all(c is not None for c in counts)
+    return r.model_copy(
+        update={
+            "study_ids": [s.study_id for s in members],
+            "record_ids": sorted(rid for s in members for rid in s.record_ids),
+            "total_events": sum(c[0] for c in counts if c) if known else None,
+            "total_participants": sum(c[1] for c in counts if c) if known else None,
+        }
+    )
 
 
 def _mh_only_study(u: Unit, t: tuple[int, int, int, int]) -> dict[str, Any]:

@@ -467,3 +467,144 @@ def test_p2b_reference_case_is_in_the_live_r_validation() -> None:
     assert math.exp(case["expected"]["RR"]["mh"]["estimate"]) == pytest.approx(70 / 65)
     assert case["expected"]["RR"]["mh"]["weights_all"][2] == pytest.approx(100 * 50 / 65)
     assert case["expected"]["OR"]["mh"]["weights_all"][2] == 0
+
+
+# =========================================================================== populations
+# Review of d364c0f: the models of one analysis can use different studies (the MH risk
+# ratio includes the double-all-event table that no inverse-variance model uses). Everything
+# reported next to an estimate must describe that estimate's model.
+TRIALS = [("t1", "30", "100", "20", "100"), ("t2", "10", "100", "10", "100"),
+          ("t3", "100", "100", "100", "100")]  # fmt: skip
+RE_POP = (2, 400, 70)  # primary inverse-variance random effects
+MH_POP = (3, 600, 270)  # Mantel-Haenszel common effect
+
+
+def _pop(p: Any) -> tuple[int, int | None, int | None]:
+    return p.k, p.total_participants, p.total_events
+
+
+@pytest.mark.parametrize("primary", ["random_effects", "common_effect"])
+def test_models_carry_their_own_populations(primary: str) -> None:
+    from src.reporting import grade as gr
+
+    arms = [arm for t in TRIALS for arm in _two(*t)]
+    spec = AnalysisSpec(analysis_id="r", outcome_id="complication", effect_measure="RR",
+                        primary_model=primary)  # type: ignore[arg-type]  # fmt: skip
+    a = run_analysis(spec, OUTCOMES["complication"], inputs(arms))
+    mh, re_ = a.common_effect, a.random_effects
+    assert mh is not None and re_ is not None and a.primary is not None
+    assert _pop(a.population(mh)) == MH_POP and mh.study_ids == ["t1", "t2", "t3"]
+    assert _pop(a.population(re_)) == RE_POP and re_.study_ids == ["t1", "t2"]
+    assert mh.estimate_natural == pytest.approx(70 / 65, rel=1e-12)  # validated, unchanged
+    expected = RE_POP if primary == "random_effects" else MH_POP
+    assert _pop(a.population()) == expected
+    # status text names the primary model and its k
+    k = expected[0]
+    assert a.status_reason == f"{k} studies pooled by the primary {a.primary.label} model"
+    # the ledger keeps every report and names the models each contributes to
+    models = {r.record_id: r.models for r in a.reports}
+    assert models["t3"] == ["common-effect (Mantel-Haenszel)"]
+    assert set(models["t1"] or []) == {
+        "common-effect (Mantel-Haenszel)", "random-effects (inverse variance)",
+        "common-effect (inverse variance)",
+    }  # fmt: skip
+    # GRADE decision support describes the rated (primary) estimate; the other model is
+    # visible, labelled auxiliary
+    ds = gr.decision_support(a, {})
+    assert (ds["k"], ds["participants"], ds["events"]) == expected
+    imp = ds["domains"]["imprecision"]
+    assert (imp["participants"], imp["events"]) == expected[1:]
+    assert ds["domains"]["publication_bias"]["k"] == k
+    assert ds["population_model"] == a.primary.label
+    aux = {m["model"]: (m["k"], m["participants"], m["events"]) for m in ds["auxiliary_models"]}
+    if primary == "random_effects":
+        assert aux == {"common-effect (Mantel-Haenszel)": MH_POP}
+        assert gr.contributing_records(a) == ["t1", "t2"]
+    else:
+        assert aux["random-effects (inverse variance)"] == RE_POP
+        assert gr.contributing_records(a) == ["t1", "t2", "t3"]
+    # report: each model's population, plot rows with model-specific k
+    md = analysis_markdown(a)
+    assert "* Model population — common-effect (Mantel-Haenszel)" in md
+    assert "k = 3; 270 events / 600 participants" in md
+    assert "k = 2; 70 events / 400 participants" in md
+
+
+def _workflow(session: Session, primary: str, tmp_path: Path) -> tuple[Repository, str, Any]:
+    """Real Gate 3 approval -> run_stage5 -> valid artifact -> Stage 6 (no guard bypassed)."""
+    from src.core.enums import GateId, GateVerdict
+    from src.core.schemas.pipeline import GateDecision
+    from src.stats_engine.stage5 import run_stage5
+
+    repo, rid, _ = comparative_project(session, trials=TRIALS, primary_model=primary,
+                                       stop_at_gate3=True)  # fmt: skip
+    rv = repo.require_active_reviewer(rid)
+    decision = GateDecision(gate=GateId.GATE_3, verdict=GateVerdict.APPROVED,
+                            reviewer_name=rv.display_name, reviewer_id=rid)  # fmt: skip
+    repo.apply_transition("mc1", lambda m, c: m.submit_gate_decision(decision, c))
+    art = run_stage5(repo, "mc1", output_dir=tmp_path / "stats")
+    assert repo.stats_output_problems("mc1") == []
+    repo.apply_transition(
+        "mc1",
+        lambda m, c: m.transition(Phase.STAGE6_MANUSCRIPT, actor=rv.display_name,
+                                  actor_type=ActorType.HUMAN, context=c),
+    )  # fmt: skip
+    assert repo.current_phase("mc1") == Phase.STAGE6_MANUSCRIPT.value
+    return repo, rid, art
+
+
+@pytest.mark.parametrize("primary", ["random_effects", "common_effect"])
+def test_reporting_outputs_use_the_primary_population_in_a_real_workflow(
+    session: Session, tmp_path: Path, primary: str
+) -> None:
+    from src.manuscript.document import render
+    from src.manuscript.evidence import build_evidence_package
+    from src.manuscript.service import ManuscriptService
+    from src.reporting.service import ReportingService
+    from tests.manuscript_helpers import SYSTEM, save_grade
+    from tests.unit.test_reporting_grade import approval
+
+    repo, rid, art = _workflow(session, primary, tmp_path)
+    expected = RE_POP if primary == "random_effects" else MH_POP
+    k, participants, events = expected
+    rs = ReportingService(repo, "mc1")
+    view = next(r for r in rs.grade() if r["analysis_id"] == "comp")
+    ds = view["decision_support"]
+    assert (ds["k"], ds["participants"], ds["events"]) == expected
+    assert ds["estimate"]["model"] == primary
+    save_grade(rs, "comp", approval(), rid)
+    package = build_evidence_package(repo, "mc1")
+    f = package.facts
+    assert (f["stats.comp.k"].text, f["stats.comp.participants"].text,
+            f["stats.comp.events"].text) == (str(k), str(participants), str(events))  # fmt: skip
+    assert "primary" in f["stats.comp.k"].description
+    if primary == "random_effects":
+        aux = ("stats.comp.common_effect.k", "stats.comp.common_effect.participants",
+               "stats.comp.common_effect.events")  # fmt: skip
+        assert tuple(f[x].text for x in aux) == ("3", "600", "270")
+        assert "auxiliary common-effect (Mantel-Haenszel)" in f[aux[0]].description
+        assert f["stats.comp.k"].record_ids == ("t1", "t2")
+    status = f["stats.comp.status"].text
+    assert f"{k} studies contributed to the pooled estimate of the primary" in status
+    # the Summary of Findings row combines the primary estimate with the primary counts
+    row = next(line for line in package.templates["table:sof"].splitlines()
+               if "{{stats.comp.outcome}}" in line)  # fmt: skip
+    assert "{{stats.comp.participants}} ({{stats.comp.k}} studies)" in row
+    assert "{{stats.comp.pooled_estimate}}" in row
+    # generated manuscript: the results table, SoF and figure legend show the primary counts
+    svc = ManuscriptService(repo, "mc1")
+    version = svc.create_template_draft(SYSTEM)
+    text = render(version.sections, package).markdown
+    assert f"{participants} ({k} studies)" in text  # SoF participants column
+    # results narrative and figure legend
+    assert f"{k} studies contributed to the analysis of" in text
+    assert f"including {participants} participants" in text
+    other = (
+        "the common-effect (Mantel-Haenszel) model used 3 studies"
+        if primary == "random_effects"
+        else "the random-effects (inverse variance) model used 2 studies"
+    )
+    assert f") used {k} studies; " in text and other in text
+    if primary == "random_effects":
+        assert "600 (3 studies)" not in text and "including 600 participants" not in text
+    del art

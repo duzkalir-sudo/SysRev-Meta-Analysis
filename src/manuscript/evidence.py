@@ -945,7 +945,14 @@ def _analysis_facts(
         "measure": a.effect_measure.value,
         "estimator": ESTIMATOR.get(a.effect_measure),
     }
-    rids = tuple(sorted({r for s in a.studies for r in s.record_ids}))
+    # Session 9 review: counts shown with the pooled estimate describe the primary model.
+    # When every reported model uses every listed study (the usual case, and every engine
+    # 1.0.0 output) the facts and their wording are unchanged.
+    pop = a.population()
+    model_specific = model_specific_populations(a)
+    rids = pop.record_ids
+    primary_label = a.primary.label if a.primary is not None else None
+    of_primary = f" of the primary {primary_label} model" if model_specific else ""
     b.add(f"{p}.outcome", a.outcome_name, "outcome name", src, "statistics", **common)
     b.add(
         f"{p}.measure_label",
@@ -957,34 +964,47 @@ def _analysis_facts(
     )
     b.count(
         f"{p}.k",
-        a.k,
-        "number of studies contributing to the analysis",
+        pop.k,
+        f"number of studies contributing to the analysis{of_primary}",
         src,
         "statistics",
         "studies",
         record_ids=rids,
         **common,
     )
-    if a.total_participants is not None:
+    if pop.total_participants is not None:
         b.count(
             f"{p}.participants",
-            a.total_participants,
-            "participants in contributing studies",
+            pop.total_participants,
+            f"participants in contributing studies{of_primary}",
             src,
             "statistics",
             "participants",
             **common,
         )
-    if a.total_events is not None:
+    if pop.total_events is not None:
         b.count(
             f"{p}.events",
-            a.total_events,
-            "events in contributing studies",
+            pop.total_events,
+            f"events in contributing studies{of_primary}",
             src,
             "statistics",
             "events",
             **common,
         )
+    for aux_model, aux in a.auxiliary_populations():  # labelled, never as the primary's
+        key = _model_key(a, aux_model)
+        what = f"auxiliary {aux_model.label} model"
+        aux_rids = aux.record_ids
+        b.count(f"{p}.{key}.k", aux.k, f"number of studies in the {what}", src, "statistics",
+                "studies", record_ids=aux_rids, model=aux_model.model, **common)  # fmt: skip
+        if aux.total_participants is not None:
+            b.count(f"{p}.{key}.participants", aux.total_participants,
+                    f"participants in the {what}", src, "statistics", "participants",
+                    model=aux_model.model, **common)  # fmt: skip
+        if aux.total_events is not None:
+            b.count(f"{p}.{key}.events", aux.total_events, f"events in the {what}", src,
+                    "statistics", "events", model=aux_model.model, **common)  # fmt: skip
     status_text = _status_text(a)
     b.add(
         f"{p}.status",
@@ -1053,7 +1073,7 @@ def _analysis_facts(
                 model=res.model,
                 null_value=null,
                 ci=(res.ci_lower_natural, res.ci_upper_natural),
-                record_ids=rids,
+                record_ids=a.population(res).record_ids,
                 **common,
             )
             if comparative:
@@ -1295,9 +1315,32 @@ def _analysis_facts(
         )
 
 
+def model_specific_populations(a: AnalysisResult) -> bool:
+    """Whether the reported models of ``a`` use different studies or totals (Session 9
+    review), so that every count must name its model."""
+    return bool(a.auxiliary_populations()) or a.population().k != a.k
+
+
+def _model_key(a: AnalysisResult, r: PooledResult) -> str:
+    """Fact-key segment of a non-primary model: ``common_effect``/``random_effects`` or
+    ``sensitivity.<i>`` (as for the estimate facts)."""
+    for name in ("common_effect", "random_effects"):
+        if getattr(a, name) == r:
+            return name
+    return f"sensitivity.{a.sensitivity.index(r) + 1}"
+
+
 def _status_text(a: AnalysisResult) -> str:
     what = f"{a.outcome_name} ({_measure_label(a)})"
     reason = a.status_reason.rstrip(".")
+    if a.status == "pooled" and a.primary is not None and model_specific_populations(a):
+        pop = a.population()
+        n = "study" if pop.k == 1 else "studies"
+        text = f"{what}: {pop.k} {n} contributed to the pooled estimate of the primary "
+        text += f"{a.primary.label} model."
+        for r, aux in a.auxiliary_populations():
+            text += f" The auxiliary {r.label} model used {aux.k} studies."
+        return text
     if a.status == "pooled":
         n = "study" if a.k == 1 else "studies"
         return f"{what}: {a.k} {n} contributed to a pooled estimate."
@@ -1317,6 +1360,20 @@ def _status_text(a: AnalysisResult) -> str:
 
 def _figure_template(a: AnalysisResult) -> str:
     p = f"stats.{a.analysis_id}"
+    if a.status == "pooled" and model_specific_populations(a):
+        aux = "; ".join(
+            f"the {r.label} model used {{{{{p}.{_model_key(a, r)}.k}}}} studies"
+            for r, _ in a.auxiliary_populations()
+        )
+        return (
+            f"Forest plot of {{{{{p}.outcome}}}} ({{{{{p}.measure_label}}}}): the primary "
+            f"{{{{{p}.model}}}} used {{{{{p}.k}}}} studies" + (f"; {aux}" if aux else "") + ". "
+            "Squares show study estimates (size proportional to the primary model's weight) "
+            "with confidence intervals; a row without a square is a study without a "
+            "study-level estimate that contributes only to the model named on that row; the "
+            "diamonds show the pooled estimates. "
+            f"File: plots/{a.analysis_id}.svg (stats artifact)."
+        )
     if a.status == "pooled":
         return (
             f"Forest plot of {{{{{p}.outcome}}}} ({{{{{p}.measure_label}}}}), "
