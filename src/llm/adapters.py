@@ -25,14 +25,25 @@ Provider facts used here (verify when updating):
   parameters are rejected on that version), adaptive thinking ``{"type": "adaptive"}``
   and ``output_config.effort``; usage fields ``input_tokens``, ``output_tokens``,
   ``cache_read_input_tokens``, ``cache_creation_input_tokens``; billing problems are
-  reported as ``billing_error`` (402) or a "credit balance is too low" 400.
+  reported as ``billing_error`` (402) or a "credit balance is too low" 400. Optional
+  explicit prompt caching (Session 8, opt-in per task): a ``cache_control: {"type":
+  "ephemeral"}`` breakpoint on a content block caches the prompt up to that block for 5
+  minutes; 5-minute cache writes cost 1.25x and reads 0.1x of base input (0.05x on Opus 5.5
+  and Sonnet 5.5, 0.025x on Fable 5.1); minimum cacheable length 512-4,096 tokens by model,
+  shorter prompts are processed uncached without error; caching "has no effect on output
+  token generation" — Anthropic prompt-caching and pricing documentation, retrieved
+  2026-10-31.
 * OpenAI: ``POST /v1/responses`` with ``instructions``, ``input``, ``max_output_tokens``,
   ``reasoning.effort`` and ``store: false``; usage fields ``input_tokens`` (with the
   breakdown ``input_tokens_details.cached_tokens`` / ``cache_write_tokens``),
   ``output_tokens`` (with ``output_tokens_details.reasoning_tokens``) and
   ``incomplete_details.reason`` — checked against the official "Create a response" API
   reference on 2026-10-30. Exhausted quota as a 429 with code ``insufficient_quota``
-  follows OpenAI's documented error codes as known up to 2025 (not re-checked). The
+  follows OpenAI's documented error codes as known up to 2025 (not re-checked). Prompt
+  caching is automatic on OpenAI ("enabled by default for supported OpenAI models", minimum
+  1,024 tokens on GPT-5.6 and later; cache writes billed 1.25x for 30-minute lifetimes on
+  GPT-5.6+), so this adapter configures nothing and records the reported cached and
+  cache-write tokens (OpenAI prompt-caching guide, retrieved 2026-10-31). The
   OpenAI path is validated against mocked responses only until a live check is run.
 """
 
@@ -240,11 +251,21 @@ class AnthropicMessagesProvider(_HTTPProvider):
         }
 
     def _body(self, request: LLMRequest) -> dict[str, Any]:
+        content: str | list[dict[str, Any]] = request.full_prompt
+        if self.config.prompt_caching and request.cacheable_prefix:
+            # Explicit breakpoint after the record-invariant prefix (protocol, criteria): the
+            # same bytes are sent, split into two text blocks. Prompts below the model's
+            # minimum cacheable length are processed without caching (no error).
+            content = [
+                {"type": "text", "text": request.cacheable_prefix,
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": request.prompt},
+            ]  # fmt: skip
         body: dict[str, Any] = {
             "model": self.model_id,
             "max_tokens": request.max_output_tokens,
             "system": request.system,
-            "messages": [{"role": "user", "content": request.prompt}],
+            "messages": [{"role": "user", "content": content}],
         }
         if self.capability.thinking == "adaptive":
             body["thinking"] = {"type": "adaptive"}
@@ -318,6 +339,9 @@ class AnthropicMessagesProvider(_HTTPProvider):
             "max_output_tokens": self.config.max_output_tokens,
             "temperature": None,
             "stop_reason": stop,
+            "prompt_caching": "explicit 5-minute breakpoint after the record-invariant prefix"
+            if self.config.prompt_caching
+            else "not requested",
         }
         return LLMResponse(
             text=text, provider=self.name, model_id=served, usage=usage,
@@ -339,7 +363,7 @@ class OpenAIResponsesProvider(_HTTPProvider):
         body: dict[str, Any] = {
             "model": self.model_id,
             "instructions": request.system,
-            "input": request.prompt,
+            "input": request.full_prompt,
             "max_output_tokens": request.max_output_tokens,
             "store": False,
         }
@@ -424,6 +448,7 @@ class OpenAIResponsesProvider(_HTTPProvider):
             "temperature": None,
             "store": False,
             "status": status,
+            "prompt_caching": "provider automatic (not configured by this software)",
         }
         return LLMResponse(
             text=text, provider=self.name, model_id=served, usage=usage,

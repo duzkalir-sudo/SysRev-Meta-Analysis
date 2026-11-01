@@ -182,7 +182,9 @@ class ExtractionReviewEvent(FrozenModel):
 
     event_id: Identifier = Field(default_factory=new_id)
     item_id: Identifier
-    action: Literal["proposed", "accepted", "rejected", "corrected", "arms_built"]
+    action: Literal[
+        "proposed", "accepted", "rejected", "corrected", "arms_built", "arms_invalidated"
+    ]
     actor_type: ActorType
     actor: NonEmptyStr
     reviewer_id: Identifier | None = None

@@ -40,6 +40,7 @@ from tests.manuscript_helpers import (
     complete_manuscript,
     confirm_checklists,
     human,
+    out_of_band,
     single_arm_project,
 )
 from tests.stats_helpers import LAST_FU, MONTHS_24, stats_arm
@@ -382,13 +383,14 @@ def _overlap(repo: Repository, rid: str, a: str, b: str) -> None:
         signals=[OverlapSignal(kind="coauthor_overlap", score=0.8, detail="synthetic")],
     )
     repo.save_overlap_warning("ms1", w)
-    repo.resolve_overlap_warning(
-        "ms1",
-        w.warning_id,
-        resolution=OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
-        reviewer_id=rid,
-        note="overlapping recruitment at one centre",
-    )
+    with out_of_band(repo, "ms1"):
+        repo.resolve_overlap_warning(
+            "ms1",
+            w.warning_id,
+            resolution=OverlapResolution.OVERLAPPING_DIFFERENT_OUTCOMES,
+            reviewer_id=rid,
+            note="overlapping recruitment at one centre",
+        )
 
 
 def _study_count_problems(repo: Repository, n: int) -> list[str]:
@@ -411,15 +413,16 @@ def test_multiple_reports_of_one_study_need_a_documented_link(session: Session) 
     repo, rid, _ = single_arm_project(session)
     reviewer = repo.require_active_reviewer(rid)
     assert _study_count_problems(repo, 5)  # not yet documented
-    link_reports_to_study(
-        repo,
-        "ms1",
-        ["s1", "s2"],
-        study_id="study-a",
-        primary_record_id="s1",
-        reviewer=reviewer,
-        note="s2 is the long-term follow-up of s1",
-    )
+    with out_of_band(repo, "ms1"):
+        link_reports_to_study(
+            repo,
+            "ms1",
+            ["s1", "s2"],
+            study_id="study-a",
+            primary_record_id="s1",
+            reviewer=reviewer,
+            note="s2 is the long-term follow-up of s1",
+        )
     assert _study_count_problems(repo, 5) == []  # exact, reproducible from the links
     assert _study_count_problems(repo, 6) and _study_count_problems(repo, 4)
 

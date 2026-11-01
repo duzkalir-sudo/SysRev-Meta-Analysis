@@ -161,11 +161,15 @@ def test_upload_manifest_extraction_review_and_export(c: TestClient) -> None:
     assert items[0]["verification"]["status"] == "verified"
     correction = km("reported_estimate", "62.1", 1, 1, 3).model_dump(mode="json")
     correction["page"] = 1  # wrong page: the API must refuse an ungrounded correction
+    url = f"/projects/{PID}/extraction/items/{proposed.item_id}/correct"
+    unbound = c.post(url, json={"correction": correction, "note": "x"}, headers=auth(tok))
+    assert unbound.status_code == 422  # the displayed item/PDF state is required
     r = c.post(
-        f"/projects/{PID}/extraction/items/{proposed.item_id}/correct",
-        json={"correction": correction, "note": "x"},
+        url,
+        json={"correction": correction, "note": "x",
+              "expected_state_sha256": items[0]["state_sha256"]},
         headers=auth(tok),
-    )
+    )  # fmt: skip
     assert r.status_code == 409 and "wrong_page" in r.json()["detail"]
     ok = c.post(
         f"/projects/{PID}/extraction/items/{proposed.item_id}/accept", json={}, headers=auth(tok)

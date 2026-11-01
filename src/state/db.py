@@ -645,6 +645,55 @@ class ReportingRecordORM(Base):
     created_at: Mapped[datetime] = mapped_column(default=_now)
 
 
+class ModelCatalogueSnapshotORM(Base):
+    """Session 8: candidate model catalogues (refresh / verification), never edited."""
+
+    __tablename__ = "model_catalogue_snapshots"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    parent_sha256: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[str] = mapped_column(Text)
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("reviewers.id"), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class ModelCatalogueActivationORM(Base):
+    """Session 8: which catalogue snapshot is active (the latest row), and who activated it."""
+
+    __tablename__ = "model_catalogue_activations"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    snapshot_id: Mapped[str] = mapped_column(ForeignKey("model_catalogue_snapshots.id"))
+    sha256: Mapped[str] = mapped_column(String(64))
+    previous_sha256: Mapped[str] = mapped_column(String(64))
+    reviewer_id: Mapped[str] = mapped_column(ForeignKey("reviewers.id"))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    activated_at: Mapped[datetime] = mapped_column(default=_now)
+
+
+class GovernanceRecordORM(Base):
+    """Session 8 project records (append-only; meaning by ``kind``): protocol amendment
+    proposals, decisions and re-reviews, arm invalidations after corrections, and the history
+    of report-to-study links. Earlier tables are not altered (no schema migration needed)."""
+
+    __tablename__ = "governance_records"
+
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(64), unique=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    subject: Mapped[str] = mapped_column(String(128), index=True)
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("reviewers.id"), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(default=_now)
+
+
 APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     ProtocolEventORM,
     SearchRunORM,
@@ -668,6 +717,9 @@ APPEND_ONLY_MODELS: tuple[type[Base], ...] = (
     ManuscriptApprovalORM,
     ClaimReviewORM,
     ReportingRecordORM,
+    ModelCatalogueSnapshotORM,
+    ModelCatalogueActivationORM,
+    GovernanceRecordORM,
 )
 
 

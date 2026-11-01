@@ -35,8 +35,15 @@ diagrams (SVG/PNG/JSON source), the PRISMA 2020 and PRISMA 2020 for Abstracts ch
 with authenticated item-level decisions, human-supervised GRADE certainty assessments with
 Summary of Findings and single-group evidence-summary tables, structured synthesis without
 meta-analysis with SWiM reporting where a reviewer judges it applicable, and a new
-`reporting` scope of the Auditor. **Not implemented yet:** the "Refresh Models" catalogue
-update (issue #9).
+`reporting` scope of the Auditor. Session 8 adds model management ("Refresh Models", issue
+#9: discovery through the providers' official model-list endpoints, versioned catalogue
+snapshots with separately verified capabilities and prices, change previews and
+authenticated activation), the remaining human operations in the UI (corrections of
+extracted values, report-to-study links, double-counting decisions, analysis-plan drafting
+and approval), protocol amendments after Gate 1 with re-review of affected work, update
+searches after screening has begun, and runtime safeguards for issues #3/#4 (parse-once
+cache, opt-in Anthropic prompt caching, catalogue provenance per call, cost status that never
+shows unknown prices as zero). See "Session 8" below for what is and is not supported.
 
 ## Quick start
 
@@ -171,8 +178,11 @@ subscriptions cannot pay for these calls. Costs shown are estimates from list pr
 `src/llm/model_catalogue.json`; the provider invoice is authoritative. The local stop
 threshold is not a hard cap — set a spending limit in the provider console as well.
 
-**Models.** Only models in the capability catalogue can be selected. The Anthropic entries
-come from Anthropic's API reference (cached 2026-10-06). The OpenAI entries
+**Models.** Only verified, executable models in the active capability catalogue can be
+selected (Session 8: page **Model catalogue (Refresh Models)** lists new models and manages
+catalogue snapshots). The Anthropic capability entries come from Anthropic's API reference
+(cached 2026-10-06); their prices were re-checked against the official pricing page on
+2026-10-31, which corrected the Claude Sonnet 5.5 cache-read price to $0.10/MTok. The OpenAI entries
 (`gpt-5.6-sol`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-astra`) were checked against the
 official OpenAI model pages on 2026-10-30, including Standard prices and the >272K-input
 long-context tier. The `gpt-5.6` alias, which routes to `gpt-5.6-sol`, is deliberately not
@@ -268,7 +278,8 @@ raises the NCBI limit from 3 to 10 requests per second. Linux/macOS: the same co
 5. **Run AI steps / Screening** — the unique records are the screening pool. AI screening
    refuses to start while a strategy has no search, import or "not searched" entry, a count
    discrepancy is unacknowledged, or records were added after the last deduplication.
-   Searches and imports are refused once screening has started.
+   Since Session 8, searches and imports after screening has started are *update searches*:
+   they are prepared incrementally against the frozen screening pool (see "Session 8").
 
 ### What is and is not validated
 
@@ -380,4 +391,95 @@ then save exactly what you previewed).
   human review (or blocked while the checklist is incomplete).
 * GRADE judgements are never computed from statistics. The tool enforces the structural
   rules listed in ARCHITECTURE.md §9.9; it cannot judge whether a rationale is correct.
+
+## Session 8: model management, UI operations, protocol amendments, runtime safeguards
+
+New pages (every decision needs the reviewer token and is tied to the screen you saw: if the
+stored state changed after the page was loaded, the decision is refused and nothing is
+saved — press "Reload the current state", review, and decide again):
+
+1. **Model catalogue (Refresh Models)** — *Refresh models* calls only the official
+   `GET /v1/models` endpoints of Anthropic and OpenAI with your keys (no inference, nothing
+   billed as a model call) and stores a *candidate* snapshot. Newly listed models appear as
+   **UNVERIFIED** and cannot run. The table keeps four facts apart: whether the provider
+   listed the model for your key at the last refresh, adapter compatibility, verified
+   capabilities (source and date) and verified prices (separate source and date; otherwise
+   "unavailable"). To make a new model usable, fill in the verification form from the
+   provider's official documentation (efforts, default effort, thinking mode, output limit,
+   documentation URL and date; prices optional with their own URL and date) — effort levels
+   or limits that contradict what the provider's list reported are refused — then preview
+   the candidate snapshot and *Activate* it. Nothing changes until an activation; existing
+   projects keep their stored selections, and a model that becomes retired fails its
+   preflight with the reason (no other model is substituted). Every call records the
+   catalogue hash it was validated against.
+2. **Corrections, links & double counting** — correct an extracted value (pending or already
+   accepted/rejected) with page, location and verbatim quote; the correction must verify
+   against the linked PDF or be attested explicitly when the source cannot be machine-checked.
+   Correcting an accepted value in Stage 4 / Gate 3 invalidates the arm built from it: rebuild
+   the arms of that report (*Full text & extraction*) — Gate 3 requires it. Link reports of
+   one study (or unlink them), with an append-only history, and resolve double counting of a
+   cohort (keep one report, or document non-overlapping participants).
+3. **Analysis plan** — compose analyses (outcome, admissible measure, pre-specified
+   timepoints, model options; advanced settings as JSON), save draft versions and approve the
+   draft displayed. Approval makes earlier statistics stale; it is refused from Stage 6 on.
+4. **Protocol amendments** — after Gate 1 the approved protocol is never edited. Propose an
+   amendment with a rationale; the page shows the changes, the work it affects and what would
+   become pending re-review; verify new MeSH terms and strategies; then approve, reject or
+   withdraw the displayed revision. Approval creates protocol version *n*+1 (version *n* stays
+   stored). Affected work — title/abstract and full-text decisions after eligibility changes,
+   extraction and the analysis plan after outcome changes, new strategies after search
+   changes — must be re-reviewed (confirmed, or revised as a new human decision) before the
+   pipeline can move forward.
+
+**Update searches.** In Stage 2, after screening has begun, a new or amended strategy can be
+executed or imported. *Deduplicate and prepare* then compares only the new records with the
+screened pool: a new record matching one screened record becomes its duplicate (the screened
+record is kept unchanged), new records matching each other are merged, ambiguous matches go to
+a human, and PRISMA counts are re-derived (identification, duplicates removed, records still
+awaiting screening).
+
+**How to review the new workflows** (synthetic data, no keys needed except for Refresh):
+
+1. `pip install -e ".[dev,stats,ui,manuscript]"` and run `pytest tests/unit/test_model_registry.py
+   tests/unit/test_session8_operations.py tests/unit/test_amendments.py
+   tests/unit/test_update_searches.py tests/unit/test_session8_runtime.py
+   tests/unit/test_operations_ui.py` — these drive each workflow, including stale-screen
+   refusals through the Streamlit widgets.
+2. Interactively: enroll a reviewer (`python -m src.api_server.reviewer_cli enroll "Dr …"`),
+   start the UI (`python -m src.ui`), paste the token in the sidebar, then open the four pages
+   above. To see a stale-screen refusal, open the same page in two browser tabs, decide in one,
+   then submit from the other.
+
+**After the independent review of PR #13:** a correction is bound to the PDF shown with it
+(a replaced or re-confirmed PDF makes the screen stale); an outcome amendment requires every
+report with data for that outcome to be re-reviewed (confirm, correct, or withdraw the data for
+the outcome); analysis-plan screens are bound to the protocol version they show; arms of a
+report excluded after an amendment can be withdrawn (tab *Withdraw arms*, Stage 4 / Gate 3); and
+from Stage 6 on, links, double-counting decisions and other statistics inputs can no longer be
+changed, because Stage 5 cannot be re-run then.
+
+**After the follow-up review:** each correction and analysis-plan screen is built from one
+captured state (the displayed PDF or outcome definitions and the hash sent back always describe
+the same thing), title/abstract decisions are also refused from Stage 6 on, and the phase is
+re-read from the database under the write lock before any late-stage mutation.
+
+### What is and is not supported (Session 8)
+
+* **Provider facts were verified against the official documentation on 2026-10-31**
+  (Anthropic models list, authentication, pricing, prompt caching and effort pages; OpenAI
+  models list and prompt-caching guide). All provider traffic in the tests is **mocked**; no
+  live listing or inference call was made, and no measured cost saving is claimed.
+* Amendment phase rules: search changes only in Stage 2; eligibility and outcome changes up
+  to Gate 3; administrative changes up to the audit phase. Later amendments, amendments after
+  completion, update searches after Stage 2, re-running an identical strategy (amend its dates
+  instead) and the PRISMA "updated review" diagram variant are refused explicitly.
+* Corrections of reviewed values are possible in Stage 4 and at Gate 3 only.
+* Provider batch APIs and adaptive model routing are **not implemented** (see ARCHITECTURE.md
+  §9.10 for the assessment). Prompt caching is opt-in per task for Anthropic and automatic on
+  OpenAI; its effect on cost was not measured.
+* Concurrency: the "bound to the displayed state" checks take the SQLite write lock before
+  checking. They are tested on **SQLite only**; on PostgreSQL the same statement locks only
+  the project row and does not serialise every other writer (ARCHITECTURE.md §9.9).
+* Multi-reviewer sign-off is not implemented: the same enrolled reviewer may propose and
+  approve an amendment (both identities are recorded).
 

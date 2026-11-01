@@ -104,11 +104,18 @@ class UIBackend:
         init_db(engine)
         self._factory: sessionmaker[Session] = make_session_factory(engine)
         self.store = DocumentStore(data_dir / "fulltext")
-        self.catalogue = ModelCatalogue.load(data_dir)
+        self.base_catalogue = ModelCatalogue.load(data_dir)  # built-in + local override
         api_url = os.environ.get("SYSREV_API_URL", "").strip()
         self.api = (
             ApiClient.remote(api_url) if api_url else ApiClient.in_process(database_url, data_dir)
         )
+
+    @property
+    def catalogue(self) -> ModelCatalogue:
+        """The active catalogue (latest activated snapshot, else built-in + override), read
+        afresh so an activation in another session applies to the next step."""
+        with self.repo() as repo:
+            return repo.active_catalogue(self.base_catalogue)
 
     @classmethod
     def from_settings(cls) -> UIBackend:

@@ -133,19 +133,25 @@ def build_request(
         "words that show it. When information is missing or unclear, answer 'uncertain'. "
         "Reply with one JSON object and nothing else."
     )
-    prompt = (
+    # Record-invariant part first (identical for every record of a run and stage), so a
+    # provider prompt cache can reuse it when the task opts in. The text sent is unchanged.
+    prefix = (
         f"REVIEW QUESTION: {protocol.research_question}\n"
         f"POPULATION: {protocol.population}\nINTERVENTION: {protocol.intervention}\n"
         f"COMPARATOR: {protocol.comparator or 'none (single-arm review)'}\n"
         f"ELIGIBLE DESIGNS: {', '.join(d.value for d in protocol.study_designs)}\n"
         f"CRITERIA:\n{criteria}\n\n"
-        f"SCREENING STAGE: {stage}\n<<<RECORD {source.record_id}\n{source.context}\nRECORD>>>\n\n"
+        f"SCREENING STAGE: {stage}\n"
+    )
+    prompt = (
+        f"<<<RECORD {source.record_id}\n{source.context}\nRECORD>>>\n\n"
         "JSON fields: verdict (include|exclude|uncertain), unmet_inclusion_criteria (ids), "
         "met_exclusion_criteria (ids), supporting_quotes (verbatim quotes from the record), "
         "information_sufficient (bool), rationale (short)."
     )
     return LLMRequest(
         system=system,
+        cacheable_prefix=prefix,
         prompt=prompt,
         response_schema=LLMScreeningResponse.model_json_schema(),
         temperature=config.temperature,

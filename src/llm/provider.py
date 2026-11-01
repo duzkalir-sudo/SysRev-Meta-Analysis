@@ -87,20 +87,36 @@ class LLMConfig(StrictModel):
         description="exact provider effort value (e.g. 'high'); None = do not send one "
         "and let the provider apply its documented default",
     )
+    prompt_caching: bool = Field(
+        default=False,
+        description="Anthropic only, explicit opt-in: mark the request's record-invariant "
+        "prefix with a 5-minute cache_control breakpoint. Off by default (cache writes cost "
+        "more than ordinary input; savings depend on reuse and are not assumed)",
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class LLMRequest:
+    """One model request. ``cacheable_prefix`` is the record-invariant beginning of the user
+    prompt (e.g. the protocol and criteria); the text sent is ``cacheable_prefix + prompt``
+    whether or not caching is used, and the hash covers exactly that text, so enabling
+    caching never changes what the model reads or the request's identity."""
+
     system: str
     prompt: str
     response_schema: dict[str, Any] = field(default_factory=dict)
     temperature: float | None = 0.0
     max_output_tokens: int = 1024
+    cacheable_prefix: str = ""
+
+    @property
+    def full_prompt(self) -> str:
+        return self.cacheable_prefix + self.prompt
 
     @property
     def sha256(self) -> str:
         payload = json.dumps(
-            {"system": self.system, "prompt": self.prompt, "schema": self.response_schema},
+            {"system": self.system, "prompt": self.full_prompt, "schema": self.response_schema},
             sort_keys=True,
             ensure_ascii=False,
         )

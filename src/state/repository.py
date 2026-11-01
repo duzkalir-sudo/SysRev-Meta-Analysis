@@ -79,6 +79,8 @@ from src.core.security import (
     parse_token,
     verify_secret,
 )
+from src.llm.catalogue import ModelCatalogue
+from src.llm.model_registry import CatalogueSnapshot, ProviderDiscovery
 from src.llm.tasks import ProjectAISettings
 from src.llm.usage import LLMCallRecord
 from src.screening.agreement import screening_status
@@ -99,10 +101,13 @@ from src.state.db import (
     FullTextDocumentORM,
     FullTextItemORM,
     GateDecisionORM,
+    GovernanceRecordORM,
     LLMCallORM,
     LLMCallOutcomeORM,
     ManuscriptApprovalORM,
     ManuscriptVersionORM,
+    ModelCatalogueActivationORM,
+    ModelCatalogueSnapshotORM,
     ProjectAISettingsORM,
     ProjectORM,
     ProtocolEventORM,
@@ -126,6 +131,8 @@ from src.state.db import (
 from src.state.machine import GuardContext, PipelineStateMachine
 from src.stats_engine.engine import run_plan
 from src.stats_engine.inputs import AnalysisInputs
+
+_REVIEW_STAMPS = {"review_status", "reviewed_by", "reviewer_id", "reviewed_at", "review_note"}
 
 
 class NotFoundError(SysRevError, LookupError):
@@ -501,6 +508,9 @@ class Repository:
 
     # ------------------------------------------------------------------ screening
     def save_screening_decision(self, project_id: str, decision: ScreeningDecision) -> None:
+        # Follow-up review, finding 3: full-text eligibility depends on title/abstract
+        # inclusion, so every screening decision is a Stage 5 input.
+        self.require_stats_inputs_open(project_id, f"a {decision.stage.value} screening decision")
         if decision.is_human:
             reviewer = self.require_active_reviewer(decision.reviewer_id)
             if decision.reviewer_identity != reviewer.display_name:
@@ -524,18 +534,51 @@ class Repository:
         self.session.flush()
 
     def load_screening_decisions(self, project_id: str) -> list[ScreeningDecision]:
+        """Stored decisions, followed by any verdict a human revised when re-reviewing a record
+        after a protocol amendment (Session 8). A revision is appended as a later human
+        ADJUDICATOR decision, so it is the effective one; the earlier rows are unchanged."""
         rows = self.session.scalars(
             select(ScreeningDecisionORM).where(ScreeningDecisionORM.project_id == project_id)
         ).all()
-        return [ScreeningDecision.model_validate(r.payload) for r in rows]
+        stored = [ScreeningDecision.model_validate(r.payload) for r in rows]
+        return stored + self._amendment_revisions(project_id)
+
+    def _amendment_revisions(self, project_id: str) -> list[ScreeningDecision]:
+        out = []
+        for res in self.governance_records(project_id, "amendment_resolution"):
+            if res.get("resolution") != "revised" or res.get("verdict") is None:
+                continue
+            out.append(
+                ScreeningDecision(
+                    decision_id=str(res["_record_id"]),
+                    record_id=str(res["subject"]),
+                    reviewer=ReviewerRole.ADJUDICATOR,
+                    reviewer_identity=str(res["resolved_by"]),
+                    reviewer_id=str(res["reviewer_id"]),
+                    is_human=True,
+                    stage=ScreeningStage(str(res["stage"])),
+                    verdict=ScreeningVerdict(str(res["verdict"])),
+                    exclusion_reason=(
+                        str(res["exclusion_reason"]) if res.get("exclusion_reason") else None
+                    ),
+                    rationale=(
+                        f"re-review after protocol amendment {str(res['amendment_id'])[:12]}: "
+                        f"{res['note']}"
+                    ),
+                    decided_at=res["resolved_at"],  # type: ignore[arg-type]
+                )
+            )
+        return out
 
     def save_conflict(self, project_id: str, conflict: ScreeningConflict) -> None:
         """Persist a conflict that matches the stored reviewer decisions.
 
+        Refused from Stage 6 on, like every screening mutation (follow-up review, finding 3).
         A *resolved* conflict is accepted only as a mirror of an existing human
         ADJUDICATOR decision by an active, enrolled reviewer with the same verdict; a
         stored resolution can never be changed or withdrawn.
         """
+        self.require_stats_inputs_open(project_id, "a screening conflict record")
         self._validate_conflict(project_id, conflict)
         self.session.merge(
             ScreeningConflictORM(
@@ -729,6 +772,7 @@ class Repository:
         note: str | None = None,
     ) -> CohortOverlapWarning:
         """Record a human cohort-overlap decision on behalf of an enrolled reviewer."""
+        self.require_stats_inputs_open(project_id, "resolving a cohort-overlap warning")
         reviewer = self.require_active_reviewer(reviewer_id)
         row = self.session.get(CohortOverlapWarningORM, warning_id)
         if row is None or row.project_id != project_id:
@@ -797,6 +841,7 @@ class Repository:
 
     # ------------------------------------------------------------------ extraction
     def save_extracted_arm(self, project_id: str, arm: ExtractedStudyArm) -> None:
+        self.require_stats_inputs_open(project_id, "adding an extracted arm")
         if self.session.get(ExtractedArmORM, arm.arm_id) is not None:
             raise SysRevError(
                 f"arm {arm.arm_id} already exists; corrections create a new arm version"
@@ -837,6 +882,7 @@ class Repository:
         row = self.session.get(ExtractedArmORM, arm_id)
         if row is None:
             raise NotFoundError(f"arm {arm_id} not found")
+        self.require_stats_inputs_open(row.project_id, "approving an extracted arm")
         arm = self._arm_from_row(row)
         approved = arm.model_copy(
             update={
@@ -852,12 +898,75 @@ class Repository:
         self.session.flush()
         return approved
 
-    def load_extracted_arms(self, project_id: str) -> list[ExtractedStudyArm]:
+    def invalidated_arm_ids(self, project_id: str) -> set[str]:
+        """Arms withdrawn after a correction of an accepted value (Session 8). The rows are
+        kept (write-once history); every reader ignores them and a rebuilt arm gets a new id."""
         rows = self.session.scalars(
-            select(ExtractedArmORM)
-            .where(ExtractedArmORM.project_id == project_id)
-            .order_by(ExtractedArmORM.id)
+            select(GovernanceRecordORM.subject).where(
+                GovernanceRecordORM.project_id == project_id,
+                GovernanceRecordORM.kind == "arm_invalidation",
+            )
         ).all()
+        return set(rows)
+
+    def invalidate_arm(
+        self,
+        project_id: str,
+        arm_id: str,
+        *,
+        reviewer_id: str,
+        item_id: str | None,
+        reason: str,
+        kind: str = "correction",
+    ) -> None:
+        """``kind``: ``correction`` (a value was corrected; the arm is rebuilt) or
+        ``withdrawal`` (the report is no longer included; nothing is rebuilt)."""
+        row = self.session.get(ExtractedArmORM, arm_id)
+        if row is None or row.project_id != project_id:
+            raise NotFoundError(f"arm {arm_id} not found")
+        if arm_id in self.invalidated_arm_ids(project_id):
+            return
+        self.require_stats_inputs_open(project_id, "invalidating an extracted arm")
+        self.add_governance_record(
+            project_id, "arm_invalidation", arm_id,
+            {"arm_id": arm_id, "record_id": row.record_id, "outcome_id": row.outcome_id,
+             "item_id": item_id, "reason": reason, "reviewer_id": reviewer_id, "kind": kind},
+            reviewer_id=reviewer_id,
+        )  # fmt: skip
+
+    def withdrawn_arm_records(self, project_id: str) -> set[str]:
+        return {
+            str(r["record_id"])
+            for r in self.governance_records(project_id, "arm_invalidation")
+            if r.get("kind") == "withdrawal"
+        }
+
+    STATS_INPUTS_FROZEN = (
+        Phase.STAGE6_MANUSCRIPT.value,
+        Phase.STAGE6_AUDIT.value,
+        Phase.COMPLETED.value,
+    )
+
+    def require_stats_inputs_open(self, project_id: str, what: str) -> None:
+        """Review of PR #13, finding 5: from Stage 6 on, the verified statistics cannot be
+        recomputed (the state machine has no route back to Stage 5 and ``run_stage5`` refuses),
+        so a change to any Stage 5 input is refused *before anything is written*."""
+        phase = self.locked_phase(project_id)
+        if phase in self.STATS_INPUTS_FROZEN:
+            raise SysRevError(
+                f"{what} would change the inputs of the verified statistics, which cannot be "
+                f"recomputed in {phase} (no route back to Stage 5); nothing was changed"
+            )
+
+    def load_extracted_arms(
+        self, project_id: str, *, include_invalidated: bool = False
+    ) -> list[ExtractedStudyArm]:
+        stmt = select(ExtractedArmORM).where(ExtractedArmORM.project_id == project_id)
+        if not include_invalidated:
+            invalid = self.invalidated_arm_ids(project_id)
+            if invalid:
+                stmt = stmt.where(ExtractedArmORM.id.notin_(invalid))
+        rows = self.session.scalars(stmt.order_by(ExtractedArmORM.id)).all()
         return [self._arm_from_row(r) for r in rows]
 
     def _get_or_add_evidence(self, evidence: SourceEvidence) -> SourceEvidenceORM:
@@ -1089,6 +1198,27 @@ class Repository:
         row.payload = item.model_dump(mode="json")
         self.session.flush()
 
+    def supersede_reviewed_item(self, project_id: str, superseded: ExtractionItem) -> None:
+        """Mark an accepted/rejected item superseded by a correction (Session 8). Only the
+        review status and its stamps change; the earlier payload is kept in the append-only
+        review event written by the caller."""
+        row = self.session.get(ExtractionItemORM, superseded.item_id)
+        if row is None or row.project_id != project_id:
+            raise NotFoundError(f"extraction item {superseded.item_id} not found")
+        if row.review_status not in (ReviewStatus.ACCEPTED.value, ReviewStatus.REJECTED.value):
+            raise SysRevError(f"item {superseded.item_id} is {row.review_status}")
+        if superseded.review_status != ReviewStatus.SUPERSEDED:
+            raise SysRevError("a reviewed item can only become superseded")
+        self.require_active_reviewer(superseded.reviewer_id)
+        before = ExtractionItem.model_validate(row.payload)
+        if superseded.model_dump(exclude=_REVIEW_STAMPS) != before.model_dump(
+            exclude=_REVIEW_STAMPS
+        ):
+            raise SysRevError("superseding may not change the item's content")
+        row.review_status = ReviewStatus.SUPERSEDED.value
+        row.payload = superseded.model_dump(mode="json")
+        self.session.flush()
+
     def get_extraction_item(self, project_id: str, item_id: str) -> ExtractionItem:
         row = self.session.get(ExtractionItemORM, item_id)
         if row is None or row.project_id != project_id:
@@ -1129,6 +1259,7 @@ class Repository:
 
     # report → study mapping and qualitative-only inclusion
     def save_study_link(self, project_id: str, link: StudyReportLink) -> None:
+        self.require_stats_inputs_open(project_id, "linking a report to a study")
         self.require_active_reviewer(link.reviewer_id)
         self.get_record(project_id, link.record_id)
         row = self.session.scalars(
@@ -1140,6 +1271,30 @@ class Repository:
         row.study_id = link.study_id
         row.payload = link.model_dump(mode="json")
         self.session.add(row)
+        self.session.flush()
+
+    def load_study_links(self, project_id: str) -> list[StudyReportLink]:
+        rows = self.session.scalars(
+            select(StudyReportLinkORM)
+            .where(StudyReportLinkORM.project_id == project_id)
+            .order_by(StudyReportLinkORM.record_id)
+        ).all()
+        return [StudyReportLink.model_validate(r.payload) for r in rows]
+
+    def remove_study_link(self, project_id: str, record_id: str, *, reviewer_id: str) -> None:
+        """The report becomes its own study again (Session 8). History is kept by the caller
+        in the append-only governance log."""
+        self.require_stats_inputs_open(project_id, "unlinking a report from its study")
+        self.require_active_reviewer(reviewer_id)
+        row = self.session.scalars(
+            select(StudyReportLinkORM).where(
+                StudyReportLinkORM.project_id == project_id,
+                StudyReportLinkORM.record_id == record_id,
+            )
+        ).first()
+        if row is None:
+            raise NotFoundError(f"report {record_id} is not linked to a study")
+        self.session.delete(row)
         self.session.flush()
 
     def study_ids(self, project_id: str, record_ids: set[str] | None = None) -> dict[str, str]:
@@ -1155,6 +1310,7 @@ class Repository:
         return {rid: links.get(rid, rid) for rid in ids}
 
     def save_unavailability(self, project_id: str, entry: QuantitativeUnavailability) -> None:
+        self.require_stats_inputs_open(project_id, "recording data as unavailable")
         self.require_active_reviewer(entry.reviewer_id)
         self.get_record(project_id, entry.record_id)
         self.session.merge(
@@ -1168,6 +1324,7 @@ class Repository:
     def save_contribution_decision(
         self, project_id: str, decision: CohortContributionDecision
     ) -> None:
+        self.require_stats_inputs_open(project_id, "a double-counting (contribution) decision")
         reviewer = self.require_active_reviewer(decision.reviewer_id)
         if decision.decided_by != reviewer.display_name:
             raise SysRevError("decided_by does not match the enrolled reviewer")
@@ -1355,7 +1512,7 @@ class Repository:
             is not None
         )
 
-    def llm_usage_totals(self, project_id: str) -> dict[str, float | int]:
+    def llm_usage_totals(self, project_id: str) -> dict[str, float | int | str]:
         """Project totals over successful and failed calls (estimates, not invoices)."""
         calls = self.load_llm_calls(project_id)
         ok = [c for c in calls if c.status == "ok"]
@@ -1368,8 +1525,19 @@ class Repository:
             "output_tokens": sum(c.output_tokens or 0 for c in calls),
             "reasoning_tokens": sum(c.reasoning_tokens or 0 for c in calls),
             "cache_read_tokens": sum(c.cache_read_tokens or 0 for c in calls),
+            "cache_write_tokens": sum(c.cache_write_tokens or 0 for c in calls),
             "cost_usd_estimate": round(sum(c.cost_usd_estimate or 0.0 for c in calls), 9),
             "unpriced_successful_calls": sum(c.cost_usd_estimate is None for c in ok),
+            # Session 8: never present an unknown price as zero
+            "cost_status": (
+                "no successful calls"
+                if not ok
+                else "unavailable (no call had a verified list price)"
+                if all(c.cost_usd_estimate is None for c in ok)
+                else "partial (lower bound: some calls had no list price)"
+                if any(c.cost_usd_estimate is None for c in ok)
+                else "complete estimate"
+            ),
         }
 
     def save_ai_verification(self, project_id: str, verification: AIVerification) -> None:
@@ -1398,6 +1566,17 @@ class Repository:
         approved plan must be consistent with the protocol's outcomes."""
         self.get_project(project_id)
         if plan.status == "approved":
+            phase = self.locked_phase(project_id)
+            if phase in (
+                Phase.STAGE6_MANUSCRIPT.value,
+                Phase.STAGE6_AUDIT.value,
+                Phase.COMPLETED.value,
+            ):
+                raise SysRevError(
+                    f"a new analysis plan cannot be approved in {phase}: it would "
+                    "invalidate the statistics output, and the pipeline has no route back to "
+                    "Stage 5 to re-run them (Session 8 safeguard)"
+                )
             reviewer = self.require_active_reviewer(plan.approved_reviewer_id)
             if plan.approved_by != reviewer.display_name:
                 raise SysRevError("approved_by does not match the enrolled reviewer")
@@ -1882,9 +2061,16 @@ class Repository:
         stored against: no other writer can change records, decisions or evidence between
         the check and the commit (SQLite allows one writer; on other databases this locks the
         project row, which serialises reporting decisions)."""
+        self.session.flush()  # pending changes are written (and kept) before the lock
         self.session.execute(
             text("UPDATE projects SET title = title WHERE id = :pid"), {"pid": project_id}
         )
+        # The cached project (kept across commits: expire_on_commit=False) may describe a
+        # state another session has since changed; reload it from inside the locked
+        # transaction on next access (follow-up review, finding 4).
+        cached = self.session.get(ProjectORM, project_id)
+        if cached is not None:
+            self.session.expire(cached)
 
     def _require_reporting_phase(self, project_id: str) -> None:
         phase = self.get_project(project_id).phase
@@ -1994,6 +2180,171 @@ class Repository:
                 for p in self._load_reporting(project_id, "swim_applicability")]  # fmt: skip
 
     # ------------------------------------------------------------------ guards
+    # ------------------------------------------------------------------ Session 8: models
+    def save_catalogue_snapshot(self, snapshot: CatalogueSnapshot) -> None:
+        if snapshot.reviewer_id is not None:
+            reviewer = self.require_active_reviewer(snapshot.reviewer_id)
+            if reviewer.display_name != snapshot.created_by:
+                raise SysRevError("created_by does not match the enrolled reviewer")
+        self.session.add(
+            ModelCatalogueSnapshotORM(
+                id=snapshot.snapshot_id, kind=snapshot.kind, sha256=snapshot.sha256,
+                parent_sha256=snapshot.parent_sha256, created_by=snapshot.created_by,
+                reviewer_id=snapshot.reviewer_id, payload=snapshot.model_dump(mode="json"),
+            )
+        )  # fmt: skip
+        self.session.flush()
+
+    def load_catalogue_snapshots(self) -> list[CatalogueSnapshot]:
+        rows = self.session.scalars(
+            select(ModelCatalogueSnapshotORM).order_by(ModelCatalogueSnapshotORM.seq)
+        ).all()
+        return [self._snapshot(r) for r in rows]
+
+    def get_catalogue_snapshot(self, snapshot_id: str) -> CatalogueSnapshot:
+        row = self.session.scalars(
+            select(ModelCatalogueSnapshotORM).where(ModelCatalogueSnapshotORM.id == snapshot_id)
+        ).first()
+        if row is None:
+            raise NotFoundError(f"catalogue snapshot {snapshot_id} not found")
+        return self._snapshot(row)
+
+    @staticmethod
+    def _snapshot(row: ModelCatalogueSnapshotORM) -> CatalogueSnapshot:
+        snapshot = CatalogueSnapshot.model_validate(row.payload)
+        if snapshot.sha256 != row.sha256:
+            raise SysRevError(f"catalogue snapshot {row.id} fails its integrity hash")
+        return snapshot
+
+    def catalogue_activations(self) -> list[ModelCatalogueActivationORM]:
+        return list(
+            self.session.scalars(
+                select(ModelCatalogueActivationORM).order_by(ModelCatalogueActivationORM.seq)
+            )
+        )
+
+    def active_catalogue(self, base: ModelCatalogue) -> ModelCatalogue:
+        """The latest activated snapshot, or ``base`` (built-in + local override) if none."""
+        latest = self.session.scalars(
+            select(ModelCatalogueActivationORM)
+            .order_by(ModelCatalogueActivationORM.seq.desc())
+            .limit(1)
+        ).first()
+        if latest is None:
+            return base
+        snapshot = self.get_catalogue_snapshot(latest.snapshot_id)
+        if snapshot.sha256 != latest.sha256:
+            raise SysRevError("the active catalogue snapshot does not match its activation")
+        return snapshot.catalogue()
+
+    def latest_discovery(self) -> dict[str, ProviderDiscovery]:
+        """The most recent listing attempt per provider (successful or not)."""
+        out: dict[str, ProviderDiscovery] = {}
+        for snapshot in self.load_catalogue_snapshots():
+            for d in snapshot.discovery:
+                out[d.provider] = d
+        return out
+
+    def activate_catalogue_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        base: ModelCatalogue,
+        expected_sha256: str,
+        expected_active_sha256: str,
+        reviewer_id: str,
+        note: str | None = None,
+    ) -> ModelCatalogueActivationORM:
+        """Activate a previewed snapshot. Refused (nothing saved) if the snapshot is not the
+        one previewed, or if the active catalogue changed since the preview, or if the
+        snapshot was built on another catalogue (it would silently drop those changes)."""
+        reviewer = self.require_active_reviewer(reviewer_id)
+        # Write lock before the checks (SQLite: one writer), as for reporting decisions.
+        self.session.execute(text("UPDATE model_catalogue_activations SET note = note WHERE 1 = 0"))
+        snapshot = self.get_catalogue_snapshot(snapshot_id)
+        active = self.active_catalogue(base)
+        if snapshot.sha256 != expected_sha256:
+            raise SysRevError("the catalogue snapshot has changed since it was previewed")
+        if active.sha256 != expected_active_sha256:
+            raise SysRevError(
+                "the active catalogue has changed since this preview was shown; reload the "
+                "preview before activating"
+            )
+        if snapshot.parent_sha256 != active.sha256:
+            raise SysRevError(
+                "this snapshot was built on a different catalogue than the active one; refresh "
+                "or verify again so that no intervening change is lost"
+            )
+        if snapshot.sha256 == active.sha256:
+            raise SysRevError("nothing to activate: the snapshot equals the active catalogue")
+        row = ModelCatalogueActivationORM(
+            id=uuid.uuid4().hex, snapshot_id=snapshot.snapshot_id, sha256=snapshot.sha256,
+            previous_sha256=active.sha256, reviewer_id=reviewer.id, note=note,
+        )  # fmt: skip
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    # ------------------------------------------------------------------ Session 8: governance
+    def add_governance_record(
+        self,
+        project_id: str,
+        kind: str,
+        subject: str,
+        payload: dict[str, object],
+        *,
+        reviewer_id: str | None,
+        record_id: str | None = None,
+    ) -> str:
+        import json
+
+        if reviewer_id is not None:
+            self.require_active_reviewer(reviewer_id)
+        text_ = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                           default=str)  # fmt: skip
+        rid = record_id or uuid.uuid4().hex
+        self.session.add(GovernanceRecordORM(
+            id=rid, project_id=project_id, kind=kind, subject=subject[:128],
+            reviewer_id=reviewer_id, payload=json.loads(text_),
+            payload_sha256=hashlib.sha256(text_.encode("utf-8")).hexdigest(),
+        ))  # fmt: skip
+        self.session.flush()
+        return rid
+
+    def governance_records(
+        self, project_id: str, kind: str, subject: str | None = None
+    ) -> list[dict[str, object]]:
+        stmt = select(GovernanceRecordORM).where(
+            GovernanceRecordORM.project_id == project_id, GovernanceRecordORM.kind == kind
+        )
+        if subject is not None:
+            stmt = stmt.where(GovernanceRecordORM.subject == subject[:128])
+        rows = self.session.scalars(stmt.order_by(GovernanceRecordORM.seq)).all()
+        return [r.payload | {"_record_id": r.id, "_recorded_at": r.created_at.isoformat()}
+                for r in rows]  # fmt: skip
+
+    def current_phase(self, project_id: str) -> str:
+        """The phase as persisted *now* (a column read from the database, never the cached
+        ``ProjectORM``, which survives commits because sessions use expire_on_commit=False)."""
+        phase = self.session.execute(
+            select(ProjectORM.phase).where(ProjectORM.id == project_id)
+        ).scalar_one_or_none()
+        if phase is None:
+            raise NotFoundError(f"project {project_id} not found")
+        return str(phase)
+
+    def locked_phase(self, project_id: str) -> str:
+        """Take the write lock, then read the persisted phase within the same transaction
+        (follow-up review, finding 4): a transition committed by another session before the
+        lock is seen, and none can commit until this transaction ends (SQLite: one writer)."""
+        self._lock_for_reporting(project_id)
+        return self.current_phase(project_id)
+
+    def lock_project(self, project_id: str) -> None:
+        """Take the database write lock for this transaction before checking that the state a
+        reviewer saw is still current (see ``_lock_for_reporting``; SQLite only)."""
+        self._lock_for_reporting(project_id)
+
     def build_guard_context(self, project_id: str) -> GuardContext:
         """Derive every guard fact from persisted rows. Missing data counts as missing work."""
         project = self.get_project(project_id)
@@ -2053,9 +2404,11 @@ class Repository:
         # ---- Stage 4: full-text eligibility and extraction
         ft = screening_status(retrieved, decisions, conflicts, ScreeningStage.FULL_TEXT)
         ft_included = ft.ids_with(ScreeningVerdict.INCLUDE)
+        invalid_arms = self.invalidated_arm_ids(project_id)
         arm_rows = self.session.execute(
             select(ExtractedArmORM.record_id, ExtractedArmORM.approved_by_human).where(
-                ExtractedArmORM.project_id == project_id
+                ExtractedArmORM.project_id == project_id,
+                ExtractedArmORM.id.notin_(invalid_arms),
             )
         ).all()
         arm_records = {rid for rid, _ in arm_rows}
@@ -2096,6 +2449,7 @@ class Repository:
             .join(ExtractedArmORM)
             .where(
                 ExtractedArmORM.project_id == project_id,
+                ExtractedArmORM.id.notin_(invalid_arms),
                 ExtractedValueORM.evidence_id.is_(None),
             )
         )
@@ -2133,6 +2487,8 @@ class Repository:
                     "removals other than duplicates cannot yet be verified against persisted "
                     "records"
                 )
+
+        from src.search.amendments import amendment_problems
 
         audit = self.latest_audit_report(project_id)
         audit_problems: tuple[str, ...] = ()
@@ -2179,6 +2535,7 @@ class Repository:
             manuscript_present=project.manuscript_version is not None,
             audit_passed=None if audit is None else audit.passed,
             audit_problems=audit_problems,
+            amendment_problems=tuple(amendment_problems(self, project_id)),
         )
 
     def _authenticated_approval(self, protocol: PICOProtocol) -> bool:

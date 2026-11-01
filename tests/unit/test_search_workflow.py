@@ -589,7 +589,8 @@ def test_multi_database_identification_dedup_and_prisma(
     assert again.summary["human_decisions_reapplied"] == 1
     assert again.summary["possible_duplicates_for_review"] == 0
     assert [c.resolution for c in repo.load_duplicate_candidates(PID)] == ["distinct"]
-    # Screening starts: no more searches or imports.
+    # Screening starts. Session 8: a later import is an *update search*, prepared
+    # incrementally — the screened pool is never re-deduplicated (test_update_searches.py).
     repo.save_screening_decision(
         PID,
         ScreeningDecision(
@@ -601,17 +602,20 @@ def test_multi_database_identification_dedup_and_prisma(
             rationale="synthetic",
         ),
     )
-    with pytest.raises(SearchError, match="screening has started"):
-        service.import_file(
-            sha["embase"],
-            b"TY  - JOUR\nTI  - Late\nER  - \n",
-            filename="late.ris",
-            fmt="ris",
-            searched_on=day,
-            reviewer=human,
-        )
+    late = service.import_file(
+        sha["embase"],
+        b"TY  - JOUR\nTI  - Late\nER  - \n",
+        filename="late.ris",
+        fmt="ris",
+        searched_on=day,
+        reviewer=human,
+    )
+    assert late.records_saved == 1
+    assert any("not been prepared" in p for p in repo.search_identification_problems(PID))
+    update = service.prepare_for_screening(reviewer=human)
+    assert update.summary["update_search"] and update.summary["new_unique_records_to_screen"] == 1
     counts = derive_prisma(repo, PID)
-    assert counts.records_awaiting_screening == 7 and counts.records_screened == 0
+    assert counts.records_awaiting_screening == 8 and counts.records_screened == 0
     # The search log is append-only.
     row = session.query(SearchRunORM).first()
     assert row is not None

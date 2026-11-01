@@ -15,7 +15,7 @@ import hashlib
 import io
 import json
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any, Literal
 
 from src.core.enums import (
@@ -25,7 +25,9 @@ from src.core.enums import (
     EffectMeasure,
     EstimateType,
     EvidenceCheckStatus,
+    Phase,
     ReviewStatus,
+    ScreeningStage,
 )
 from src.core.exceptions import SysRevError
 from src.core.schemas.base import utc_now
@@ -46,11 +48,78 @@ from src.pdf_extractor.models import ParsedDocument
 from src.state.db import ExtractedArmORM, ReviewerORM
 from src.state.repository import Repository
 
-EventAction = Literal["proposed", "accepted", "rejected", "corrected", "arms_built"]
+EventAction = Literal[
+    "proposed", "accepted", "rejected", "corrected", "arms_built", "arms_invalidated"
+]
+# Corrections of already reviewed values are possible while Gate 3 can still enforce that arms
+# are rebuilt and re-approved; later phases have no route back to Stage 4.
+REVISION_PHASES = frozenset({Phase.STAGE4_EXTRACTION_ROB, Phase.GATE3_EXTRACTION_APPROVAL})
 
 
 class ReviewError(SysRevError, ValueError):
     """A review action is not allowed in the item's current state."""
+
+
+class StaleStateError(ReviewError):
+    """The reviewer decided on a screen whose state has changed since it was displayed."""
+
+
+def state_sha256(data: Any) -> str:
+    """Hash of a displayed state (canonical JSON) that a decision is bound to."""
+    text = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      default=str)  # fmt: skip
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def item_state_sha256(item: ExtractionItem) -> str:
+    """Hash of the item alone (its content and review status)."""
+    return state_sha256(item.model_dump(mode="json"))
+
+
+def source_state(repo: Repository, project_id: str, record_id: str) -> dict[str, Any]:
+    """The evidence source a correction screen shows: the report's linked PDF (content hash,
+    stored filename) and the state of its identity check and human confirmation."""
+    ft = repo.get_fulltext_item(project_id, record_id)
+    if ft is None:
+        return {"record_id": record_id, "linked_pdf": None}
+    return {
+        "record_id": record_id,
+        "pdf_filename": ft.pdf_filename,
+        "pdf_sha256": ft.pdf_sha256,
+        "match_status": ft.match_status.value if ft.match_status else None,
+        "match_notes": list(ft.match_notes),
+        "confirmed_by_reviewer_id": ft.confirmed_by_reviewer_id,
+        "match_unconfirmed": ft.match_unconfirmed,
+    }
+
+
+def correction_state_sha256(
+    repo: Repository,
+    project_id: str,
+    item: ExtractionItem,
+    source: dict[str, Any] | None = None,
+) -> str:
+    """What a correction decision is bound to (review of PR #13, finding 1): the item *and*
+    the linked PDF and identity confirmation displayed with it. A replaced PDF, a changed
+    identity check or a changed confirmation therefore makes an older screen stale.
+
+    A screen must pass the ``source`` it displays (follow-up review, finding 1): the hash is
+    then computed from exactly that captured state, never from a second read that another
+    session could have changed in between. Without ``source`` the current state is read."""
+    shown = source if source is not None else source_state(repo, project_id, item.record_id)
+    if shown.get("record_id") != item.record_id:
+        raise ValueError("the source shown belongs to another report")
+    return state_sha256({"item": item.model_dump(mode="json"), "source": shown})
+
+
+def check_expected(actual: str, expected: str | None, what: str) -> None:
+    """Refuse (nothing saved) when the state shown to the reviewer is no longer current.
+    ``expected=None`` means the caller sent no displayed state (legacy API use)."""
+    if expected is not None and expected != actual:
+        raise StaleStateError(
+            f"{what} has changed since it was displayed; nothing was saved — reload, review "
+            "the current state, then decide"
+        )
 
 
 def _require_linked_document(repo: Repository, project_id: str, record_id: str,
@@ -179,6 +248,7 @@ def correct_item(
     reviewer: ReviewerORM,
     note: str,
     attest_unverifiable: bool = False,
+    expected_state_sha256: str | None = None,
 ) -> ExtractionItem:
     """Supersede a pending item with a human-entered, re-verified version.
 
@@ -189,13 +259,45 @@ def correct_item(
     reviewer = repo.require_active_reviewer(reviewer.id)
     if not note.strip():
         raise ReviewError("a correction needs a note")
+    repo.lock_project(project_id)
+    check_expected(
+        correction_state_sha256(repo, project_id, repo.get_extraction_item(project_id, item_id)),
+        expected_state_sha256,
+        f"item {item_id} or its linked PDF",
+    )
     old = _pending(repo, project_id, item_id)
     _require_linked_document(repo, project_id, old.record_id, doc)
+    new = _grounded_correction(old, correction, doc, reviewer, attest_unverifiable)
+    superseded = _stamped(old, ReviewStatus.SUPERSEDED, reviewer, note)
+    repo.save_extraction_item(project_id, superseded)
+    accepted = _stamped(new, ReviewStatus.ACCEPTED, reviewer, note)
+    repo.save_extraction_item(project_id, accepted)
+    _event(repo, project_id, superseded, "corrected", reviewer, note, old)
+    _event(repo, project_id, accepted, "accepted", reviewer, note, None)
+    return accepted
+
+
+def _grounded_correction(
+    old: ExtractionItem,
+    correction: ProposedValue,
+    doc: ParsedDocument,
+    reviewer: ReviewerORM,
+    attest_unverifiable: bool,
+) -> ExtractionItem:
+    """The corrected item, grounded in ``doc`` (or explicitly attested when the source cannot
+    be machine-checked, keeping the failed check on record)."""
     new = proposal_to_item(
         correction, doc, record_id=old.record_id, proposed_by=ActorType.HUMAN,
         proposer_identity=reviewer.display_name, item_version=old.version + 1,
         supersedes=old.item_id,
     )  # fmt: skip
+    if new.data_status.value != correction.data_status:
+        # Grounding downgraded the reviewer's entry (e.g. the number is not in the quote):
+        # refuse instead of silently storing something other than what was submitted.
+        raise ReviewError(
+            f"the correction was entered as {correction.data_status!r} but cannot be stored as "
+            f"such ({'; '.join(new.flags) or new.data_status.value}); fix the entry"
+        )
     check = new.verification
     if new.data_status == DataStatus.REPORTED and not (check and check.acceptable):
         if not attest_unverifiable:
@@ -216,13 +318,103 @@ def correct_item(
                 "flags": [*new.flags, "human-attested value (not machine-verifiable)"],
             }
         )
+    return new
+
+
+def _arm_id_chain(key: tuple[str, ...]) -> Iterator[str]:
+    """Arm ids for one arm key: the original id, then one per rebuild after invalidation."""
+    yield _arm_id(key)
+    n = 1
+    while True:
+        yield _arm_id((*key, f"rebuild-{n}"))
+        n += 1
+
+
+def current_arm_id(repo: Repository, project_id: str, key: tuple[str, ...]) -> str | None:
+    """The valid (not invalidated) arm built for ``key``, if any."""
+    invalid = repo.invalidated_arm_ids(project_id)
+    for arm_id in _arm_id_chain(key):
+        if repo.session.get(ExtractedArmORM, arm_id) is None:
+            return None
+        if arm_id not in invalid:
+            return arm_id
+    return None  # pragma: no cover - the chain is unbounded but rows are finite
+
+
+def _next_arm_id(repo: Repository, project_id: str, key: tuple[str, ...]) -> str | None:
+    """A fresh id for building ``key`` (None: a valid arm already exists)."""
+    invalid = repo.invalidated_arm_ids(project_id)
+    for arm_id in _arm_id_chain(key):
+        if repo.session.get(ExtractedArmORM, arm_id) is None:
+            return arm_id
+        if arm_id not in invalid:
+            return None
+    return None  # pragma: no cover
+
+
+def revise_reviewed_item(
+    repo: Repository,
+    project_id: str,
+    item_id: str,
+    correction: ProposedValue,
+    doc: ParsedDocument,
+    *,
+    reviewer: ReviewerORM,
+    note: str,
+    expected_state_sha256: str,
+    attest_unverifiable: bool = False,
+) -> tuple[ExtractionItem, list[str]]:
+    """Correct an item that was already accepted or rejected (Session 8).
+
+    The reviewed item is superseded (its earlier content stays in the append-only review
+    history), the correction is grounded in the linked PDF (or attested) and accepted by the
+    correcting reviewer, and any arm built from the old value is **invalidated**: Gate 3 then
+    requires the arms of that report to be rebuilt and approved, and statistics, GRADE and
+    syntheses computed from the old arm become stale through their input hashes. Returns the
+    new item and the invalidated arm ids. Allowed in Stage 4 and Gate 3 only.
+    """
+    reviewer = repo.require_active_reviewer(reviewer.id)
+    if not note.strip():
+        raise ReviewError("a correction needs a note")
+    repo.lock_project(project_id)
+    phase = Phase(repo.current_phase(project_id))
+    if phase not in REVISION_PHASES:
+        raise ReviewError(
+            f"reviewed values can be corrected in Stage 4 or at Gate 3 (project is in {phase}); "
+            "later phases have no route back to rebuild and re-approve the arms"
+        )
+    old = repo.get_extraction_item(project_id, item_id)
+    check_expected(
+        correction_state_sha256(repo, project_id, old),
+        expected_state_sha256,
+        f"item {item_id} or its linked PDF",
+    )
+    if old.review_status == ReviewStatus.PENDING:
+        raise ReviewError(f"item {item_id} is pending: use the ordinary correction")
+    if old.review_status not in (ReviewStatus.ACCEPTED, ReviewStatus.REJECTED):
+        raise ReviewError(f"item {item_id} is {old.review_status}; correct its current version")
+    _require_linked_document(repo, project_id, old.record_id, doc)
+    new = _grounded_correction(old, correction, doc, reviewer, attest_unverifiable)
+    invalidated: list[str] = []
+    if old.review_status == ReviewStatus.ACCEPTED and old.domain in ARM_DOMAINS:
+        arm_id = current_arm_id(repo, project_id, old.arm_key)
+        if arm_id is not None:
+            repo.invalidate_arm(
+                project_id, arm_id, reviewer_id=reviewer.id, item_id=old.item_id,
+                reason=f"value corrected after acceptance: {note}",
+            )  # fmt: skip
+            invalidated.append(arm_id)
     superseded = _stamped(old, ReviewStatus.SUPERSEDED, reviewer, note)
-    repo.save_extraction_item(project_id, superseded)
+    repo.supersede_reviewed_item(project_id, superseded)
     accepted = _stamped(new, ReviewStatus.ACCEPTED, reviewer, note)
     repo.save_extraction_item(project_id, accepted)
     _event(repo, project_id, superseded, "corrected", reviewer, note, old)
     _event(repo, project_id, accepted, "accepted", reviewer, note, None)
-    return accepted
+    if invalidated:
+        _event(repo, project_id, superseded, "arms_invalidated", reviewer,
+               f"arm(s) {', '.join(invalidated)} invalidated; rebuild the arms of "
+               f"{old.record_id}", None)  # fmt: skip
+    return accepted, invalidated
 
 
 def reverify_items(
@@ -259,6 +451,13 @@ def build_arms(
 ) -> list[ExtractedStudyArm]:
     """Assemble accepted, verified arm-level items into approved ExtractedStudyArms."""
     reviewer = repo.require_active_reviewer(reviewer.id)
+    if record_id in repo.withdrawn_arm_records(project_id) and record_id not in (
+        repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT)
+    ):
+        raise ReviewError(
+            f"the arms of {record_id} were withdrawn because the report is not included at "
+            "full text; they are rebuilt only if it is included again"
+        )
     items = [
         i
         for i in repo.load_extraction_items(project_id)
@@ -279,9 +478,10 @@ def build_arms(
         groups[item.arm_key].append(item)
     built: list[ExtractedStudyArm] = []
     for key, group in sorted(groups.items()):
-        arm_id = _arm_id(key)
-        if repo.session.get(ExtractedArmORM, arm_id) is not None:
+        next_id = _next_arm_id(repo, project_id, key)
+        if next_id is None:  # a valid arm was already built from these items
             continue
+        arm_id = next_id
         fields: dict[str, Any] = {}
         for item in group:
             if item.field_name in fields:
@@ -357,6 +557,64 @@ def analysis_compatibility(arm: ExtractedStudyArm, outcome: OutcomeDefinition) -
 # --------------------------------------------------------------------------- studies, export
 
 
+def arms_state_sha256(repo: Repository, project_id: str, record_id: str) -> str:
+    """The active arms of one report and its full-text inclusion, as displayed."""
+    return state_sha256(
+        {
+            "arms": sorted(
+                a.arm_id for a in repo.load_extracted_arms(project_id) if a.record_id == record_id
+            ),
+            "included": record_id in repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT),
+        }
+    )
+
+
+def withdraw_arms(
+    repo: Repository,
+    project_id: str,
+    record_id: str,
+    *,
+    reviewer: ReviewerORM,
+    reason: str,
+    expected_state_sha256: str,
+) -> list[str]:
+    """Retire the active arms of a report that is **no longer included** at full text (e.g.
+    excluded on re-review after an eligibility amendment). Review of PR #13, finding 4.
+
+    The arms and their evidence stay stored; an append-only ``arm_invalidation`` record of kind
+    ``withdrawal`` names the reviewer and reason, and every reader ignores the arms from then
+    on. Data of an included report are never withdrawn here (correct them, or record them as
+    unavailable for an outcome). Allowed in Stage 4 and at Gate 3, where Gate 3 re-checks the
+    extraction state; refused (nothing written) if the displayed state changed.
+    """
+    reviewer = repo.require_active_reviewer(reviewer.id)
+    if not reason.strip():
+        raise ReviewError("a withdrawal needs a reason")
+    repo.lock_project(project_id)
+    phase = Phase(repo.current_phase(project_id))
+    if phase not in REVISION_PHASES:
+        raise ReviewError(
+            f"arms are withdrawn in Stage 4 or at Gate 3 (project is in {phase}); later phases "
+            "have no route back to re-check the extraction"
+        )
+    check_expected(arms_state_sha256(repo, project_id, record_id), expected_state_sha256,
+                   f"the arms or inclusion of {record_id}")  # fmt: skip
+    if record_id in repo.included_record_ids(project_id, ScreeningStage.FULL_TEXT):
+        raise ReviewError(
+            f"{record_id} is included at full text: its data are corrected, or recorded as "
+            "unavailable for an outcome, not withdrawn"
+        )
+    arms = [a.arm_id for a in repo.load_extracted_arms(project_id) if a.record_id == record_id]
+    if not arms:
+        raise ReviewError(f"{record_id} has no active arms")
+    for arm_id in arms:
+        repo.invalidate_arm(
+            project_id, arm_id, reviewer_id=reviewer.id, item_id=None,
+            reason=f"withdrawn: report not included at full text — {reason}", kind="withdrawal",
+        )  # fmt: skip
+    return arms
+
+
 def link_reports_to_study(
     repo: Repository,
     project_id: str,
@@ -366,11 +624,17 @@ def link_reports_to_study(
     primary_record_id: str,
     reviewer: ReviewerORM,
     note: str,
+    expected_state_sha256: str | None = None,
 ) -> list[StudyReportLink]:
-    """Declare that several reports describe one study/cohort (human decision)."""
+    """Declare that several reports describe one study/cohort (human decision). A report
+    already linked elsewhere is re-linked; every change is kept in the link history."""
     reviewer = repo.require_active_reviewer(reviewer.id)
     if primary_record_id not in record_ids:
         raise ValueError("the primary report must be one of the linked reports")
+    repo.lock_project(project_id)
+    check_expected(links_state_sha256(repo, project_id), expected_state_sha256,
+                   "the report-to-study links")  # fmt: skip
+    before = repo.study_ids(project_id, set(record_ids))
     links = [
         StudyReportLink(
             record_id=rid, study_id=study_id, is_primary_report=rid == primary_record_id,
@@ -380,7 +644,54 @@ def link_reports_to_study(
     ]  # fmt: skip
     for link in links:
         repo.save_study_link(project_id, link)
+        _link_history(repo, project_id, link.record_id, before[link.record_id], study_id,
+                      reviewer, note)  # fmt: skip
     return links
+
+
+def links_state_sha256(repo: Repository, project_id: str) -> str:
+    return state_sha256(
+        [(x.record_id, x.study_id, x.is_primary_report) for x in repo.load_study_links(project_id)]
+    )
+
+
+def _link_history(repo: Repository, project_id: str, record_id: str, before: str, after: str,
+                  reviewer: ReviewerORM, note: str) -> None:  # fmt: skip
+    action = "unlinked" if after == record_id else "linked" if before == record_id else "relinked"
+    repo.add_governance_record(
+        project_id, "study_link", record_id,
+        {"action": action, "record_id": record_id, "study_before": before,
+         "study_after": after, "reviewer": reviewer.display_name, "note": note},
+        reviewer_id=reviewer.id,
+    )  # fmt: skip
+
+
+def unlink_reports(
+    repo: Repository,
+    project_id: str,
+    record_ids: Sequence[str],
+    *,
+    reviewer: ReviewerORM,
+    note: str,
+    expected_state_sha256: str,
+) -> None:
+    """Undo a report-to-study link (the report becomes its own study again). The history
+    keeps the earlier link; statistics, PRISMA study counts and syntheses that used it become
+    stale through their input hashes."""
+    reviewer = repo.require_active_reviewer(reviewer.id)
+    if not note.strip():
+        raise ReviewError("unlinking needs a note")
+    repo.lock_project(project_id)
+    check_expected(links_state_sha256(repo, project_id), expected_state_sha256,
+                   "the report-to-study links")  # fmt: skip
+    before = repo.study_ids(project_id, set(record_ids))
+    for rid in record_ids:
+        repo.remove_study_link(project_id, rid, reviewer_id=reviewer.id)
+        _link_history(repo, project_id, rid, before[rid], rid, reviewer, note)
+
+
+def double_counting_state_sha256(repo: Repository, project_id: str) -> str:
+    return state_sha256(repo.double_counting_conflicts(project_id))
 
 
 def record_unavailability(
@@ -423,6 +734,7 @@ def resolve_double_counting(
     keep_record_id: str | None = None,
     drop_record_ids: Sequence[str] = (),
     non_overlapping_record_ids: Sequence[str] = (),
+    expected_state_sha256: str | None = None,
 ) -> None:
     """Document how one cohort contributes to ``outcome_id`` (exactly one mode):
 
@@ -435,6 +747,9 @@ def resolve_double_counting(
     reviewer = repo.require_active_reviewer(reviewer.id)
     if not justification.strip():
         raise ReviewError("a justification is required")
+    repo.lock_project(project_id)
+    check_expected(double_counting_state_sha256(repo, project_id), expected_state_sha256,
+                   "the double-counting conflicts")  # fmt: skip
     if bool(keep_record_id) == bool(non_overlapping_record_ids):
         raise ReviewError("choose either keep_record_id or non_overlapping_record_ids")
     if keep_record_id:

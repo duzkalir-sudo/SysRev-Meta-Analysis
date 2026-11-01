@@ -28,10 +28,13 @@ src/
   apis/            Async, rate-limited clients: PubMed, Europe PMC, OpenAlex, Unpaywall, Crossref
   screening/       Deduplication, Cohen's kappa + conflicts, PRISMA tracker, cohort-overlap detector,
                    dual automated (LLM) screening + human adjudication, reviewer-reporting facts
-  llm/             Provider-agnostic LLM interface, config and registry (no provider built in)
+  llm/             Provider-agnostic LLM interface, config and registry (no provider built in);
+                   Session 8: discovery.py (official model-list endpoints), model_registry.py
+                   (catalogue snapshots, verification, preview)
   fulltext/        Stage 3: OA retrieval (Europe PMC XML, Unpaywall PDF), safe download,
                    content-addressed storage, uploads + identity matching, Gate 2 manifest
-  pdf_extractor/   pdfplumber/pypdf parsing (pages, blocks, tables, labels) + evidence grounding
+  pdf_extractor/   pdfplumber/pypdf parsing (pages, blocks, tables, labels) + evidence grounding;
+                   cache.py (Session 8: parse-once cache keyed by content hash and parser)
   extraction/      Stage 4: proposals → verification → Master Extraction Table; RoB drafts
   stats_engine/    Stage 5 deterministic statistics (§9.5), validated against R metafor
 validation/        R reference script, metafor comparison, VALIDATION_REPORT.md
@@ -41,8 +44,10 @@ validation/        R reference script, metafor comparison, VALIDATION_REPORT.md
                    Findings, synthesis without meta-analysis, SWiM, reporting audit checks
   api_server/      FastAPI app: project state, guards, gate decisions, Stage 2-4 review routes
   search/          Session 5: database registry, protocol editor, search execution, RIS/BibTeX/CSV
-                   import, preparation for screening, PRISMA derivation, PRISMA-S report
-  ui/              Local Streamlit reviewer UI (Session 4; protocol & search pages in Session 5)
+                   import, preparation for screening, PRISMA derivation, PRISMA-S report;
+                   Session 8: amendments.py (protocol amendments), update-search preparation
+  ui/              Local Streamlit reviewer UI (Session 4; protocol & search pages in Session 5;
+                   Session 8: operations_pages.py + frozen.py)
 tests/
   unit/            Schemas, identifiers, state machine, persistence, clients, screening, API
   integration/     End-to-end Stage 1→6 flow; opt-in live API smoke tests (`-m live`)
@@ -131,6 +136,7 @@ even if no `ScreeningConflict` row was ever saved.
 | Stage 6 → Audit | Manuscript draft exists |
 | Audit → COMPLETED | **Session 6:** the latest `AuditReport` was made by the current Auditor (Session 7: 1.3.0, with the `reporting` scope, §9.9), is complete and passed, examined the *current* manuscript version (content SHA-256) and the *current* evidence fingerprint (recomputed); every `REQUIRES_HUMAN_REVIEW` finding is acknowledged by an active enrolled reviewer for that exact content/evidence; and an authenticated human signed off that version and audit (§9.8) |
 | Audit → Stage 6 | Always allowed (returning to drafting certifies nothing) |
+| **Every forward transition** (Session 8) | No protocol amendment awaiting a decision and no work pending re-review after an approved amendment (`amendment_problems`, §9.10). Gate rejections and Audit → Stage 6 are not affected |
 
 **PRISMA cross-check.** The stored `PRISMACounts` snapshot must agree with the database:
 total identified = stored records; duplicates removed = records with `duplicate_of`;
@@ -324,6 +330,14 @@ SQLAlchemy 2.0 typed ORM on SQLite (any SQLAlchemy URL works).
   rejects stale transitions whose `from_phase` no longer matches the stored phase.
 * SQLite foreign keys are switched on (`PRAGMA foreign_keys=ON`); datetimes round-trip as
   UTC-aware values.
+* Session 8 adds three append-only tables and alters none (no migration is needed; `init_db`
+  creates missing tables): `model_catalogue_snapshots` and `model_catalogue_activations`
+  (installation-wide) and `governance_records` (per project; `kind` = `amendment_proposal`,
+  `amendment_decision`, `amendment_resolution`, `arm_invalidation`, `study_link`). Arms
+  invalidated after a correction stay stored and are filtered out by every reader
+  (`load_extracted_arms`, the guard context). `study_report_links` rows remain the current
+  mapping (a re-link updates the row, unlinking deletes it); their history is the
+  `study_link` governance log.
 
 ---
 
@@ -715,9 +729,11 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
 | PRISMA 2020 flow diagram, PRISMA 2020 / abstract / SWiM checklists, GRADE and Summary of Findings, synthesis without meta-analysis (Session 7) | Implemented and tested with synthetic projects only (§9.9). Only the *new review, databases and registers* diagram variant is supported; other variants are refused with their unsupported fields |
 | Auditor (Session 6) | Implemented: deterministic, completeness-aware checks (§9.8), human acknowledgement and sign-off, advisory model claim review. Prose checks are rule-based and incomplete (limitations in §9.8 and in every report); reference verification tested with in-memory PubMed/Crossref fakes only — **no live lookup was made** |
-| Protocol editor, database selection, search execution (PubMed/Europe PMC/OpenAlex), RIS/BibTeX/CSV import, preparation for screening, search log, PRISMA derivation, PRISMA-S report (Session 5) | Implemented and tested with **mocked HTTP and synthetic export files only**; no live database call; parsers not tested on real vendor exports. Subscription-database APIs and a ClinicalTrials.gov API search are not implemented (manual import). Protocol amendments after Gate 1 and update (top-up) searches after screening has started are not supported |
-| Model discovery / "Refresh Models" (issue #9) | Not implemented (deferred from Session 5): needs official model-list calls for both providers, versioned catalogue snapshots with sources, unverified-model flags that block execution, a reviewed manual override, and the mocked acceptance scenarios listed in the issue |
-| Local UI (Streamlit, Session 4) | First usable version: projects, phase/blockers, authenticated advance and gate decisions, per-task model settings, keys, AI steps, screening queue and adjudication, PDF upload/identity, extraction accept/reject/arms, RoB approval, statistics and forest plots, usage/costs. Tested headlessly (Streamlit AppTest) on Linux; **not yet run on a Windows machine**. Session 5 adds protocol editing/approval, searches, imports, deduplication decisions and PRISMA recomputation. Not in the UI: item corrections, study linking, double counting, analysis-plan editing (use the API/Python) |
+| Protocol editor, database selection, search execution (PubMed/Europe PMC/OpenAlex), RIS/BibTeX/CSV import, preparation for screening, search log, PRISMA derivation, PRISMA-S report (Session 5) | Implemented and tested with **mocked HTTP and synthetic export files only**; no live database call; parsers not tested on real vendor exports. Subscription-database APIs and a ClinicalTrials.gov API search are not implemented (manual import). Session 8 adds amendments after Gate 1 and update searches in Stage 2 (§9.10) |
+| Model discovery / "Refresh Models" (issue #9, Session 8) | Implemented and tested with **mocked** list endpoints (§9.10): official `GET /v1/models` for both providers, candidate snapshots, separately verified capabilities and prices, preview, authenticated activation bound to the previewed hashes, lifecycle (deprecated/retired) handling without substitution. No live listing was made |
+| UI operations (Session 8): corrections with evidence (pending and reviewed values, arm invalidation), report-to-study links and unlinking with history, double-counting decisions, analysis-plan drafts/revisions/approval | Implemented and tested (API + Streamlit AppTest), bound to the displayed state; SQLite only for the locking guarantee |
+| Protocol amendments after Gate 1 and update searches after screening has begun (Session 8) | Implemented and tested with synthetic projects (§9.10). Phase limits and unsupported cases are refused explicitly |
+| Local UI (Streamlit, Session 4) | First usable version: projects, phase/blockers, authenticated advance and gate decisions, per-task model settings, keys, AI steps, screening queue and adjudication, PDF upload/identity, extraction accept/reject/arms, RoB approval, statistics and forest plots, usage/costs. Tested headlessly (Streamlit AppTest) on Linux; **not yet run on a Windows machine**. Session 5 adds protocol editing/approval, searches, imports, deduplication decisions and PRISMA recomputation. Session 8 adds the model catalogue, corrections, study links, double counting, analysis plans and protocol amendments |
 
 ### 9.6 Real AI providers and the local UI (`src/llm`, `src/workflows`, `src/ui`) — Session 4
 
@@ -734,7 +750,9 @@ ID) or, on OpenAI, a different echoed effort discards the result.
 output limit and list prices with their source. A configuration is validated against it
 *before* any request; unknown models, unlisted efforts, a temperature or an excessive
 output limit raise `UnsupportedConfigurationError`. Effort values are provider-specific
-strings and are not mapped across providers.
+strings and are not mapped across providers. Since Session 8 the validated catalogue is the
+latest *activated snapshot* (else the built-in file plus the override), and `validate()`
+also refuses unverified entries, retired models and adapter-incompatible entries (§9.10).
 
 **Errors.** `ProviderAccessError` (401/403/404), `InsufficientFundsError` (Anthropic
 `billing_error`/"credit balance", OpenAI `insufficient_quota`) and
@@ -770,8 +788,9 @@ draft); a reply that failed JSON/schema validation or grounding is billed and lo
 never blocks an ordinary retry; the two screening passes never share a cache key; a
 local stop threshold refuses to *start* calls once recorded estimated spend or tokens
 reach it. This is not a hard spending cap (estimates can differ from invoices; a call in
-flight completes); a cost threshold with an unpriced model is refused. No batching,
-adaptive routing or response caching is implemented.
+flight completes); a cost threshold with an unpriced model is refused. Session 8 adds a
+parse-once cache, opt-in Anthropic prompt caching and per-call catalogue provenance; batch
+processing and adaptive routing remain unimplemented (assessment in §9.10).
 
 **Advisory verification** (`src/extraction/ai_verification.py`): a separately configured
 model judges whether the quote/page supports a pending AI-proposed value as recorded.
@@ -807,7 +826,7 @@ descriptor or an unchanged strategy hash; changes are grouped as *eligibility*,
 invalidated items. Editing an approved protocol creates version *n*+1 as a draft (voiding
 the approval); approval (`POST /protocol/approve`) requires an enrolled reviewer and no
 `approval_blockers()`, and marks older approved versions `superseded`. Editing is allowed
-only in Stage 1. Every action is in the append-only `protocol_events` table with the full
+only in Stage 1; after Gate 1 changes go through amendments (Session 8, §9.10). Every action is in the append-only `protocol_events` table with the full
 protocol payload.
 
 **Databases** (`databases.py`): PubMed, Europe PMC and OpenAlex are executed through the
@@ -867,8 +886,8 @@ unvalidated engineering threshold), stores candidates for human adjudication
 (`POST /duplicates/{id}/resolve`), records per-source identified/duplicate/unique counts
 and saves the PRISMA snapshot. Human duplicate decisions are kept and re-applied when the
 preparation is re-run (e.g. after a further import), and the same pair is not proposed
-again. Preparation, searches and imports are refused once screening decisions exist
-(update searches are not supported).
+again. Once screening decisions exist, searches and imports are *update searches* and the
+preparation is incremental (Session 8, §9.10): the screened pool is never re-deduplicated.
 Records stay *records*: duplicates of one report are linked by `duplicate_of`; reports of
 one study and overlapping cohorts are linked later (§9.3, §8.4), never merged here.
 
@@ -1175,6 +1194,189 @@ interpretation. GRADE for syntheses without meta-analysis is recorded as text (S
 not as a structured rating. Imprecision is limited to two levels of rating down. The
 PRISMA "other methods" and updated-review variants, minimally important differences and
 optimal information size are not supported.
+
+### 9.10 Session 8 — model management, UI operations, protocol amendments, runtime safeguards
+
+**Provider facts** (official documentation, retrieved 2026-10-31). Anthropic
+`GET https://api.anthropic.com/v1/models` (headers `x-api-key` — documented as the
+still-supported alternative to `Authorization: Bearer` — and `anthropic-version`; pagination
+`limit` 1–1000 and `after_id`; items `id`, `display_name`, `lifecycle` active/deprecated/retired
+with retired models omitted unless requested, `retires_at`, `max_tokens`, `capabilities` with
+effort levels, thinking types and structured outputs). OpenAI `GET https://api.openai.com/v1/models`
+(Bearer; no documented pagination; items `id`, `created`, `owned_by`, optional `shutdown_date`;
+no capabilities or prices). Pricing: Anthropic pricing page (the re-check corrected the Sonnet
+5.5 cache-read price to $0.10/MTok and added Haiku 5.5's long-prompt cache prices). Prompt
+caching: Anthropic (explicit `cache_control`, 5-minute writes 1.25× and reads 0.1× base input —
+0.05× on Opus 5.5 and Sonnet 5.5, 0.025× on Fable 5.1; minimum cacheable length 512–4,096 tokens
+by model; "no effect on output token generation") and OpenAI (automatic; 1,024-token minimum on
+GPT-5.6+, cache writes 1.25× for 30-minute lifetimes on GPT-5.6+). Batch: Anthropic Message
+Batches and OpenAI Batch (50 % discount, asynchronous, up to 24 h) were read but not used.
+
+**Model catalogue (issue #9).** Four facts are kept apart and shown separately
+(`model_registry.model_status`): *account availability* (was the ID listed for this key at the
+last refresh; an outage or rejected key is reported as "unknown — refresh failed", never as model
+incompatibility), *adapter compatibility* (`adapter`; known only for verified entries),
+*verified capabilities* (`verified`, `source`, `verified_at`) and *verified prices*
+(`pricing_source`, `pricing_verified_at`; no price → costs "unavailable"). Execution requires a
+verified entry whose lifecycle is not `retired` and whose adapter matches the provider
+(`ModelCapability.execution_problems`); deprecated models run with a warning. Nothing is ever
+substituted.
+
+| Step | What happens | Safeguard |
+|---|---|---|
+| Refresh (`workflows.models.refresh_catalogue`, UI only) | `ModelLister` calls the two list endpoints; `refresh_snapshot` copies the active catalogue, adds new IDs as `verified=False` entries (display name and source marked UNVERIFIED; provider-reported metadata kept for review), records reported lifecycle changes, removes nothing | Only GET list requests (tested); keys only in the request header, redacted, never stored; a failed listing leaves that provider unchanged; repeating a refresh yields the same content hash |
+| Verify (`POST /models/verifications`, reviewer token) | `verification_snapshot` stores a candidate with the reviewer's capabilities (efforts, default, thinking, output limit, adapter, https source, date) and optional prices with their own https source and date | Effort levels, output limits or adaptive thinking that contradict the provider-reported metadata are refused ("mismatched effort"); prices without source/date are refused; bound to the active catalogue hash displayed |
+| Preview (`GET /models/snapshots/{id}/preview`) | `diff`: added, changed fields, newly executable, newly blocked; nothing is ever removed | — |
+| Activate (`POST /models/snapshots/{id}/activate`, reviewer token) | Append-only activation row; the latest activation is the active catalogue | Refused unless the snapshot hash and the active-catalogue hash equal those previewed and the snapshot was built on the active catalogue; write lock taken first |
+
+Reproducibility: catalogue snapshots and activations are append-only, so the catalogue every
+activation replaced is reconstructable; `ProjectAISettings.catalogue_sha256` records the
+catalogue a selection was saved against and every `llm_calls` row records `catalogue_sha256` and
+`catalogue_snapshot_id` in its settings. Stored selections are never rewritten: a model that
+becomes retired or unverified fails preflight with the reason, and the UI keeps showing the
+stored ID instead of silently replacing it. Built-in catalogue corrections ship with software
+updates and apply where no snapshot has been activated; historical call rows keep the estimate
+and basis computed at the time.
+
+**Operations bound to the displayed state.** Read endpoints return a `state_sha256`
+(`GET /extraction/items` per item, `GET /studies`, `GET /extraction/double-counting/state`,
+`GET /stats/plans` latest/approved hashes); decisions send it back and the service refuses
+(409, "has changed", nothing saved) after taking the write lock (`Repository.lock_project`,
+SQLite) if it differs. The legacy endpoints keep accepting requests without the hash (no stale
+check is then possible); the UI always sends it, and correcting a *reviewed* value requires it.
+
+* *Corrections* (`correct_item` for pending items; `revise_reviewed_item` for accepted/rejected
+  items in Stage 4 or Gate 3): the correction is grounded in the linked PDF or explicitly attested;
+  a human entry that grounding would downgrade (e.g. the number is not in the quote) is refused
+  rather than stored as "ambiguous". The reviewed item becomes `superseded` (its content stays in
+  the append-only review events), the new version is accepted by the correcting reviewer, and
+  the arm built from the old value is invalidated (`arm_invalidation`); `build_arms` then builds a
+  new arm under a new id (`…rebuild-n`). Gate 3 requires it again, and statistics, GRADE and
+  syntheses become stale through their input hashes.
+* *Study links*: link/re-link (`link_reports_to_study`) and unlink (`unlink_reports`) with a
+  `study_link` history (linked/relinked/unlinked, before/after study, reviewer, note).
+* *Double counting*: `resolve_double_counting` bound to the hash of the conflict list shown.
+* *Analysis plans* (`stats_engine.plan_service`): drafts are new versions; approval stores the
+  displayed draft as approved (same plan id/version) and is refused if a newer version exists.
+  `save_analysis_plan` now refuses approved plans from Stage 6 on (a new plan would invalidate
+  statistics that can no longer be re-run).
+
+The UI keeps these screens frozen in `operation_screens` (typed keys `(kind, project, *scope)`,
+disjoint from Session 7's `reporting_screens`; widget keys derived from the screen key), exactly
+as in §9.9.
+
+**Protocol amendments** (`search/amendments.py`, `/projects/{id}/amendments`). The approved
+protocol is never unlocked. A proposal (full proposed protocol, base version and hash, rationale,
+proposer, phase, material changes, impact) is stored separately; until approved, every step keeps
+using the approved version. Proposals bind to the approved-protocol hash shown; revisions (MeSH
+verification against NLM, strategy validation by API preview or — for non-API databases —
+attestation) are new revisions; decisions (approve/reject/withdraw, comments required) bind to the
+revision displayed. Approval requires no `approval_blockers()` on the proposal, saves version
+*n*+1 as approved, marks *n* superseded (stored), logs `amendment_approved`, and records
+obligations. An open proposal or open obligation blocks every forward transition.
+
+| Change group (fields) | Allowed phases | Affected work | Obligations (re-review) |
+|---|---|---|---|
+| search (databases, strategies, MeSH) | Stage 2 | searches, screening of new records, reporting, audit, sign-off | one per new/changed strategy; resolved by the search log (executed, imported or declared not searched) |
+| eligibility (question, P, I, C, design, study designs, criteria) | Stage 2 – Gate 3 | title/abstract and full-text screening, extraction, statistics, reporting, audit, sign-off | one per record with a final TA decision and per report with a final FT decision: *confirmed*, or *revised* (a new include/exclude decision with reason) |
+| outcomes | Stage 2 – Gate 3 | outcome definitions, extraction, analysis plans, statistics, reporting, audit, sign-off | one per (report, changed/removed outcome) with extraction items; one for an approved plan analysing a changed outcome — resolved by approving a later plan, or *confirmed* only if the plan passes the checks against the amended protocol |
+| administrative (title, PROSPERO ID) | Stage 2 – audit | reporting, audit, sign-off | none (the evidence fingerprint covers the protocol) |
+
+Statistics (input hash includes the outcome definitions and the eligible set), GRADE/SoF and
+syntheses (input hashes), checklists, audits and sign-offs (evidence fingerprint) need no extra
+obligation: they become stale through their existing hashes. A *revised* screening verdict is
+appended by `load_screening_decisions` as a later human ADJUDICATOR decision (derived from the
+`amendment_resolution` record), so it is the effective decision for screening status, PRISMA and
+the guards; the stored decision rows are never modified. Refused explicitly: amendments before
+Gate 1 (edit the draft), search changes after Stage 2, eligibility/outcome changes after Gate 3,
+amendments after completion, a second open amendment.
+
+**Update searches** (`SearchService._prepare_update`). In Stage 2 after screening has begun,
+searches and imports are accepted. Preparation then deduplicates only the records of runs logged
+after the last preparation against the frozen unique records: a new record matching exactly one
+frozen record becomes its duplicate (the screened record, its identifiers and decisions are not
+changed); new-only clusters merge under the deduplicator's representative; a cluster that would
+join several frozen records, and every conflicting match, becomes a `DuplicateCandidate`; a human
+cannot drop a screened record in favour of an unscreened one. PRISMA is re-derived: the update's
+records count in identification (per source), duplicates removed and records awaiting screening,
+as in the PRISMA 2020 flow for a new review. Not supported: update searches after Stage 2;
+re-executing an identical strategy (amend its dates, which creates a new strategy); the PRISMA
+"updated review" variant.
+
+**Runtime safeguards and optimisations (issues #3/#4).**
+
+| Item | Status | Notes |
+|---|---|---|
+| Parse each PDF once | Implemented | `pdf_extractor.cache`: in-memory LRU keyed by (SHA-256, filename, parser rules + pdfplumber/pypdf versions); bytes still read and hash-verified on every use; used by AI steps and correction endpoints |
+| Result reuse with full provenance | Existing + extended | Identical requests (task, provider, model, effort, request hash) are not repeated once a validated result was persisted; the request hash covers system prompt, full prompt and schema, so protocol or prompt changes invalidate it; calls now also record the catalogue hash. Human approvals are never cached |
+| Independence of the two screening passes | Preserved | Task is part of the key; neither prompt contains the other pass's output; caching shares only the identical protocol prefix computation, which the provider documents as not affecting output |
+| Bounded retries, resumable idempotent units | Existing | ≤ 2 retries for 408/429/5xx/529 and pre-send connection failures; read timeouts not retried; per-record commits |
+| Usage reporting, unknown prices | Extended | `cost_status`: complete / partial (lower bound) / unavailable; UI never shows an unknown price as 0 |
+| Budget pause | Existing | Local stop threshold refuses to start calls and records `blocked_budget`; nothing is skipped or marked done |
+| Provider prompt caching | Implemented (opt-in, Anthropic) | `TaskModelSettings.prompt_caching`; screening requests carry the record-invariant protocol block as `cacheable_prefix`; the same text is sent either way and the request hash is unchanged. OpenAI caching is automatic (nothing configured). **No savings measured** |
+| Provider batch processing | **Deferred** | Needs asynchronous submission, polling, result reconciliation with the audit trail and persisted results, cancellation semantics and live verification of result formats; the 50 % list discount would have to be recorded from actual billing. Not justified without live testing |
+| Adaptive model/effort routing | **Not implemented** (by design) | Requires explicit configuration and benchmarks against a human-verified reference set, which do not exist; user-selected models and efforts are never changed |
+
+**Review of PR #13 (independent review of commit 4748b58): five fixes.**
+
+1. *Corrections bound to the PDF displayed.* `correction_state_sha256` covers the item **and** its
+   linked PDF (SHA-256, stored filename), identity-check status, notes and human confirmation
+   (`source_state`). `GET /extraction/items` returns it with the `source` shown; the correction
+   endpoint requires it (422 without), and `correct_item` / `revise_reviewed_item` re-check it
+   under the write lock before saving. A replaced PDF or a changed confirmation gives 409 with
+   nothing stored; a correction is never bound to evidence fetched after the screen was loaded.
+2. *Outcome amendments and approved arms.* Re-review obligations are derived from extraction
+   items **and** active arms, so every report with data for a changed outcome must be
+   re-reviewed. Resolutions: `confirmed` (the data meet the amended definition), `revised` (only
+   once no active arm predates the amendment, i.e. the values were corrected and arms rebuilt),
+   `withdrawn` (recorded as `QuantitativeUnavailability` for that outcome, reason code `other`;
+   data and evidence stay stored), `not_applicable` (only for an outcome removed from the
+   protocol). A plan confirmation or a changed statistics hash never resolves them.
+3. *Plan screens bound to the protocol.* `GET /stats/plans` returns `protocol_sha256`,
+   `protocol_version` and the outcome definitions; draft saves and approvals require
+   `expected_protocol_sha256` and are refused (409, nothing stored) after an intervening
+   amendment until the reviewer reloads. The UI composes from the frozen outcome definitions.
+   Bound approvals record `plan_approval_basis` (plan, protocol hash and version); only such an
+   approval made against the amended protocol version closes a plan re-review. The legacy
+   `POST /stats/plan` accepts an optional `expected_protocol_sha256` and never closes one.
+4. *Withdrawing arms of reports no longer included.* `withdraw_arms`
+   (`POST /extraction/records/{id}/withdraw-arms`, reviewer token, bound to
+   `GET …/arms-state`) retires the active arms of a report excluded at full text (e.g. on
+   re-review after an eligibility amendment), in Stage 4 or at Gate 3. The arms stay stored; an
+   `arm_invalidation` record of kind `withdrawal` names the reviewer and reason; `build_arms`
+   refuses to rebuild them unless the report is included again. Included reports are corrected
+   or recorded as unavailable instead. Tested through Gate 3, Stage 5 and the statistics run.
+5. *No late changes to Stage 5 inputs.* From Stage 6 on, `Repository.require_stats_inputs_open`
+   refuses, before anything is written, every change to a statistics input: study links (link,
+   re-link, unlink), contribution and unavailability decisions (double counting), arm creation,
+   approval and invalidation, cohort-overlap resolutions and full-text eligibility decisions.
+   In Stage 5 such changes remain allowed and the supported route is to re-run Stage 5 (tested).
+
+**Follow-up review of PR #13 (commit e7dd405): four fixes.**
+
+1. *One captured source per correction screen.* `GET /extraction/items` reads each report's
+   source once and computes `state_sha256` from that same captured source
+   (`correction_state_sha256(…, source=…)`); a screen can no longer display PDF A with a hash
+   of PDF B. If B becomes current afterwards, the correction is refused (409, nothing saved).
+2. *One captured protocol per plan screen.* `plan_state` derives the displayed outcome
+   definitions, the protocol hash and version, and the draft's compatibility check from one
+   `latest_protocol` read (`basis_of`). An approval based on old definitions is refused after
+   an amendment and neither records a basis nor closes the plan re-review.
+3. *Every screening mutation is a Stage 5 input.* `save_screening_decision` (title/abstract and
+   full text) and `save_conflict` are refused from Stage 6 on, before writing; full-text
+   eligibility depends on title/abstract inclusion.
+4. *Phase read fresh under the lock.* `require_stats_inputs_open`, plan approval and the
+   Stage 4 / Gate 3 and amendment phase checks use `Repository.locked_phase` /
+   `current_phase`: the write lock is taken first, then the persisted phase is read as a column
+   in the same transaction. `_lock_for_reporting` also flushes pending changes and expires the
+   cached `ProjectORM` (sessions keep objects across commits: `expire_on_commit=False`), so a
+   transition committed by another session is never hidden by a stale object.
+
+**Limitations.** All provider traffic is mocked; no live listing, inference or cost measurement
+was made. The stale-state checks are guaranteed on SQLite only (one writer); on PostgreSQL the
+lock statement locks a row and does not serialise other writers (§9.9). The same enrolled
+reviewer may propose and approve an amendment (both recorded; multi-reviewer sign-off is not
+implemented). Corrections of reviewed values are limited to Stage 4 and Gate 3.
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;
