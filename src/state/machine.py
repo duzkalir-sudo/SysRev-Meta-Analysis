@@ -108,6 +108,12 @@ class GuardContext:
     # Session 8: an undecided protocol amendment, or work pending re-review after an approved
     # amendment, blocks every forward transition (returning to drafting stays allowed).
     amendment_problems: tuple[str, ...]
+    # Session 9: accepted values not represented by an approved arm or arms whose basis
+    # changed (H1); values, arms or risk-of-bias evidence that cite a replaced PDF (H3);
+    # numbers without a recorded reading of an ambiguous format (M5).
+    extraction_integrity_problems: tuple[str, ...]
+    # Session 9 (H2): the Gate 3-approved data changed after the Gate 3 approval.
+    gate3_basis_problems: tuple[str, ...]
 
 
 Guard = Callable[[GuardContext], list[str]]
@@ -213,6 +219,7 @@ def _extraction_grounded(c: GuardContext) -> list[str]:
         )
     if c.extracted_values_without_evidence:
         v.append(f"{c.extracted_values_without_evidence} extracted value(s) lack SourceEvidence")
+    v.extend(f"extraction: {p}" for p in c.extraction_integrity_problems)
     return v
 
 
@@ -240,11 +247,16 @@ def _extraction_approved(c: GuardContext) -> list[str]:
 
 
 def _stats_valid(c: GuardContext) -> list[str]:
-    """Stage 5 → 6: a verified statistics artifact computed by the deterministic engine from
-    the current approved plan and the current approved extraction data."""
+    """Stage 5 → 6: the Gate 3 conditions still hold for the current data (Session 9, H2) —
+    eligibility, extraction, arms, risk of bias, double counting, PRISMA and pending reviews,
+    since Stage 5 operations such as link changes can affect them — the Gate 3-approved data
+    are unchanged since the approval, and a verified statistics artifact was computed by the
+    deterministic engine from the current approved plan and the current approved data."""
+    v = [f"Gate 3 condition no longer met: {p}" for p in _extraction_approved(c)]
+    v.extend(f"Gate 3 approval: {p}" for p in c.gate3_basis_problems)
     if not c.stats_output_present:
-        return ["stats_output.json has not been produced"]
-    return [f"stats_output.json: {p}" for p in c.stats_output_problems]
+        return [*v, "stats_output.json has not been produced"]
+    return v + [f"stats_output.json: {p}" for p in c.stats_output_problems]
 
 
 def _manuscript_present(c: GuardContext) -> list[str]:

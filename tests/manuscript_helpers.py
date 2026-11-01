@@ -123,7 +123,9 @@ def include_everywhere(
                 title=rec.title,
                 status=FullTextStatus.OA_DOWNLOADED,
                 pdf_filename=f"{rec.record_id}.pdf",
-                pdf_sha256="b" * 64,
+                # the hash the synthetic arm evidence cites (tests.conftest.make_evidence):
+                # since Session 9 (H3) values citing another PDF block Gate 3 and Stage 6
+                pdf_sha256="a" * 64,
                 match_status=UploadMatchStatus.CONFIRMED,
             ),
         )
@@ -242,8 +244,18 @@ def single_arm_project(
 
 
 def comparative_project(
-    session: Session, pid: str = "mc1", *, study_links: list[list[str]] | None = None
+    session: Session,
+    pid: str = "mc1",
+    *,
+    study_links: list[list[str]] | None = None,
+    trials: list[tuple[str, str, str, str, str]] | None = None,
+    primary_model: str = "random_effects",
+    stop_at_gate3: bool = False,
 ) -> tuple[Repository, str, str]:
+    """A comparative review with an approved RR plan, by default taken (directly) to Stage 6
+    with verified statistics. ``trials`` replaces the 2x2 tables (record id, intervention
+    events, intervention n, control events, control n). With ``stop_at_gate3`` the project
+    is left at Gate 3 with the plan approved, for a real Gate 3 -> Stage 5 -> Stage 6 run."""
     repo = Repository(session)
     repo.create_project(pid, "Synthetic comparative review")
     rid, token = repo.enroll_reviewer(REVIEWER)
@@ -257,7 +269,7 @@ def comparative_project(
         ),
     )
     run_id = _search_run(repo, pid, rid, REVIEWER)
-    trials = [
+    trials = trials or [
         ("t1", "12", "100", "20", "100"),
         ("t2", "8", "80", "15", "82"),
         ("t3", "5", "60", "9", "58"),
@@ -291,12 +303,16 @@ def comparative_project(
             note="synthetic: reports of one study",
         )
     repo.save_prisma(pid, derive_prisma(repo, pid))
-    _to_stage6(
-        repo,
-        pid,
-        rid,
-        [AnalysisSpec(analysis_id="comp", outcome_id="complication", effect_measure="RR")],
-    )
+    spec = AnalysisSpec(
+        analysis_id="comp", outcome_id="complication", effect_measure="RR",
+        primary_model=primary_model,  # type: ignore[arg-type]
+    )  # fmt: skip
+    if stop_at_gate3:
+        repo.save_analysis_plan(pid, plan(spec, reviewer_id=rid))
+        repo.get_project(pid).phase = Phase.GATE3_EXTRACTION_APPROVAL.value
+        session.flush()
+        return repo, rid, token
+    _to_stage6(repo, pid, rid, [spec])
     return repo, rid, token
 
 
@@ -313,13 +329,15 @@ def _to_stage6(repo: Repository, pid: str, rid: str, specs: list[AnalysisSpec]) 
 
 @contextmanager
 def out_of_band(repo: Repository, pid: str) -> Iterator[None]:
-    """Simulate a change to Stage 5 inputs made *outside* the application in Stage 6 (e.g. a
-    direct database write, which the threat model does not exclude). Since the review of
-    PR #13 (finding 5) the application refuses such changes from Stage 6 on; the tests using
-    this helper check that the audit, the evidence package and syntheses still *detect* them."""
+    """Simulate a change made *outside* the application after Gate 3 (e.g. a direct database
+    write, which the threat model does not exclude). Since the review of PR #13 (finding 5) the
+    application refuses changes to Stage 5 inputs from Stage 6 on, and since Session 9 (H2) it
+    refuses changes to any Gate 3-approved data (screening, full text, extraction, arms, risk
+    of bias) from Stage 5 on. The tests using this helper check that the audit, the evidence
+    package, syntheses and the Stage 5 -> 6 guard still *detect* such changes."""
     project = repo.get_project(pid)
     phase = project.phase
-    project.phase = Phase.STAGE5_META_ANALYSIS.value
+    project.phase = Phase.STAGE4_EXTRACTION_ROB.value
     repo.session.flush()
     try:
         yield

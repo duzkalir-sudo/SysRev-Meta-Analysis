@@ -89,8 +89,11 @@ tbl_case <- function(id, ai, n1i, ci, n2i, source) {
     blk <- iv_block(es$yi[keep], es$vi[keep])
     blk$kept <- which(keep) - 1  # zero-based indices
     mh <- rma.mh(measure = measure, ai = ai, n1i = n1i, ci = ci, n2i = n2i, drop00 = TRUE)
+    # Mantel-Haenszel study weights (weights.rma.mh) for every table, in percent; tables that
+    # contribute nothing to the MH sums have weight 0 (Session 9, M3 and review P2).
     blk$mh <- list(estimate = unname(c(mh$beta)), se = mh$se, ci_lower = mh$ci.lb,
-                   ci_upper = mh$ci.ub, statistic = mh$zval, p_value = mh$pval)
+                   ci_upper = mh$ci.ub, statistic = mh$zval, p_value = mh$pval,
+                   weights_all = as.list(unname(weights(mh))))
     out$expected[[measure]] <- blk
   }
   out

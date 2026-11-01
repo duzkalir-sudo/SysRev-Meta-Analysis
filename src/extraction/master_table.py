@@ -31,7 +31,7 @@ from src.core.enums import (
 )
 from src.core.exceptions import SysRevError
 from src.core.schemas.base import utc_now
-from src.core.schemas.extraction import ExtractedStudyArm
+from src.core.schemas.extraction import ExtractedStudyArm, RiskOfBiasAssessment
 from src.core.schemas.master import (
     ARM_DOMAINS,
     CohortContributionDecision,
@@ -136,6 +136,191 @@ def _require_linked_document(repo: Repository, project_id: str, record_id: str,
         raise ReviewError(f"the PDF linked to {record_id} has an unconfirmed identity")
 
 
+def require_current_source(repo: Repository, project_id: str, item: ExtractionItem) -> None:
+    """Session 9 (H3): an item may only be accepted against the report's *current*, confirmed
+    PDF. The evidence must cite that PDF (hash and stored filename) and the machine check must
+    have been made against it; a successful check of an earlier, replaced PDF never authorises
+    acceptance. Correct the item against the linked PDF instead."""
+    if item.evidence is None:
+        return
+    ft = repo.get_fulltext_item(project_id, item.record_id)
+    if ft is None or ft.pdf_sha256 is None:
+        raise ReviewError(f"record {item.record_id} has no linked PDF; the evidence cannot be "
+                          "checked against the authoritative source")  # fmt: skip
+    if ft.match_unconfirmed:
+        raise ReviewError(f"the PDF linked to {item.record_id} has an unconfirmed identity")
+    ev = item.evidence
+    if ev.pdf_sha256 != ft.pdf_sha256 or ev.pdf_filename != ft.pdf_filename:
+        raise ReviewError(
+            f"the evidence cites {ev.pdf_filename} ({str(ev.pdf_sha256)[:12]}…) but the PDF now "
+            f"linked to {item.record_id} is {ft.pdf_filename} ({ft.pdf_sha256[:12]}…): the "
+            "source was replaced; correct the item against the linked PDF (nothing was saved)"
+        )
+    check = item.verification
+    if check is not None and check.checked_against_sha256 not in (None, ft.pdf_sha256):
+        raise ReviewError(
+            "the evidence check was made against another PDF than the one now linked; "
+            "re-verify by correcting the item (nothing was saved)"
+        )
+
+
+def arm_basis(repo: Repository, project_id: str, arm_id: str) -> dict[str, str] | None:
+    """The accepted item versions an arm represents (``item_id -> item state hash``).
+
+    Session 9 (H1): recorded when the arm is built (``arm_basis``). For arms built before
+    Session 9 it is reconstructed from the append-only ``arms_built`` review events (item
+    ids only, hash ``""``). ``None`` for arms that were never built from master-table items
+    (e.g. stored directly through the repository)."""
+    records = repo.governance_records(project_id, "arm_basis", arm_id)
+    if records:
+        items = records[-1].get("items")
+        return {str(k): str(v) for k, v in items.items()} if isinstance(items, dict) else {}
+    built = {
+        e.item_id
+        for e in repo.list_review_events(project_id)
+        if e.action == "arms_built" and e.note == f"arm {arm_id}"
+    }
+    return dict.fromkeys(built, "") if built else None
+
+
+def _arm_items(item: ExtractionItem) -> bool:
+    return (
+        item.domain in ARM_DOMAINS
+        and item.review_status == ReviewStatus.ACCEPTED
+        and item.data_status == DataStatus.REPORTED
+        and item.value_kind == "numeric"
+    )
+
+
+def _invalidate_if_unrepresented(
+    repo: Repository, project_id: str, item: ExtractionItem, reviewer: ReviewerORM, why: str
+) -> list[str]:
+    """Session 9 (H1): a newly accepted arm-level value that the current arm does not represent
+    makes that arm stale. The arm is invalidated (kept as history) so that Gate 3 requires the
+    arms of the report to be rebuilt from the current accepted values and approved again."""
+    if not _arm_items(item):
+        return []
+    arm_id = current_arm_id(repo, project_id, item.arm_key)
+    if arm_id is None:
+        return []
+    basis = arm_basis(repo, project_id, arm_id)
+    if basis is not None and item.item_id in basis:
+        return []
+    repo.invalidate_arm(
+        project_id, arm_id, reviewer_id=reviewer.id, item_id=item.item_id,
+        reason=f"{why}: {item.field_name} = {item.reported_text!r} is not represented by the arm",
+        kind="stale_basis",
+    )  # fmt: skip
+    _event(repo, project_id, item, "arms_invalidated", reviewer,
+           f"arm {arm_id} invalidated ({why}); rebuild the arms of {item.record_id}",
+           None)  # fmt: skip
+    return [arm_id]
+
+
+def arm_representation_problems(repo: Repository, project_id: str, included: set[str]) -> list[str]:
+    """Session 9 (H1): accepted arm-level values of included reports that no valid arm
+    represents, and arms whose recorded basis is no longer the set of accepted values."""
+    excluded = {(u.record_id, u.outcome_id) for u in repo.load_unavailability(project_id)}
+    groups: dict[tuple[str, str, str, str], list[ExtractionItem]] = defaultdict(list)
+    for item in repo.load_extraction_items(project_id):
+        if (
+            _arm_items(item)
+            and item.record_id in included
+            and (item.record_id, item.outcome_id) not in excluded
+            and (item.record_id, None) not in excluded
+        ):
+            groups[item.arm_key].append(item)
+    problems: list[str] = []
+    for key, group in sorted(groups.items()):
+        label = f"{key[0]} / {key[1]} / {key[2]} ({key[3].strip('|') or 'no timepoint'})"
+        arm_id = current_arm_id(repo, project_id, key)
+        if arm_id is None:
+            problems.append(
+                f"{label}: {len(group)} accepted value(s) are not represented by any approved "
+                "arm; build the arms of the report"
+            )
+            continue
+        basis = arm_basis(repo, project_id, arm_id)
+        if basis is None:
+            continue  # arm not built from master-table items (cannot be compared)
+        current = {i.item_id: item_state_sha256(i) for i in group}
+        missing = sorted(set(current) - set(basis))
+        gone = sorted(set(basis) - set(current))
+        changed = sorted(
+            i for i in set(current) & set(basis) if basis[i] and basis[i] != current[i]
+        )
+        if missing or gone or changed:
+            problems.append(
+                f"{label}: arm {arm_id[:12]}… no longer matches the accepted values "
+                f"(not represented: {len(missing)}, no longer accepted: {len(gone)}, "
+                f"changed: {len(changed)}); rebuild and approve the arms again"
+            )
+    return problems
+
+
+def source_and_format_problems(repo: Repository, project_id: str, included: set[str]) -> list[str]:
+    """Session 9 (H3, M5): for included reports, accepted values and active arm values that
+    cite a PDF other than the one now linked, the latest approved risk-of-bias assessment
+    citing another PDF, and numbers whose printed form has no recorded reading."""
+    linked = {
+        i.record_id: i.pdf_sha256 for i in repo.load_fulltext_items(project_id) if i.pdf_sha256
+    }
+    problems: list[str] = []
+    stale_items: dict[str, int] = defaultdict(int)
+    unresolved: dict[str, int] = defaultdict(int)
+    for item in repo.load_extraction_items(project_id):
+        if item.record_id not in included or item.review_status != ReviewStatus.ACCEPTED:
+            continue
+        ev = item.evidence
+        if ev is not None and ev.pdf_sha256 != linked.get(item.record_id):
+            stale_items[item.record_id] += 1
+        if item.format_status in ("ambiguous_uninterpreted", "legacy_reading_differs"):
+            unresolved[item.record_id] += 1
+    stale_arms: dict[str, int] = defaultdict(int)
+    for arm in repo.load_extracted_arms(project_id):
+        if arm.record_id not in included:
+            continue
+        for value in arm.extracted_values().values():
+            if value.evidence.pdf_sha256 != linked.get(arm.record_id):
+                stale_arms[arm.record_id] += 1
+            if value.format_status in ("ambiguous_uninterpreted", "legacy_reading_differs"):
+                unresolved[arm.record_id] += 1
+    latest_rob: dict[str, RiskOfBiasAssessment] = {}
+    for a in repo.load_rob(project_id):
+        if a.approved_by_human and a.approved_at is not None:
+            prev = latest_rob.get(a.record_id)
+            if prev is None or (prev.approved_at is not None and a.approved_at > prev.approved_at):
+                latest_rob[a.record_id] = a
+    for rid in sorted(included):
+        if stale_items[rid]:
+            problems.append(
+                f"{rid}: {stale_items[rid]} accepted value(s) cite a PDF that is no longer the "
+                "linked one; re-verify them against the linked PDF (correct each item)"
+            )
+        if stale_arms[rid]:
+            problems.append(
+                f"{rid}: {stale_arms[rid]} value(s) of an approved arm cite a PDF that is no "
+                "longer linked; rebuild the arms from re-verified values"
+            )
+        rob = latest_rob.get(rid)
+        if rob is not None and any(
+            e.pdf_sha256 is not None and e.pdf_sha256 != linked.get(rid)
+            for d in rob.domains
+            for e in d.evidence
+        ):
+            problems.append(
+                f"{rid}: the approved risk-of-bias assessment cites a PDF that is no longer "
+                "linked; a new assessment must be approved"
+            )
+        if unresolved[rid]:
+            problems.append(
+                f"{rid}: {unresolved[rid]} number(s) have an ambiguous printed format without a "
+                "recorded reading, or were stored with the reading used before Session 9; "
+                "correct them with number_format and a note citing the source context"
+            )
+    return problems
+
+
 def submit_proposals(
     repo: Repository,
     project_id: str,
@@ -220,10 +405,26 @@ def accept_item(repo: Repository, project_id: str, item_id: str, *, reviewer: Re
         )
     if item.flags and not (note and note.strip()):
         raise ReviewError("flagged items can only be accepted with a note explaining why")
+    _require_resolved_number(item)
+    repo.require_gate3_open(project_id, "accepting an extraction item")
+    require_current_source(repo, project_id, item)
     accepted = _stamped(item, ReviewStatus.ACCEPTED, reviewer, note)
     repo.save_extraction_item(project_id, accepted)
     _event(repo, project_id, accepted, "accepted", reviewer, note, item)
+    _invalidate_if_unrepresented(repo, project_id, accepted, reviewer,
+                                 "value accepted after the arm was built")  # fmt: skip
     return accepted
+
+
+def _require_resolved_number(item: ExtractionItem) -> None:
+    """Session 9 (M5): an uninterpreted ambiguous number, or a value stored with the reading
+    used before Session 9 that differs from the current one, is never accepted or built."""
+    status = item.format_status
+    if status in ("ambiguous_uninterpreted", "legacy_reading_differs"):
+        raise ReviewError(
+            f"{item.reported_text!r} has no recorded number format ({status}); correct the item "
+            "with number_format and a note citing the source context"
+        )
 
 
 def reject_item(repo: Repository, project_id: str, item_id: str, *, reviewer: ReviewerORM,
@@ -274,6 +475,8 @@ def correct_item(
     repo.save_extraction_item(project_id, accepted)
     _event(repo, project_id, superseded, "corrected", reviewer, note, old)
     _event(repo, project_id, accepted, "accepted", reviewer, note, None)
+    _invalidate_if_unrepresented(repo, project_id, accepted, reviewer,
+                                 "corrected value accepted after the arm was built")  # fmt: skip
     return accepted
 
 
@@ -410,7 +613,13 @@ def revise_reviewed_item(
     repo.save_extraction_item(project_id, accepted)
     _event(repo, project_id, superseded, "corrected", reviewer, note, old)
     _event(repo, project_id, accepted, "accepted", reviewer, note, None)
-    if invalidated:
+    if not invalidated:
+        # Session 9 (H1): a REJECTED value corrected and accepted (or a value moved to another
+        # arm) is not represented by the arm built without it.
+        invalidated += _invalidate_if_unrepresented(
+            repo, project_id, accepted, reviewer, "corrected value accepted after the arm was built"
+        )
+    if invalidated and old.review_status == ReviewStatus.ACCEPTED:
         _event(repo, project_id, superseded, "arms_invalidated", reviewer,
                f"arm(s) {', '.join(invalidated)} invalidated; rebuild the arms of "
                f"{old.record_id}", None)  # fmt: skip
@@ -473,6 +682,12 @@ def build_arms(
         if i.record_id == record_id
     ):
         raise ReviewError(f"record {record_id} still has pending extraction items")
+    repo.require_gate3_open(project_id, "building approved arms")
+    for item in items:
+        # Session 9 (H3, M5): every value must rest on the current, confirmed PDF and have
+        # a resolved number format before it can enter an approved arm.
+        require_current_source(repo, project_id, item)
+        _require_resolved_number(item)
     groups: dict[tuple[str, str, str, str], list[ExtractionItem]] = defaultdict(list)
     for item in items:
         groups[item.arm_key].append(item)
@@ -516,6 +731,14 @@ def build_arms(
             **fields,
         )  # fmt: skip
         repo.save_extracted_arm(project_id, arm)
+        ft = repo.get_fulltext_item(project_id, record_id)
+        repo.add_governance_record(
+            project_id, "arm_basis", arm_id,
+            {"arm_id": arm_id, "record_id": record_id, "arm_key": list(key),
+             "items": {i.item_id: item_state_sha256(i) for i in group},
+             "pdf_sha256": ft.pdf_sha256 if ft else None},
+            reviewer_id=reviewer.id,
+        )  # fmt: skip
         for item in group:
             repo.add_review_event(
                 project_id,

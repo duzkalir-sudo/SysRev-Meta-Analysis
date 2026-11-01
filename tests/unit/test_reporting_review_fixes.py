@@ -155,7 +155,8 @@ def test_grade_decision_on_outdated_inputs_is_refused(session: Session) -> None:
     later = approved_rob("t1", rid, name=REVIEWER).model_copy(
         update={"overall": "high", "approved_at": NOW + timedelta(days=1)}
     )
-    repo.save_rob("mc1", later)  # another operation: risk of bias re-assessed
+    with out_of_band(repo, "mc1"):  # risk of bias re-assessed (outside the app since Session 9)
+        repo.save_rob("mc1", later)
     body = approval() | {
         "inputs_sha256": shown["inputs_sha256"],
         "based_on_assessment_id": shown["based_on_assessment_id"],
@@ -504,29 +505,31 @@ def test_three_level_downgrade_only_for_robins_i_risk_of_bias() -> None:
 
 def test_robins_i_assessment_reports_the_three_level_judgement(session: Session) -> None:
     repo, rid, _ = comparative_project(session)
-    for t in ("t1", "t2", "t3"):
-        repo.save_rob(
-            "mc1",
-            RiskOfBiasAssessment(
-                record_id=t,
-                tool=RoBTool.ROBINS_I,
-                domains=[
-                    DomainJudgement(
-                        domain=d,
-                        judgement="critical" if d == "confounding" else "low",
-                        support="synthetic",
-                    )
-                    for d in ROBINS_I_DOMAINS
-                ],
-                overall="critical",
-                assessor=REVIEWER,
-                assessed_by=ActorType.HUMAN,
-                approved_by_human=True,
-                approved_by=REVIEWER,
-                approved_reviewer_id=rid,
-                approved_at=NOW + timedelta(days=1),
-            ),
-        )
+    # set-up of a different body of evidence, written outside the app (frozen since Session 9)
+    with out_of_band(repo, "mc1"):
+        for t in ("t1", "t2", "t3"):
+            repo.save_rob(
+                "mc1",
+                RiskOfBiasAssessment(
+                    record_id=t,
+                    tool=RoBTool.ROBINS_I,
+                    domains=[
+                        DomainJudgement(
+                            domain=d,
+                            judgement="critical" if d == "confounding" else "low",
+                            support="synthetic",
+                        )
+                        for d in ROBINS_I_DOMAINS
+                    ],
+                    overall="critical",
+                    assessor=REVIEWER,
+                    assessed_by=ActorType.HUMAN,
+                    approved_by_human=True,
+                    approved_by=REVIEWER,
+                    approved_reviewer_id=rid,
+                    approved_at=NOW + timedelta(days=1),
+                ),
+            )
     rs = ReportingService(repo, "mc1")
     view = next(r for r in rs.grade() if r["analysis_id"] == "comp")
     assert "interventions_nrsi_robins_i" in view["applicable_approaches"]

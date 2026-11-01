@@ -47,7 +47,7 @@ from src.stats_engine.inputs import (
     all_reports_excluded,
     select_units,
 )
-from src.stats_engine.mantel_haenszel import mantel_haenszel
+from src.stats_engine.mantel_haenszel import mantel_haenszel, mantel_haenszel_weights
 from src.stats_engine.numerics import (
     EstimationError,
     Pooled,
@@ -58,8 +58,13 @@ from src.stats_engine.numerics import (
     study_wald_ci,
 )
 
-ENGINE_VERSION = "1.0.0"
+# 1.1.0 (Session 9): per-number rounding tolerance and identity-scale boundaries for KM/CIF
+# (M1, M2); weights attached to the model they belong to (M3).
+ENGINE_VERSION = "1.1.0"
 GLMM_NODES = 7
+# Labels of sensitivity models whose study weights are reported (Session 9, M3)
+IV_COMMON_LABEL = "inverse-variance common effect (sensitivity)"
+IV_LOGIT_RE_LABEL = "inverse-variance logit random effects (sensitivity)"
 
 NUMERIC_PRECISION = (
     "All quantities are IEEE 754 binary64 floats serialised with the shortest repr that "
@@ -249,6 +254,9 @@ class _Analysis:
             "(inverse-variance analyses only)",
             glmm_quadrature_nodes=GLMM_NODES,
             prediction_interval_min_k=3,
+            # Session 9 (M3): study weights belong to the model they are shown with; outputs
+            # of engine 1.0.0 have no such setting (their weights are inverse-variance)
+            weight_convention="model-specific",
         )
         return s
 
@@ -261,6 +269,24 @@ class _Analysis:
         )
         included = {rid: s.study_id for s in studies for rid in s.record_ids}
         excluded, reports = account_reports(self.inputs, selection, included, self.excluded)
+        # Session 9 review of d364c0f: every model carries its own population, and the ledger
+        # names the models each included report contributes to.
+        totals_known = kw.get("total_events") is not None
+        for name in ("primary", "common_effect", "random_effects"):
+            if kw.get(name) is not None:
+                kw[name] = _with_population(kw[name], studies, totals_known)
+        self.sensitivity = [_with_population(r, studies, totals_known) for r in self.sensitivity]
+        models = [
+            r for r in (kw.get("common_effect"), kw.get("random_effects"), *self.sensitivity)
+            if r is not None
+        ]  # fmt: skip
+        if models:
+            reports = [
+                r.model_copy(update={"models": [m.label for m in models
+                                                if r.unit_id in (m.study_ids or [])]})
+                if r.status == "included" else r
+                for r in reports
+            ]  # fmt: skip
         return AnalysisResult.model_validate(
             {
                 "analysis_id": self.spec.analysis_id,
@@ -297,8 +323,9 @@ class _Analysis:
         fe = fixed_effect(d.yi, d.vi, level=self.level)
         w_fe = 1 / np.asarray(d.vi)
         w_fe = w_fe / w_fe.sum()
-        for s, wf in zip(d.studies, w_fe, strict=True):
-            s["weight_common_pct"] = float(100 * wf)
+        # The weights are returned, not attached: each handler attaches them to the model
+        # they belong to (Session 9, M3).
+        iv_common_weights = [float(100 * wf) for wf in w_fe]
         self._small_k_warnings(k)
         common = _pooled_result(
             fe, model="common_effect", method="inverse variance", scale=scale, back=back, k=k
@@ -315,9 +342,15 @@ class _Analysis:
                 level=self.level,
             )
         except EstimationError as exc:
-            return {"common": common, "random": None, "random_error": str(exc), "het": het}
-        for s, wr in zip(d.studies, re.weights, strict=True):
-            s["weight_random_pct"] = float(100 * wr)
+            return {
+                "common": common,
+                "random": None,
+                "random_error": str(exc),
+                "het": het,
+                "w_common": iv_common_weights,
+                "w_random": None,
+            }
+        iv_random_weights = [float(100 * wr) for wr in re.weights]
         if self.spec.random_effects_ci == "hksj":
             wald = random_effects(
                 d.yi, d.vi, tau2_method=self.spec.tau2_estimator, ci_method="wald", level=self.level
@@ -331,6 +364,8 @@ class _Analysis:
             "common": common,
             "random_error": None,
             "het": het,
+            "w_common": iv_common_weights,
+            "w_random": iv_random_weights,
             "random": _pooled_result(
                 re.pooled,
                 model="random_effects",
@@ -341,6 +376,24 @@ class _Analysis:
                 re=re,
             ),
         }
+
+    @staticmethod
+    def _attach_weights(
+        d: _Data,
+        *,
+        common: list[float] | None = None,
+        random: list[float] | None = None,
+        sensitivity: dict[str, list[float] | None] | None = None,
+    ) -> None:
+        """Attach study weights to the model they belong to (Session 9, M3)."""
+        for i, s in enumerate(d.studies):
+            if common is not None:
+                s["weight_common_pct"] = common[i]
+            if random is not None:
+                s["weight_random_pct"] = random[i]
+            for label, w in (sensitivity or {}).items():
+                if w is not None:
+                    s.setdefault("weight_sensitivity_pct", {})[label] = w[i]
 
     def _finish(
         self,
@@ -382,7 +435,7 @@ class _Analysis:
                 )
         return self._result(
             "pooled",
-            f"{len(d.yi)} studies pooled ({self.spec.primary_model} primary)",
+            f"{primary.k} studies pooled by the primary {primary.label} model",
             scale=scale,
             k_data=d,
             primary=primary,
@@ -565,6 +618,21 @@ class _Analysis:
         else:
             random, random_error = iv_random, iv["random_error"]
             aux, aux_error, aux_name = glmm_res, glmm_error, "binomial-normal GLMM"
+        # Weights (M3): the binomial ML common-effect model and the binomial-normal GLMM have
+        # no inverse-variance study weights, so none are shown for them. The IV-logit
+        # random-effects weights are attached to the IV-logit model only — as the reported
+        # random-effects model when it is primary, else as a labelled sensitivity model.
+        if self.spec.proportion_method == "glmm":
+            self._attach_weights(d, sensitivity={IV_LOGIT_RE_LABEL: iv["w_random"]})
+            self.methods.append(
+                "Study weights: the binomial-normal GLMM and the binomial maximum-likelihood "
+                "common-effect model have no inverse-variance study weights, so none are shown "
+                "for them (metafor likewise provides no weights() for rma.glmm); forest-plot "
+                "boxes are drawn at equal size. Weights of the inverse-variance logit "
+                "sensitivity model are reported separately and labelled as such."
+            )
+        else:
+            self._attach_weights(d, random=iv["w_random"])
         if aux is not None:
             self.sensitivity.append(aux)
         else:
@@ -598,9 +666,13 @@ class _Analysis:
                 self._exclude(u, problem[0], problem[1])
                 continue
             p, lo, hi, h, level = _probabilities(arm)
-            yi = es.to_scale(p, scale)
-            z = _zcrit(level)
-            se = abs(es.to_scale(hi, scale) - es.to_scale(lo, scale)) / (2 * z)
+            try:  # a single unusable study is excluded; it never aborts the analysis (M1)
+                yi = es.to_scale(p, scale)
+                z = _zcrit(level)
+                se = abs(es.to_scale(hi, scale) - es.to_scale(lo, scale)) / (2 * z)
+            except EstimationError as exc:  # pragma: no cover - _check_time_t screens these
+                self._exclude(u, "invalid_data", f"not transformable to the {scale} scale: {exc}")
+                continue
             d.units.append(u)
             d.yi.append(yi)
             d.vi.append(se**2)
@@ -616,7 +688,10 @@ class _Analysis:
                         "ci_lower": lo,
                         "ci_upper": hi,
                         "ci_level": level * 100,
-                        "rounding_half_unit": h,
+                        # half a unit of the last printed digit of each number (Session 9, M2)
+                        "rounding_half_unit_estimate": h[0],
+                        "rounding_half_unit_ci_lower": h[1],
+                        "rounding_half_unit_ci_upper": h[2],
                     },
                     "yi": yi,
                     "vi": se**2,
@@ -649,6 +724,7 @@ class _Analysis:
             return early
         back: Transform = lambda t: es.from_scale(t, scale)  # noqa: E731
         iv = self._pool_iv(d, scale, back)
+        self._attach_weights(d, common=iv["w_common"], random=iv["w_random"])
         return self._finish(
             d, scale, iv["common"], iv["random"], iv["het"], random_error=iv["random_error"]
         )
@@ -657,8 +733,12 @@ class _Analysis:
     def _ratio(self, units: list[Unit]) -> AnalysisResult:
         is_rr = self.spec.effect_measure == EffectMeasure.RR
         measure: Literal["RR", "OR"] = "RR" if is_rr else "OR"
+        use_mh = self.spec.common_effect_method in ("auto", "mantel_haenszel")
         d = _Data()
         tables: list[tuple[int, int, int, int]] = []
+        # Session 9 review (P2/N1): tables that enter the Mantel-Haenszel sums but have no
+        # study-level estimate (double-all-event tables for the RR); never in an IV model.
+        mh_only: list[tuple[Unit, tuple[int, int, int, int]]] = []
         for u in units:
             ia, ca = u.arms["intervention"], u.arms["control"]
             a, n1, c, n2 = (
@@ -674,6 +754,9 @@ class _Analysis:
                 self._exclude(u, "invalid_data", "an arm has n_analyzed = 0")
                 continue
             if not es.two_by_two_informative(a, n1, c, n2):
+                if use_mh and es.enters_mantel_haenszel(measure, a, n1, c, n2):
+                    mh_only.append((u, (a, n1, c, n2)))
+                    continue
                 self._exclude(
                     u,
                     "non_informative",
@@ -719,20 +802,49 @@ class _Analysis:
         }
         scale = "log"
         self.methods.append(
-            f"{measure} on the log scale (escalc conventions: double-zero / double-all-event "
-            "studies excluded; 0.5 added to all cells of studies with a zero cell for inverse-"
-            "variance analyses only)."
+            f"{measure} on the log scale (escalc conventions for the study-level estimates and "
+            "every inverse-variance model: double-zero / double-all-event studies excluded; "
+            "0.5 added to all cells of studies with a zero cell)."
         )
+        if mh_only and len(d.studies) < 2:
+            for u, (a, n1, c, n2) in mh_only:
+                self._exclude(
+                    u,
+                    "non_informative",
+                    f"{a}/{n1} vs {c}/{n2}: all participants had the event in both arms; such "
+                    "a study enters only a Mantel-Haenszel risk ratio, which is not computed "
+                    "with fewer than two studies that have a study-level estimate",
+                )
+            mh_only = []
         early = self._no_pool(d, scale, **totals)
         if early is not None:
             return early
         iv = self._pool_iv(d, scale, math.exp)
         common: PooledResult | None = iv["common"]
         common_error: str | None = None
-        use_mh = self.spec.common_effect_method in ("auto", "mantel_haenszel")
+        self._attach_weights(d, random=iv["w_random"])
         if use_mh:
+            # The IV common-effect model becomes a sensitivity analysis; its weights are
+            # labelled as such and never shown as the Mantel-Haenszel weights (M3).
+            self._attach_weights(d, sensitivity={IV_COMMON_LABEL: iv["w_common"]})
+            mh_tables = tables + [t for _, t in mh_only]
             try:
-                mh = mantel_haenszel(measure, tables, level=self.level)
+                mh = mantel_haenszel(measure, mh_tables, level=self.level)
+                mh_weights = mantel_haenszel_weights(measure, mh_tables)
+                for u, t in mh_only:
+                    d.studies.append(_mh_only_study(u, t))
+                self._attach_weights(d, common=mh_weights)
+                if mh_only:
+                    totals = {
+                        "total_events": sum(t[0] + t[2] for t in mh_tables),
+                        "total_participants": sum(t[1] + t[3] for t in mh_tables),
+                    }
+                    self.warnings.append(
+                        f"{len(mh_only)} stud{'y' if len(mh_only) == 1 else 'ies'} with the "
+                        "event in every participant of both arms enter(s) the Mantel-Haenszel "
+                        f"risk ratio (k = {len(mh_tables)}) but have no study-level estimate "
+                        f"and are not in the inverse-variance models (k = {len(tables)})."
+                    )
                 common = _pooled_result(
                     mh,
                     model="common_effect",
@@ -741,15 +853,27 @@ class _Analysis:
                     + " variance)",
                     scale=scale,
                     back=math.exp,
-                    k=len(tables),
+                    k=len(mh_tables),
                 )
                 self.sensitivity.append(iv["common"])
-                self.methods.append("Common-effect model: Mantel-Haenszel on raw counts.")
+                self.methods.append(
+                    "Common-effect model: Mantel-Haenszel on raw counts; study weights are the "
+                    "Mantel-Haenszel weights (b·c/N for OR, c·n₁/N for RR), as in metafor's "
+                    "weights.rma.mh. Inverse-variance common-effect weights belong to the "
+                    "sensitivity analysis and are reported separately."
+                )
             except EstimationError as exc:
                 common = None
                 common_error = f"Mantel-Haenszel estimate not estimable: {exc}"
                 self.sensitivity.append(iv["common"])
+                for u, (a, n1, c, n2) in mh_only:
+                    self._exclude(
+                        u, "non_informative",
+                        f"{a}/{n1} vs {c}/{n2}: enters only the Mantel-Haenszel risk ratio, "
+                        "which is not estimable here",
+                    )  # fmt: skip
         else:
+            self._attach_weights(d, common=iv["w_common"])
             self.methods.append("Common-effect model: inverse variance.")
         self.methods.append(f"Random-effects model: {_re_method_label(self.spec)}.")
         return self._finish(
@@ -851,6 +975,7 @@ class _Analysis:
         if early is not None:
             return early
         iv = self._pool_iv(d, scale, _identity)
+        self._attach_weights(d, common=iv["w_common"], random=iv["w_random"])
         self.methods.append(
             f"Common-effect: inverse variance. Random effects: {_re_method_label(self.spec)}."
         )
@@ -860,7 +985,14 @@ class _Analysis:
 
 
 _DESCRIBABLE = frozenset(
-    {"missing_data", "boundary_estimate", "ci_inconsistent", "non_informative", "invalid_data"}
+    {
+        "missing_data",
+        "boundary_estimate",
+        "ci_inconsistent",
+        "ci_bound_not_transformable",
+        "non_informative",
+        "invalid_data",
+    }
 )
 _UNSUPPORTED_DEFAULT = "this summary measure is not supported by the statistics engine"
 _UNSUPPORTED: dict[EffectMeasure, str] = {
@@ -878,6 +1010,59 @@ _UNSUPPORTED: dict[EffectMeasure, str] = {
     EffectMeasure.MEDIAN_TIME_TO_EVENT: "Median times to event are not pooled (no validated "
     "method without individual participant data).",
 }
+
+
+def _study_totals(study: StudyResult) -> tuple[int, int] | None:
+    """(events, participants) of one study's data, for count-based measures."""
+    d = study.data
+    if "events_intervention" in d:
+        return (int(d["events_intervention"] + d["events_control"]),
+                int(d["n_intervention"] + d["n_control"]))  # fmt: skip
+    if "events" in d and "n" in d:
+        return int(d["events"]), int(d["n"])
+    return None
+
+
+def _with_population(r: PooledResult, studies: list[StudyResult], totals: bool) -> PooledResult:
+    """Attach the population of model ``r``: the Mantel-Haenszel risk ratio uses every listed
+    table, every other model the studies with a study-level estimate (Session 9 review)."""
+    if r.method.startswith("Mantel-Haenszel"):
+        members = studies
+    else:
+        members = [s for s in studies if s.yi is not None]
+    if len(members) != r.k:  # pragma: no cover - internal invariant of the handlers
+        raise EstimationError(f"{r.label}: {len(members)} studies listed, k = {r.k}")
+    counts = [_study_totals(s) for s in members]
+    known = totals and all(c is not None for c in counts)
+    return r.model_copy(
+        update={
+            "study_ids": [s.study_id for s in members],
+            "record_ids": sorted(rid for s in members for rid in s.record_ids),
+            "total_events": sum(c[0] for c in counts if c) if known else None,
+            "total_participants": sum(c[1] for c in counts if c) if known else None,
+        }
+    )
+
+
+def _mh_only_study(u: Unit, t: tuple[int, int, int, int]) -> dict[str, Any]:
+    """A table that enters only the Mantel-Haenszel risk ratio (Session 9 review, P2/N1)."""
+    a, n1, c, n2 = t
+    return {
+        "study_id": u.unit_id,
+        "record_ids": list(u.record_ids),
+        "label": u.label,
+        "arm_ids": u.arm_ids,
+        "data": {"events_intervention": a, "n_intervention": n1, "events_control": c,
+                 "n_control": n2},
+        "yi": None,
+        "vi": None,
+        "ci_method": "none: no study-level estimate (event in every participant of both arms)",
+        "notes": [
+            "contributes to the Mantel-Haenszel risk ratio only (raw counts, as in "
+            "metafor::rma.mh); excluded from every inverse-variance model and from the "
+            "heterogeneity statistics"
+        ],
+    }  # fmt: skip
 
 
 def _binomial_common(xs: list[int], ns: list[int], level: float, k: int) -> PooledResult | None:
@@ -920,15 +1105,21 @@ def _decimals(text: str) -> int:
     return 0
 
 
-def _probabilities(arm: ExtractedStudyArm) -> tuple[float, float, float, float, float]:
-    """(p, lower, upper, rounding half-unit, ci level) on the proportion scale."""
+HalfUnits = tuple[float, float, float]
+
+
+def _probabilities(arm: ExtractedStudyArm) -> tuple[float, float, float, HalfUnits, float]:
+    """(p, lower, upper, rounding half-units, ci level) on the proportion scale.
+
+    Each printed number carries its own precision: "62" can stand for any value in
+    [61.5, 62.5) while "56.3" stands for [56.25, 56.35). The rounding half-unit is therefore
+    derived separately for the estimate, the lower and the upper limit (Session 9, M2)."""
     est, lo, hi = arm.reported_estimate, arm.ci_lower, arm.ci_upper
     if est is None or lo is None or hi is None or arm.ci_level is None:
         raise ValueError("estimate and confidence interval required")
     div = 100.0 if arm.estimate_scale == "percent" else 1.0
-    dec = max(_decimals(v.reported_text) for v in (est, lo, hi))
-    h = 0.5 * 10.0 ** (-dec) / div
-    return est.value / div, lo.value / div, hi.value / div, h, arm.ci_level / 100.0
+    h = tuple(0.5 * 10.0 ** (-_decimals(v.reported_text)) / div for v in (est, lo, hi))
+    return est.value / div, lo.value / div, hi.value / div, (h[0], h[1], h[2]), arm.ci_level / 100.0
 
 
 def _check_time_t(arm: ExtractedStudyArm, scale: es.ProbabilityScale) -> tuple[str, str] | None:
@@ -945,34 +1136,49 @@ def _check_time_t(arm: ExtractedStudyArm, scale: es.ProbabilityScale) -> tuple[s
             f"estimate {p:g} lies on the boundary; its variance cannot be derived on the "
             f"{scale} scale — described, not pooled"
         )
-    if scale != "plain" and (lo <= 0.0 or hi >= 1.0):
-        return "ci_inconsistent", f"a CI bound at 0 or 1 cannot be transformed to the {scale} scale"
     if hi <= lo:
         return "invalid_data", "zero-width confidence interval"
+    if not (es.scale_domain_contains(lo, scale) and es.scale_domain_contains(hi, scale)):
+        # Each scale has its own domain (es.SCALE_DOMAINS): identity [0, 1], log (0, 1],
+        # logit and log(-log) (0, 1). A limit outside it cannot be transformed (M1, P2).
+        return "ci_bound_not_transformable", (
+            f"the confidence interval {lo:g}–{hi:g} has a limit outside the domain "
+            f"{es.scale_domain_text(scale)} of the declared {scale} transformation, so the "
+            "study SE cannot be recovered on that scale; described, not pooled (the source "
+            "values and the declared scale are unchanged)"
+        )
     if not _symmetric_within_rounding(p, lo, hi, h, scale):
         return "ci_inconsistent", (
             f"the reported CI ({lo:g}–{hi:g} around {p:g}) is not symmetric on the declared "
-            f"{scale} scale even allowing for rounding (±{h:g}); the authors probably used "
-            "another method, so the SE cannot be recovered"
+            f"{scale} scale even allowing for the rounding of each printed number "
+            f"(estimate ±{h[0]:g}, lower ±{h[1]:g}, upper ±{h[2]:g}); the authors probably "
+            "used another method, so the SE cannot be recovered"
         )
     return None
 
 
 def _symmetric_within_rounding(
-    p: float, lo: float, hi: float, h: float, scale: es.ProbabilityScale
+    p: float, lo: float, hi: float, h: HalfUnits, scale: es.ProbabilityScale
 ) -> bool:
-    """Is g(U) + g(L) − 2 g(p) = 0 achievable with each number moved by ≤ h (rounding)?
+    """Is g(U) + g(L) − 2 g(p) = 0 achievable with each printed number moved within its own
+    rounding interval (p ± h_p, L ± h_L, U ± h_U)?
 
-    For increasing g the expression is increasing in U and L and decreasing in p, so its
-    range over the rounding box is spanned by the two corners below (reversed for
-    decreasing g such as log(−log p))."""
+    Each interval is intersected with the domain of the scale (``es.SCALE_DOMAINS``: [0, 1]
+    for the identity scale, (0, 1] for log, (0, 1) for logit and log(-log); an open end is
+    approached to within 1e-12). g is monotone,
+    so the expression is monotone in each argument and its range over the box is spanned by
+    the two opposite corners below (their roles swap for decreasing g, e.g. log(−log p))."""
     eps = 1e-12
+    dlo, dlo_in, dhi, dhi_in = es.SCALE_DOMAINS[scale]
+    lo_dom = dlo if dlo_in else dlo + eps
+    hi_dom = dhi if dhi_in else dhi - eps
 
     def g(x: float) -> float:
-        return es.to_scale(min(max(x, eps), 1 - eps), scale)
+        return es.to_scale(min(max(x, lo_dom), hi_dom), scale)
 
-    a = g(hi - h) + g(lo - h) - 2 * g(p + h)
-    b = g(hi + h) + g(lo + h) - 2 * g(p - h)
+    hp, hl, hu = h
+    a = g(hi - hu) + g(lo - hl) - 2 * g(p + hp)
+    b = g(hi + hu) + g(lo + hl) - 2 * g(p - hp)
     return min(a, b) <= 0.0 <= max(a, b)
 
 

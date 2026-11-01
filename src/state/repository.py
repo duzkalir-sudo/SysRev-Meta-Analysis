@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from sqlalchemy import Select, func, select, text
 from sqlalchemy.orm import Session
@@ -162,8 +162,31 @@ class Repository:
             project_id, Phase(project.phase), history=self.list_transitions(project_id)
         )
 
+    def apply_transition(
+        self,
+        project_id: str,
+        make: Callable[[PipelineStateMachine, GuardContext], StateTransition],
+    ) -> StateTransition:
+        """Evaluate and persist a transition atomically (Session 9 review, P1).
+
+        The write lock is taken *before* the authoritative phase is read and the guards are
+        evaluated, so no other session can commit a change between the check and the
+        recording: the guard context, the gate decision, the phase change and the Gate 3
+        fingerprint describe the same state (SQLite allows one writer; elsewhere the project
+        row is locked). ``make`` builds the transition from the machine and the context and
+        raises (``GuardViolationError``/``StateTransitionError``) when it is not allowed - in
+        that case nothing is stored. Callers commit the session afterwards."""
+        self.lock_project(project_id)
+        machine = self.load_state_machine(project_id)
+        transition = make(machine, self.build_guard_context(project_id))
+        self.record_transition(transition)
+        return transition
+
     def record_transition(self, transition: StateTransition) -> None:
-        """Persist a transition produced by the state machine and update the project phase."""
+        """Persist a transition produced by the state machine and update the project phase.
+
+        Production code uses :meth:`apply_transition`, which holds the write lock from the
+        guard evaluation to this recording."""
         project = self.get_project(transition.project_id)
         if project.phase != transition.from_phase.value:
             raise SysRevError(
@@ -189,6 +212,19 @@ class Repository:
         )
         project.phase = transition.to_phase.value
         self.session.flush()
+        if (
+            transition.from_phase == Phase.GATE3_EXTRACTION_APPROVAL
+            and transition.to_phase == Phase.STAGE5_META_ANALYSIS
+            and transition.gate_decision is not None
+        ):
+            # Session 9 (H2): record what this Gate 3 approval covers; Stage 5 → 6 refuses if
+            # those data differ later (e.g. after a write outside the application).
+            self.add_governance_record(
+                transition.project_id, "gate3_basis", transition.transition_id,
+                {"sha256": self.gate3_basis_sha256(transition.project_id),
+                 "transition_id": transition.transition_id},
+                reviewer_id=transition.gate_decision.reviewer_id,
+            )  # fmt: skip
 
     def list_transitions(self, project_id: str) -> list[StateTransition]:
         rows = self.session.scalars(
@@ -509,8 +545,9 @@ class Repository:
     # ------------------------------------------------------------------ screening
     def save_screening_decision(self, project_id: str, decision: ScreeningDecision) -> None:
         # Follow-up review, finding 3: full-text eligibility depends on title/abstract
-        # inclusion, so every screening decision is a Stage 5 input.
-        self.require_stats_inputs_open(project_id, f"a {decision.stage.value} screening decision")
+        # inclusion, so every screening decision is a Stage 5 input. Session 9 (H2): it is also
+        # Gate 3-approved data, so it is frozen from Stage 5 on.
+        self.require_gate3_open(project_id, f"a {decision.stage.value} screening decision")
         if decision.is_human:
             reviewer = self.require_active_reviewer(decision.reviewer_id)
             if decision.reviewer_identity != reviewer.display_name:
@@ -799,6 +836,8 @@ class Repository:
 
     # ------------------------------------------------------------------ full text
     def save_fulltext_item(self, project_id: str, item: FullTextItem) -> None:
+        # Session 9 (H3): the linked PDF and its identity are Gate 3-approved evidence.
+        self.require_gate3_open(project_id, "changing the full-text manifest or linked PDF")
         self._require_fulltext_humans(item)
         existing = self.session.scalars(
             select(FullTextItemORM).where(
@@ -841,7 +880,7 @@ class Repository:
 
     # ------------------------------------------------------------------ extraction
     def save_extracted_arm(self, project_id: str, arm: ExtractedStudyArm) -> None:
-        self.require_stats_inputs_open(project_id, "adding an extracted arm")
+        self.require_gate3_open(project_id, "adding an extracted arm")
         if self.session.get(ExtractedArmORM, arm.arm_id) is not None:
             raise SysRevError(
                 f"arm {arm.arm_id} already exists; corrections create a new arm version"
@@ -870,6 +909,7 @@ class Repository:
                     value=value.value,
                     reported_text=value.reported_text,
                     unit=value.unit,
+                    number_format=value.number_format,
                     evidence=evidence,
                 )
             )
@@ -882,7 +922,7 @@ class Repository:
         row = self.session.get(ExtractedArmORM, arm_id)
         if row is None:
             raise NotFoundError(f"arm {arm_id} not found")
-        self.require_stats_inputs_open(row.project_id, "approving an extracted arm")
+        self.require_gate3_open(row.project_id, "approving an extracted arm")
         arm = self._arm_from_row(row)
         approved = arm.model_copy(
             update={
@@ -926,7 +966,7 @@ class Repository:
             raise NotFoundError(f"arm {arm_id} not found")
         if arm_id in self.invalidated_arm_ids(project_id):
             return
-        self.require_stats_inputs_open(project_id, "invalidating an extracted arm")
+        self.require_gate3_open(project_id, "invalidating an extracted arm")
         self.add_governance_record(
             project_id, "arm_invalidation", arm_id,
             {"arm_id": arm_id, "record_id": row.record_id, "outcome_id": row.outcome_id,
@@ -956,6 +996,29 @@ class Repository:
             raise SysRevError(
                 f"{what} would change the inputs of the verified statistics, which cannot be "
                 f"recomputed in {phase} (no route back to Stage 5); nothing was changed"
+            )
+
+    POST_GATE3 = (
+        Phase.STAGE5_META_ANALYSIS.value,
+        Phase.STAGE6_MANUSCRIPT.value,
+        Phase.STAGE6_AUDIT.value,
+        Phase.COMPLETED.value,
+    )
+
+    def require_gate3_open(self, project_id: str, what: str) -> None:
+        """Session 9 (H2): the data a human approved at Gate 3 — screening decisions, the
+        full-text manifest and linked PDFs, extraction items, arms and risk of bias — are
+        frozen once the project has passed Gate 3. The state machine has no route back to
+        Stage 4, so a change would bypass the Gate 3 review; it is refused *before anything
+        is written*. Report-to-study links, double-counting decisions, quantitative
+        unavailability and analysis-plan revisions stay possible in Stage 5 (they only
+        require Stage 5 to be re-run, and Stage 5 → 6 re-checks the Gate 3 conditions)."""
+        phase = self.locked_phase(project_id)
+        if phase in self.POST_GATE3:
+            raise SysRevError(
+                f"{what} would change data approved at Gate 3, but the project is in {phase} "
+                "and the pipeline has no route back to Stage 4 for a renewed Gate 3 review; "
+                "nothing was changed"
             )
 
     def load_extracted_arms(
@@ -1028,11 +1091,13 @@ class Repository:
                 value=v.value,
                 reported_text=v.reported_text,
                 unit=v.unit,
+                number_format=v.number_format,  # type: ignore[arg-type]
                 evidence=SourceEvidence.model_validate(self._evidence_dict(v.evidence)),
             )
         return ExtractedStudyArm.model_validate(data)
 
     def save_rob(self, project_id: str, assessment: RiskOfBiasAssessment) -> None:
+        self.require_gate3_open(project_id, "a risk-of-bias assessment")
         if assessment.approved_by_human:
             reviewer = self.require_active_reviewer(assessment.approved_reviewer_id)
             if assessment.approved_by != reviewer.display_name:
@@ -1140,6 +1205,7 @@ class Repository:
         original_filename: str | None = None,
         recorded_by: str | None = None,
     ) -> None:
+        self.require_gate3_open(project_id, "linking a full-text document")
         exists = self.session.scalars(
             select(FullTextDocumentORM).where(
                 FullTextDocumentORM.project_id == project_id,
@@ -1178,6 +1244,7 @@ class Repository:
 
     # master extraction table
     def save_extraction_item(self, project_id: str, item: ExtractionItem) -> None:
+        self.require_gate3_open(project_id, "changing the Master Extraction Table")
         row = self.session.get(ExtractionItemORM, item.item_id)
         if row is None:
             row = ExtractionItemORM(id=item.item_id, project_id=project_id)
@@ -1202,6 +1269,7 @@ class Repository:
         """Mark an accepted/rejected item superseded by a correction (Session 8). Only the
         review status and its stamps change; the earlier payload is kept in the append-only
         review event written by the caller."""
+        self.require_gate3_open(project_id, "superseding an extraction item")
         row = self.session.get(ExtractionItemORM, superseded.item_id)
         if row is None or row.project_id != project_id:
             raise NotFoundError(f"extraction item {superseded.item_id} not found")
@@ -2488,7 +2556,24 @@ class Repository:
                     "records"
                 )
 
+        from src.extraction.master_table import (
+            arm_representation_problems,
+            source_and_format_problems,
+        )
         from src.search.amendments import amendment_problems
+
+        integrity = arm_representation_problems(
+            self, project_id, ft_included
+        ) + source_and_format_problems(self, project_id, ft_included)
+        gate3_basis_problems: list[str] = []
+        if project.phase in self.POST_GATE3:
+            basis = self.governance_records(project_id, "gate3_basis")
+            if basis and basis[-1].get("sha256") != self.gate3_basis_sha256(project_id):
+                gate3_basis_problems.append(
+                    "the screening decisions, full-text manifest, extraction items, arms or "
+                    "risk-of-bias assessments differ from those approved at Gate 3; the "
+                    "approval no longer covers the current data"
+                )
 
         audit = self.latest_audit_report(project_id)
         audit_problems: tuple[str, ...] = ()
@@ -2536,6 +2621,40 @@ class Repository:
             audit_passed=None if audit is None else audit.passed,
             audit_problems=audit_problems,
             amendment_problems=tuple(amendment_problems(self, project_id)),
+            extraction_integrity_problems=tuple(integrity),
+            gate3_basis_problems=tuple(gate3_basis_problems),
+        )
+
+    def gate3_basis_sha256(self, project_id: str) -> str:
+        """Session 9 (H2): fingerprint of the data a human approves at Gate 3 — screening
+        decisions, the full-text manifest (linked PDFs and identity confirmations), every
+        extraction item version, the active arms and arm invalidations, and risk-of-bias
+        assessments. Report-to-study links, double-counting decisions and quantitative
+        unavailability are excluded: they may change in Stage 5 (Stage 5 is then re-run)."""
+        from src.core.schemas.stats import canonical_sha256
+
+        decisions = sorted(
+            (d.model_dump(mode="json") for d in self.load_screening_decisions(project_id)),
+            key=lambda d: str(d["decision_id"]),
+        )
+        return canonical_sha256(
+            {
+                "screening_decisions": decisions,
+                "fulltext": sorted(
+                    (i.model_dump(mode="json") for i in self.load_fulltext_items(project_id)),
+                    key=lambda d: str(d["record_id"]),
+                ),
+                "extraction_items": sorted(
+                    (
+                        i.model_dump(mode="json")
+                        for i in self.load_extraction_items(project_id, include_superseded=True)
+                    ),
+                    key=lambda d: str(d["item_id"]),
+                ),
+                "arms": [a.model_dump(mode="json") for a in self.load_extracted_arms(project_id)],
+                "invalidated_arms": sorted(self.invalidated_arm_ids(project_id)),
+                "rob": [a.model_dump(mode="json") for a in self.load_rob(project_id)],
+            }
         )
 
     def _authenticated_approval(self, protocol: PICOProtocol) -> bool:

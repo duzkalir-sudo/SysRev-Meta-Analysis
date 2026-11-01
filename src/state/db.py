@@ -244,6 +244,8 @@ class ExtractedValueORM(Base):
     value: Mapped[float] = mapped_column(Float)
     reported_text: Mapped[str] = mapped_column(Text)
     unit: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Session 9 (M5): recorded reading of an ambiguous printed number (None = default rules)
+    number_format: Mapped[str | None] = mapped_column(String(20), nullable=True)
     evidence_id: Mapped[str] = mapped_column(ForeignKey("source_evidence.id"), nullable=False)
 
     arm: Mapped[ExtractedArmORM] = relationship(back_populates="values")
@@ -768,8 +770,24 @@ def prepare_sqlite_path(url: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
+# Nullable columns added after a table was first released. ``create_all`` never alters an
+# existing table, so a database created by an earlier version gets them here; existing rows
+# keep NULL, i.e. no recorded interpretation (Session 9, M5).
+ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("extracted_values", "number_format", "VARCHAR(20)"),
+)
+
+
 def init_db(engine: Engine) -> None:
     Base.metadata.create_all(engine)
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table, column, ddl in ADDED_COLUMNS:
+            existing = {c["name"] for c in inspector.get_columns(table)}
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
 
 
 def make_session_factory(engine: Engine) -> sessionmaker[Session]:

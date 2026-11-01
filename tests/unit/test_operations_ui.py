@@ -475,3 +475,98 @@ def test_plan_approval_from_a_screen_of_the_old_protocol_is_refused_until_reload
     click(at, "Approve this draft (authenticated)")
     assert any("Plan approved" in m for m in successes(at)), errors(at)
     assert plan_obligation() == "resolved"
+
+
+# --------------------------------------------------------------------------- Session 9 (M5)
+def test_correction_screen_shows_verbatim_text_and_interpreted_value(stage4: Env) -> None:
+    import json
+
+    at = stage4.app("Corrections, links & double counting")
+    shown = [json.loads(j.value) if isinstance(j.value, str) else j.value for j in at.json]
+    detail = next(d for d in shown if isinstance(d, dict) and "as printed" in d)
+    assert detail["as printed"] == "62.1" and detail["interpreted value"] == 62.1
+    assert detail["number format"] == "default reading" and detail["format status"] == "ok"
+    (fmt,) = [w for w in at.selectbox if w.label.startswith("Number format of the source")]
+    assert "thousands_comma" in fmt.options and "decimal_comma" in fmt.options
+
+
+# --------------------------------------------------------------------------- Session 9 review P1
+def _replace_in_other_session(stage4: Env, data: bytes, name: str) -> str:
+    """Another reviewer's session links a different PDF to r1; returns its hash."""
+    from src.fulltext import register_upload
+    from src.fulltext.storage import DocumentStore
+
+    with stage4.other() as s:
+        repo = Repository(s)
+        current = repo.get_fulltext_item(PID, "r1")
+        assert current is not None
+        replaced = register_upload(
+            repo, DocumentStore(Path(get_settings().data_dir) / "fulltext"), PID, "r1", data,
+            original_filename=name, reviewer=repo.require_active_reviewer(stage4.rid),
+            replaces_sha256=current.pdf_sha256,
+        )  # fmt: skip
+        s.commit()
+        assert replaced.pdf_sha256 is not None
+        return replaced.pdf_sha256
+
+
+def _linked(stage4: Env) -> Any:
+    with stage4.other() as s:
+        item = Repository(s).get_fulltext_item(PID, "r1")
+        assert item is not None
+        return item
+
+
+def test_pdf_confirmation_is_bound_to_the_pdf_the_reviewer_saw(stage4: Env) -> None:
+    from src.core.enums import UploadMatchStatus
+    from tests.fixtures.pdf_factory import synthetic_article
+
+    at = stage4.app("Full text & extraction")
+    widget(at, "text_input", "Record ID whose PDF identity you confirm").input("r1")
+    widget(at, "text_input", "Note").input("title page and DOI checked")
+    other = synthetic_article(title="Another synthetic report", doi="10.5555/other.0002")
+    b_sha = _replace_in_other_session(stage4, other, "b.pdf")
+    assert _linked(stage4).match_unconfirmed  # B's identity is not confirmed
+    click(at, "Confirm PDF identity (authenticated)")
+    assert any("has changed" in e for e in errors(at)), errors(at)
+    item = _linked(stage4)
+    assert item.pdf_sha256 == b_sha and item.match_status != UploadMatchStatus.HUMAN_CONFIRMED
+    # control: an explicit reload shows B; a renewed review of B can then be confirmed
+    click(at, "Reload the current state")
+    widget(at, "text_input", "Record ID whose PDF identity you confirm").input("r1")
+    widget(at, "text_input", "Note").input("B examined after reload")
+    click(at, "Confirm PDF identity (authenticated)")
+    assert any("PDF identity confirmed" in m for m in successes(at)), errors(at)
+    item = _linked(stage4)
+    assert item.pdf_sha256 == b_sha and item.match_status == UploadMatchStatus.HUMAN_CONFIRMED
+
+
+def test_pdf_replacement_upload_is_bound_to_the_pdf_the_reviewer_saw(stage4: Env) -> None:
+    from tests.fixtures.pdf_factory import synthetic_article
+
+    base = synthetic_article()
+    mine, theirs = base + b"\n% my revision\n", base + b"\n% their revision\n"
+    at = stage4.app("Full text & extraction")
+    widget(at, "text_input", "Record ID for PDF upload").input("r1")
+    at.file_uploader[0].set_value(("mine.pdf", mine, "application/pdf"))
+    theirs_sha = _replace_in_other_session(stage4, theirs, "theirs.pdf")
+    click(at, "Upload (authenticated)")
+    assert any("has changed" in e for e in errors(at)), errors(at)
+    assert _linked(stage4).pdf_sha256 == theirs_sha  # nothing replaced from the old screen
+    # control: after an explicit reload the replacement names the PDF now shown
+    click(at, "Reload the current state")
+    widget(at, "text_input", "Record ID for PDF upload").input("r1")
+    at.file_uploader[0].set_value(("mine.pdf", mine, "application/pdf"))
+    click(at, "Upload (authenticated)")
+    assert any("PDF stored" in m for m in successes(at)), errors(at)
+    assert _linked(stage4).pdf_sha256 not in (theirs_sha, None)
+
+
+def test_upload_headers_use_the_displayed_hash_only() -> None:
+    from src.ui.frozen import upload_headers
+
+    assert upload_headers("a.pdf", None) == {"X-Filename": "a.pdf"}
+    assert upload_headers("a.pdf", "f" * 64) == {
+        "X-Filename": "a.pdf",
+        "X-Replaces-SHA256": "f" * 64,
+    }

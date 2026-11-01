@@ -300,7 +300,10 @@ def test_changed_risk_of_bias_makes_the_assessment_stale(session: Session) -> No
     assert svc.audit().passed
     high = approved_rob("t1", rid, name=REVIEWER).model_copy(update={"overall": "high"})
     assert high.tool == RoBTool.ROB2
-    repo.save_rob("mc1", high)
+    with pytest.raises(SysRevError, match="approved at Gate 3"):  # Session 9 (H2)
+        repo.save_rob("mc1", high)
+    with out_of_band(repo, "mc1"):  # a change written outside the application is detected
+        repo.save_rob("mc1", high)
     package = build_evidence_package(repo, "mc1")
     assert package.reporting is not None and package.reporting.grade["comp"].status == "stale"
     assert "grade.comp.statement" not in package.facts  # a stale rating is never reported

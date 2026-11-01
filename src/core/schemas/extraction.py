@@ -5,9 +5,15 @@ from __future__ import annotations
 import math
 import re
 from itertools import pairwise
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from src.core.enums import (
     ActorType,
@@ -165,36 +171,198 @@ class FullTextItem(StrictModel):
 _WS_RE = re.compile(r"\s+")
 _THOUSANDS_RE = re.compile(r"^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$")
 
+# How a printed number is read (Session 9, M5). The default reading uses the decimal point
+# (or the Lancet mid-dot); a comma is read unambiguously wherever only one reading exists.
+NumberFormat = Literal["decimal_point", "decimal_comma", "thousands_comma", "thousands_point"]
+NUMBER_FORMATS: tuple[NumberFormat, ...] = (
+    "decimal_point",
+    "decimal_comma",
+    "thousands_comma",
+    "thousands_point",
+)
+NumberFormatStatus = Literal[
+    "ok",  # unambiguous, read by the default rules
+    "interpreted",  # an explicit, recorded interpretation was applied
+    "ambiguous_uninterpreted",  # several readings are possible and none was recorded
+    "legacy_reading_differs",  # stored with the pre-Session-9 reading, which is now refused
+]
+
+
+class AmbiguousNumberError(ValueError):
+    """A printed number has more than one admissible reading (e.g. ``1,250``)."""
+
+    def __init__(self, text: str, readings: dict[NumberFormat, float]) -> None:
+        self.text = text
+        self.readings = dict(readings)
+        options = "; ".join(f"{k} → {v:g}" for k, v in readings.items())
+        super().__init__(
+            f"{text!r} is ambiguous ({options}); record the number format the source uses"
+        )
+
+
+_DIGITS = re.compile(r"^\d+$")
+
 
 def _squash(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
-def parse_reported_number(text: str) -> float:
+def _clean_number(text: str) -> str:
+    cleaned = (
+        text.strip()
+        .replace("\u2212", "-")  # Unicode minus
+        .replace("\u2013", "-")  # en dash used as a minus
+        .replace("\u00b7", ".")  # Lancet mid-dot decimal
+    )
+    for space in (" ", "\u2009", "\u00a0", "\u202f"):  # thin / no-break spaces
+        cleaned = cleaned.replace(space, "")
+    return cleaned.rstrip("%")
+
+
+def _grouped(body: str, sep: str) -> bool:
+    """``1,234`` / ``12.345.678``: a first group of 1-3 digits (not starting with 0 unless it
+    is the only digit... which never forms a group) followed by groups of exactly 3 digits."""
+    groups = body.split(sep)
+    head = groups[0]
+    return (
+        len(groups) >= 2
+        and 1 <= len(head) <= 3
+        and _DIGITS.match(head) is not None
+        and not head.startswith("0")
+        and all(len(g) == 3 and _DIGITS.match(g) for g in groups[1:])
+    )
+
+
+def number_readings(text: str) -> dict[NumberFormat, float]:
+    """Every admissible reading of a printed number (one entry when it is unambiguous).
+
+    Rules (no arithmetic beyond reading the digits):
+
+    * no comma: decimal point (``12.5``, ``12·5``); dot-grouped integers with two or more
+      groups (``1.234.567``) are thousands;
+    * one comma: decimal comma unless the comma is followed by exactly three digits *and*
+      preceded by a 1-3 digit group not starting with 0 — ``12,5``, ``0,500`` and ``1234,567``
+      are decimal commas; ``1,250`` is ambiguous (thousands or decimal comma);
+    * several comma groups (``1,234,567``) are thousands; ``1,234.5`` is a thousands comma
+      with a decimal point; ``1.234,5`` is a thousands dot with a decimal comma.
+
+    A single dot followed by three digits (``1.234``) is read with the decimal point, the
+    convention of this project; a reviewer can record ``thousands_point`` for a source that
+    groups thousands with dots.
+    """
+    cleaned = _clean_number(text)
+    sign = ""
+    if cleaned[:1] in "+-":
+        sign, cleaned = cleaned[0], cleaned[1:]
+    if not cleaned:
+        raise ValueError(f"not a number: {text!r}")
+
+    def num(body: str) -> float:
+        value = float(sign + body)
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite number: {text!r}")
+        return value
+
+    out: dict[NumberFormat, float] = {}
+    has_comma, has_dot = "," in cleaned, "." in cleaned
+    if has_comma and has_dot:
+        int_part, _, frac = cleaned.rpartition(".")
+        if _grouped(int_part, ",") and _DIGITS.match(frac):  # 1,234.5
+            out["thousands_comma"] = num(int_part.replace(",", "") + "." + frac)
+        int_part, _, frac = cleaned.rpartition(",")
+        if _grouped(int_part, ".") and _DIGITS.match(frac):  # 1.234,5
+            out["decimal_comma"] = num(int_part.replace(".", "") + "." + frac)
+    elif has_comma:
+        if cleaned.count(",") == 1:
+            head, tail = cleaned.split(",")
+            if _DIGITS.match(head) and _DIGITS.match(tail):
+                out["decimal_comma"] = num(head + "." + tail)
+                if _grouped(cleaned, ","):
+                    out["thousands_comma"] = num(head + tail)
+        elif _grouped(cleaned, ","):
+            out["thousands_comma"] = num(cleaned.replace(",", ""))
+    elif has_dot and cleaned.count(".") > 1:
+        if _grouped(cleaned, "."):
+            out["thousands_point"] = num(cleaned.replace(".", ""))
+    else:
+        if not re.match(r"^(\d+(\.\d*)?|\.\d+)(e[+-]?\d+)?$", cleaned, re.IGNORECASE):
+            raise ValueError(f"not a number: {text!r}")
+        out["decimal_point"] = num(cleaned)
+        if has_dot and _grouped(cleaned, "."):  # "1.234" may be dot-grouped thousands
+            out["thousands_point"] = num(cleaned.replace(".", ""))
+    if not out:
+        raise ValueError(f"not a printed number: {text!r}")
+    return out
+
+
+def default_reading(readings: dict[NumberFormat, float]) -> NumberFormat | None:
+    """The reading used without an explicit interpretation (``None``: ambiguous)."""
+    if "decimal_point" in readings:
+        return "decimal_point"  # project convention, see number_readings
+    return next(iter(readings)) if len(readings) == 1 else None
+
+
+def parse_reported_number(text: str, number_format: NumberFormat | None = None) -> float:
     """Parse a number exactly as typeset in a paper.
 
     Handles the Unicode minus (U+2212), the Lancet-style mid-dot decimal (U+00B7),
-    thin/no-break spaces, thousands separators (``1,234``) and a lone decimal
-    comma (``12,5``). Raises ``ValueError`` for anything else. Performs no arithmetic.
+    thin/no-break spaces, thousands separators and decimal commas (see
+    :func:`number_readings`). A genuinely ambiguous token such as ``1,250`` raises
+    :class:`AmbiguousNumberError` unless ``number_format`` records how the source writes
+    numbers; a ``number_format`` that is not an admissible reading raises ``ValueError``.
+    Performs no arithmetic.
     """
-    cleaned = (
-        text.strip()
-        .replace("−", "-")
-        .replace("–", "-")
-        .replace("·", ".")
-        .replace(" ", "")
-        .replace(" ", "")
-        .replace(" ", "")
-    )
-    cleaned = cleaned.rstrip("%")
+    readings = number_readings(text)
+    if number_format is not None:
+        if number_format not in readings:
+            raise ValueError(
+                f"{text!r} cannot be read as {number_format} (admissible: {sorted(readings)})"
+            )
+        return readings[number_format]
+    chosen = default_reading(readings)
+    if chosen is None:
+        raise AmbiguousNumberError(text, readings)
+    return readings[chosen]
+
+
+def legacy_parse_reported_number(text: str) -> float | None:
+    """The reading applied before Session 9 (``None`` if it refused the text). Used only to
+    recognise historical rows; never to create new values."""
+    cleaned = _clean_number(text)
     if _THOUSANDS_RE.match(cleaned):
         cleaned = cleaned.replace(",", "")
     elif cleaned.count(",") == 1 and "." not in cleaned:
         cleaned = cleaned.replace(",", ".")
-    value = float(cleaned)
-    if not math.isfinite(value):
-        raise ValueError(f"non-finite number: {text!r}")
-    return value
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def number_format_status(
+    text: str, value: float, number_format: NumberFormat | None
+) -> NumberFormatStatus:
+    """How ``value`` relates to the printed ``text`` (raises if it is no reading at all)."""
+    readings = number_readings(text)
+    if number_format is not None:
+        if number_format not in readings or not _close(readings[number_format], value):
+            raise ValueError(f"value {value} is not the {number_format} reading of {text!r}")
+        return "interpreted"
+    chosen = default_reading(readings)
+    if chosen is not None and _close(readings[chosen], value):
+        return "ok"
+    legacy = legacy_parse_reported_number(text)
+    if legacy is not None and _close(legacy, value):
+        return "legacy_reading_differs" if chosen is not None else "ambiguous_uninterpreted"
+    raise ValueError(
+        f"value {value} differs from reported_text {text!r}; derived values must be computed "
+        "by the stats engine, not extracted"
+    )
+
+
+def _close(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-12)
 
 
 class SourceEvidence(FrozenModel):
@@ -231,6 +399,8 @@ class ExtractedValue(FrozenModel):
     reported_text: NonEmptyStr
     unit: str | None = None
     evidence: SourceEvidence
+    # Session 9 (M5): the recorded reading of an ambiguous printed number (e.g. "1,250").
+    number_format: NumberFormat | None = None
 
     @model_validator(mode="after")
     def _grounded(self) -> ExtractedValue:
@@ -241,15 +411,28 @@ class ExtractedValue(FrozenModel):
                 f"reported_text {self.reported_text!r} does not occur in the verbatim quote"
             )
         try:
-            parsed = parse_reported_number(self.reported_text)
+            number_readings(self.reported_text)
         except ValueError as exc:
             raise ValueError(f"reported_text {self.reported_text!r} is not a number") from exc
-        if not math.isclose(parsed, self.value, rel_tol=1e-12, abs_tol=1e-12):
-            raise ValueError(
-                f"value {self.value} differs from reported_text {self.reported_text!r}; "
-                "derived values must be computed by the stats engine, not extracted"
-            )
+        # value must be the default reading, the recorded reading, or - for rows stored
+        # before Session 9 only - the old reading, which is then reported as a problem
+        # (number_format_status) instead of being silently reinterpreted.
+        number_format_status(self.reported_text, self.value, self.number_format)
         return self
+
+    @property
+    def format_status(self) -> NumberFormatStatus:
+        return number_format_status(self.reported_text, self.value, self.number_format)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_format(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Session 9 review (P1): ``number_format`` is serialised only when a reading was
+        recorded, so values stored before Session 9 serialise - and hash (statistics input
+        fingerprints, evidence fingerprints) - exactly as before the upgrade."""
+        data: dict[str, Any] = handler(self)
+        if self.number_format is None:
+            data.pop("number_format", None)
+        return data
 
 
 _NUMERIC_FIELDS = (

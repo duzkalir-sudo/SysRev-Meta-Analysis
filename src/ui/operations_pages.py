@@ -25,6 +25,7 @@ from typing import Any
 import streamlit as st
 
 from src.core.enums import ComparisonType, EffectMeasure, StudyDesign
+from src.core.schemas.extraction import NUMBER_FORMATS
 from src.core.schemas.protocol import ALLOWED_MEASURES
 from src.llm.credentials import CredentialResolver
 from src.ui import frozen as fz
@@ -324,7 +325,11 @@ def _correction(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
     ev = item.get("evidence") or {}
     st.write(
         {
+            # Session 9 (M5): the verbatim text and the value it was read as, side by side
             "as printed": item.get("reported_text"),
+            "interpreted value": item.get("value"),
+            "number format": item.get("number_format") or "default reading",
+            "format status": item.get("format_status"),
             "status": item["data_status"],
             "review": item["review_status"],
             "reviewed by": item.get("reviewed_by"),
@@ -352,6 +357,13 @@ def _correction(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
             "Data status", DATA_STATUSES, index=DATA_STATUSES.index(item["data_status"])
         )
         text = st.text_input("Number exactly as printed", item.get("reported_text") or "")
+        formats = ["default reading", *NUMBER_FORMATS]
+        fmt_choice = st.selectbox(
+            "Number format of the source (required for ambiguous forms such as 1,250; explain "
+            "the source context in the reason)",
+            formats,
+            index=formats.index(item.get("number_format") or "default reading"),
+        )
         page = st.number_input(
             "PDF page (physical, 1-based)", min_value=1, value=int(ev.get("page_number") or 1)
         )
@@ -370,6 +382,7 @@ def _correction(be: UIBackend, pid: str, token: str | None, show: Show) -> None:
             correction = {k: item[k] for k in CORRECTION_COPY if item.get(k) is not None} | {
                 "data_status": status,
                 "reported_text": text or None,
+                "number_format": None if fmt_choice == "default reading" else fmt_choice,
                 "page": int(page),
                 "location_type": loc_type,
                 "location_id": loc_id or None,

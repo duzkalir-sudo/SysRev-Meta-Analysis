@@ -36,7 +36,7 @@ from tests.conftest import make_arm, make_evidence, make_value
         ("12.5", 12.5),
         ("12·5", 12.5),
         ("−3.2", -3.2),
-        ("1,234", 1234.0),
+        ("1,234,567", 1234567.0),  # several comma groups: thousands (Session 9, M5)
         ("1,234.5", 1234.5),
         ("12,5", 12.5),
         ("45%", 45.0),

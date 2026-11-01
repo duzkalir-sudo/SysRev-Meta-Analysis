@@ -48,6 +48,24 @@ def _check_counts(events: int, n: int) -> None:
         raise EstimationError(f"invalid counts: {events} events out of {n}")
 
 
+def enters_mantel_haenszel(measure: Literal["RR", "OR"], a: int, n1: int, c: int, n2: int) -> bool:
+    """Whether a 2×2 table enters the Mantel-Haenszel sums (Session 9 review, P2/N1).
+
+    The Mantel-Haenszel estimators are ratios of sums over *all* tables (Mantel & Haenszel
+    1959; Greenland & Robins 1985), which is what ``metafor::rma.mh`` computes: its
+    ``drop00`` applies only to the study-level ``escalc`` outcomes. A double-zero table
+    contributes nothing to any sum, nor does a double-all-event table to the OR sums
+    (b = d = 0), so they are left out with identical results. A double-all-event table does
+    contribute to the RR sums (aᵢn₂ᵢ/Nᵢ = cᵢn₁ᵢ/Nᵢ = n₁ᵢn₂ᵢ/Nᵢ) and is kept, although it has
+    no study-level log RR or variance and therefore stays out of every inverse-variance model.
+    """
+    if a == 0 and c == 0:
+        return False
+    if a == n1 and c == n2:
+        return measure == "RR"
+    return True
+
+
 def log_ratio(measure: Literal["RR", "OR"], a: int, n1: int, c: int, n2: int) -> StudyEstimate:
     """Log RR or log OR for intervention (a/n1) versus control (c/n2)."""
     _check_counts(a, n1)
@@ -129,10 +147,37 @@ def expit(x: float) -> float:
 # --------------------------------------------------------------------------- probabilities at t
 
 
+# Domain of each declared CI scale for a probability p (Session 9, M1 and review P2):
+# identity g(p) = p on [0, 1]; log(p) on (0, 1] (log 1 = 0 is defined); logit and
+# log(-log p) only on the open (0, 1).
+SCALE_DOMAINS: dict[str, tuple[float, bool, float, bool]] = {
+    # scale: (lower bound, lower included, upper bound, upper included)
+    "plain": (0.0, True, 1.0, True),
+    "log": (0.0, False, 1.0, True),
+    "logit": (0.0, False, 1.0, False),
+    "log_log": (0.0, False, 1.0, False),
+}
+
+
+def scale_domain_contains(p: float, scale: ProbabilityScale) -> bool:
+    """Whether ``p`` can be expressed on ``scale`` (see ``SCALE_DOMAINS``)."""
+    lo, lo_in, hi, hi_in = SCALE_DOMAINS[scale]
+    above = p >= lo if lo_in else p > lo
+    below = p <= hi if hi_in else p < hi
+    return above and below
+
+
+def scale_domain_text(scale: ProbabilityScale) -> str:
+    lo, lo_in, hi, hi_in = SCALE_DOMAINS[scale]
+    return f"{'[' if lo_in else '('}{lo:g}, {hi:g}{']' if hi_in else ')'}"
+
+
 def to_scale(p: float, scale: ProbabilityScale) -> float:
-    """Transform a probability in (0, 1) to the declared CI scale."""
-    if not 0.0 < p < 1.0:
-        raise EstimationError(f"probability {p} is at or outside the boundary (0, 1)")
+    """Transform a probability to the declared CI scale (``SCALE_DOMAINS``)."""
+    if not scale_domain_contains(p, scale):
+        raise EstimationError(
+            f"probability {p} is outside the domain {scale_domain_text(scale)} of the {scale} scale"
+        )
     if scale == "log_log":
         return math.log(-math.log(p))
     if scale == "log":

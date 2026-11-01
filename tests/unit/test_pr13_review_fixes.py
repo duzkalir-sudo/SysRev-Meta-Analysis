@@ -93,6 +93,7 @@ class Proj:
         return parse_pdf(data, filename=ft.pdf_filename, expected_sha256=ft.pdf_sha256)
 
     def upload(self, record_id: str, data: bytes, name: str) -> None:
+        current = self.repo.get_fulltext_item(PID, record_id)
         item = register_upload(
             self.repo,
             self.store,
@@ -101,6 +102,8 @@ class Proj:
             data,
             original_filename=name,
             reviewer=self.reviewer,
+            # Session 9 (H3): a replacement names the PDF shown as currently linked
+            replaces_sha256=current.pdf_sha256 if current is not None else None,
         )
         if item.match_unconfirmed:
             confirm_pdf_match(self.repo, PID, record_id, reviewer=self.reviewer, note="checked")
@@ -226,9 +229,13 @@ def test_f1_reviewed_correction_refused_after_replacement_or_reconfirmation(
             expected_state_sha256=shown,
         )
     assert counts(p.repo) == before
-    # (b) the PDF is replaced
+    # (b) the PDF is replaced; since Session 9 (H3) the replacement itself invalidates the
+    # report's arm, recorded with the replacement
     shown = correction_state_sha256(p.repo, PID, item)
     p.upload("r1", REVISED_PDF, "revised.pdf")
+    replaced = p.repo.governance_records(PID, "arm_invalidation")
+    assert [r["kind"] for r in replaced] == ["source_replaced"]
+    before = counts(p.repo)
     with pytest.raises(StaleStateError, match="has changed"):
         revise_reviewed_item(
             p.repo,
@@ -256,7 +263,8 @@ def test_f1_reviewed_correction_refused_after_replacement_or_reconfirmation(
     )
     ft = p.repo.get_fulltext_item(PID, "r1")
     assert ft is not None and new.evidence is not None
-    assert new.evidence.pdf_sha256 == ft.pdf_sha256 and invalidated
+    # the arm was already invalidated by the replacement, so nothing further to invalidate
+    assert new.evidence.pdf_sha256 == ft.pdf_sha256 and invalidated == []
 
 
 def test_f1_http_correction_from_an_old_screen_returns_409_and_stores_nothing() -> None:
@@ -669,7 +677,9 @@ def test_f5_late_changes_to_statistics_inputs_are_refused_before_writing(
         ),
     ]
     for attempt in attempts:
-        with pytest.raises(SysRevError, match="cannot be recomputed"):
+        # the eligibility decision is now refused as a change to Gate 3-approved data
+        # (Session 9, H2); both refusals happen before anything is written
+        with pytest.raises(SysRevError, match=r"cannot be recomputed|approved at Gate 3"):
             attempt()
     assert [x.model_dump(mode="json") for x in repo.load_study_links("mc1")] == links_before
     assert repo.governance_records("mc1", "study_link") == history_before

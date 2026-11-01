@@ -26,7 +26,13 @@ from src.core.enums import (
     EvidenceLocationType,
     ExtractionDomain,
 )
-from src.core.schemas.extraction import SourceEvidence, parse_reported_number
+from src.core.schemas.extraction import (
+    AmbiguousNumberError,
+    NumberFormat,
+    SourceEvidence,
+    number_readings,
+    parse_reported_number,
+)
 from src.core.schemas.master import ExtractionItem
 from src.core.schemas.protocol import FollowUpTimepoint, PICOProtocol
 from src.llm.provider import LLMConfig, LLMProvider, LLMRequest, parse_json_object
@@ -57,6 +63,9 @@ class ProposedValue(BaseModel):
     ci_level: float | None = None
     data_status: Literal["reported", "not_reported", "ambiguous", "contradictory", "inaccessible"]
     reported_text: str | None = None
+    # Session 9 (M5): how the source writes numbers, required for an ambiguous token such as
+    # "1,250" (thousands or decimal comma); explain the source context in ``note``.
+    number_format: NumberFormat | None = None
     unit: str | None = None
     text_value: str | None = None
     page: int | None = Field(default=None, ge=1)
@@ -127,10 +136,32 @@ def proposal_to_item(
         elif proposal.value_kind == "numeric":
             text = proposal.reported_text or ""
             try:
-                value = parse_reported_number(text)
-            except ValueError:
+                value = parse_reported_number(text, proposal.number_format)
+            except AmbiguousNumberError as exc:
+                # Session 9 (M5): never guess between readings such as 1,250 = 1250 / 1.25.
                 status = DataStatus.AMBIGUOUS
-                flags.append(f"reported_text {text!r} is not a single printed number")
+                flags.append(
+                    f"ambiguous number format: {exc}; correct the item with number_format "
+                    "and a note citing the source context"
+                )
+            except ValueError as exc:
+                status = DataStatus.AMBIGUOUS
+                flags.append(
+                    f"reported_text {text!r} is not a single printed number"
+                    + (f" in the format {proposal.number_format}" if proposal.number_format else "")
+                    + f" ({exc})"
+                )
+            else:
+                readings = number_readings(text)
+                if proposal.number_format is not None and len(readings) > 1:
+                    flags.append(
+                        f"ambiguous number {text!r} read as {proposal.number_format} "
+                        f"(value {value:g}; other readings: "
+                        + ", ".join(
+                            f"{k} {v:g}" for k, v in readings.items() if k != proposal.number_format
+                        )
+                        + "); acceptance needs a note citing the source context"
+                    )
             if status == DataStatus.REPORTED and not number_in_text(text, evidence.verbatim_quote):
                 status, value = DataStatus.AMBIGUOUS, None
                 flags.append(f"{text!r} does not appear as a number in the quote")
@@ -167,6 +198,7 @@ def proposal_to_item(
         "data_status": status,
         "reported_text": proposal.reported_text,
         "value": value,
+        "number_format": proposal.number_format if value is not None else None,
         "unit": proposal.unit,
         "text_value": proposal.text_value,
         "evidence": evidence,

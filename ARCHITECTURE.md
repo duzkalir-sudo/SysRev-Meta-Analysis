@@ -130,9 +130,9 @@ even if no `ScreeningConflict` row was ever saved.
 | Gate 1.5 → Stage 3 | As above, plus 0 unresolved title/abstract disagreements; 0 unresolved possible-duplicate pairs; 0 unresolved cohort-overlap warnings; PRISMA shows 0 records awaiting screening; ≥1 record included |
 | Stage 3 → Gate 2 | **Every title/abstract-included record has a full-text manifest entry** |
 | Gate 2 → Stage 4 | As above, plus every manifest entry is downloaded, uploaded, `UNOBTAINABLE` with a reason, or structured-text-only **with a human acknowledgement that no usable PDF is available**; **every linked PDF has a positive identity check** (`CONFIRMED` by the deterministic matcher or `HUMAN_CONFIRMED`; a missing check counts as unconfirmed) |
-| Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); **every full-text outcome resting only on automated passes is confirmed by an authenticated human**; ≥1 report included; every included report has ≥1 extracted arm, belongs to a study (§9.3) that has one, or is recorded as qualitative-only by a human; **no included report lacking data is XML-only or without a confirmed PDF**; no arm belongs to a non-included report; 0 values without `SourceEvidence` |
+| Stage 4 → Gate 3 | **Every retrieved report has a final full-text eligibility decision** (dual review, adjudication or resolved conflict); **every full-text outcome resting only on automated passes is confirmed by an authenticated human**; ≥1 report included; every included report has ≥1 extracted arm, belongs to a study (§9.3) that has one, or is recorded as qualitative-only by a human; **no included report lacking data is XML-only or without a confirmed PDF**; no arm belongs to a non-included report; 0 values without `SourceEvidence`; **Session 9: every accepted arm-level value of an included report is represented by a valid arm built from exactly the current accepted values (H1); no accepted value, arm value or latest approved risk-of-bias assessment cites a PDF other than the one now linked (H3); no number has an ambiguous printed form without a recorded reading (M5)** (§9.11) |
 | Gate 3 → Stage 5 | As above, plus every arm approved by a human; **0 master-table items awaiting review; every included study has a human-approved risk-of-bias assessment; no outcome receives arm data from two reports of the same cohort without a documented human resolution (§9.3)**; PRISMA recorded, consistent with stored records and final (nothing awaiting screening, retrieval or assessment) |
-| Stage 5 → Stage 6 | **A verified `stats_output.json`**: stored (append-only) with a matching SHA-256, schema- and results-hash-valid, computed from the *latest* human-approved analysis plan and from the *current* approved extraction data (input hash recomputed; any later change blocks Stage 6 until Stage 5 is re-run) (§9.5) |
+| Stage 5 → Stage 6 | **Session 9 (H2): every Gate 3 → Stage 5 condition above is re-checked on the current data** (Stage 5 operations such as link changes can affect them), and if the Gate 3 approval recorded a fingerprint of the approved data (`gate3_basis`), those data must be unchanged; plus **a verified `stats_output.json`**: stored (append-only) with a matching SHA-256, schema- and results-hash-valid, computed from the *latest* human-approved analysis plan and from the *current* approved extraction data (input hash recomputed; any later change blocks Stage 6 until Stage 5 is re-run) (§9.5) |
 | Stage 6 → Audit | Manuscript draft exists |
 | Audit → COMPLETED | **Session 6:** the latest `AuditReport` was made by the current Auditor (Session 7: 1.3.0, with the `reporting` scope, §9.9), is complete and passed, examined the *current* manuscript version (content SHA-256) and the *current* evidence fingerprint (recomputed); every `REQUIRES_HUMAN_REVIEW` finding is acknowledged by an active enrolled reviewer for that exact content/evidence; and an authenticated human signed off that version and audit (§9.8) |
 | Audit → Stage 6 | Always allowed (returning to drafting certifies nothing) |
@@ -665,7 +665,7 @@ other interval is substituted as primary.
 | Measure | Study level | Common effect | Random effects |
 |---|---|---|---|
 | Crude proportion | logit; Clopper-Pearson CI for display | binomial ML | **binomial-normal GLMM** (ML, 7-node adaptive Gauss-Hermite; Stijnen et al. 2010), no continuity correction; sensitivity: logit IV with 0.5 added only to 0 %/100 % studies |
-| KM / cumulative incidence at *t* | SE = \|g(U) − g(L)\| / (2z) on the declared scale g; the CI must be symmetric on that scale within the rounding of the printed numbers, else not pooled | IV | IV on the declared scale |
+| KM / cumulative incidence at *t* | SE = \|g(U) − g(L)\| / (2z) on the declared scale g; the CI must be symmetric on that scale allowing each printed number its own rounding (estimate, lower and upper limit separately; Session 9, M2), else `ci_inconsistent`. On the identity (`plain`) scale g(p) = p is defined on the closed [0, 1], so a limit of 0 % or 100 % is usable; on log(−log), log and logit a limit at 0 or 1 gives `ci_bound_not_transformable` for that study only (Session 9, M1) | IV | IV on the declared scale |
 | RR, OR | log; double-zero/double-all-event studies excluded; 0.5 added to all cells of single-zero studies (IV only) | **Mantel-Haenszel** (RBG / Greenland-Robins variance) | IV |
 | MD, SMD | m₁ − m₂; Hedges' g with exact J | IV | IV |
 
@@ -725,7 +725,7 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | JATS XML parsing for evidence; OCR; supplementary-file retrieval | Not implemented (XML is stored with provenance only; image-only pages are flagged) |
 | PICO structuring agent | Not implemented |
 | Manuscript drafting (Session 6): evidence package, marker renderer, deterministic template draft, validated model drafting, Vancouver references, versioning, Markdown/DOCX export | Implemented and tested with synthetic projects and **mocked** model replies; **no live model call**; real-world prose quality unvalidated |
-| Statistics engine (`stats_engine`, Session 3) | Implemented for crude proportions (GLMM + logit IV), KM / cumulative incidence at time *t* (from reported CIs), RR, OR (IV, MH), MD, SMD; validated against metafor 4.4-0 / lme4 (1,475 comparisons; `validation/VALIDATION_REPORT.md`). HR, RD, IRR, rates, means, medians: reported as unsupported |
+| Statistics engine (`stats_engine`, Session 3) | Implemented for crude proportions (GLMM + logit IV), KM / cumulative incidence at time *t* (from reported CIs), RR, OR (IV, MH), MD, SMD; validated against metafor 4.4-0 / lme4 (1,879 comparisons incl. Mantel-Haenszel study weights; `validation/VALIDATION_REPORT.md`). HR, RD, IRR, rates, means, medians: reported as unsupported |
 | Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
 | PRISMA 2020 flow diagram, PRISMA 2020 / abstract / SWiM checklists, GRADE and Summary of Findings, synthesis without meta-analysis (Session 7) | Implemented and tested with synthetic projects only (§9.9). Only the *new review, databases and registers* diagram variant is supported; other variants are refused with their unsupported fields |
 | Auditor (Session 6) | Implemented: deterministic, completeness-aware checks (§9.8), human acknowledgement and sign-off, advisory model claim review. Prose checks are rule-based and incomplete (limitations in §9.8 and in every report); reference verification tested with in-memory PubMed/Crossref fakes only — **no live lookup was made** |
@@ -1377,6 +1377,141 @@ was made. The stale-state checks are guaranteed on SQLite only (one writer); on 
 lock statement locks a row and does not serialise other writers (§9.9). The same enrolled
 reviewer may propose and approve an amendment (both recorded; multi-reviewer sign-off is not
 implemented). Corrections of reviewed values are limited to Stage 4 and Gate 3.
+
+### 9.11 Session 9 — remediation of the independent audit (engine 1.1.0)
+
+The Session 9 audit (report on branch `claude/beautiful-cerf-t0pltw`, `SESSION9_AUDIT_TR.md`)
+found three high- and five medium-severity defects on `main` `df1a79a`; all were reproduced
+before being fixed and each has regressions in `tests/unit/test_session9_remediation.py` and
+`tests/unit/test_session9_appendix_a.py` (the audit's Appendix A tests, oracles revised where
+the review required it).
+
+* **H1 — arms represent exactly the accepted values.** Building an arm records its basis
+  (`arm_basis`: item id → item-state hash, and the linked PDF). For arms built before Session 9
+  the basis is reconstructed from the append-only `arms_built` events. Accepting a new arm-level
+  value, correcting a pending value, or correcting a REJECTED value to ACCEPTED invalidates
+  the arm that does not represent it (`arm_invalidation`, kind `stale_basis`; the row and the
+  events stay as history) and a rebuild gets a new id. The Gate 3 guard lists accepted values
+  no valid arm represents and arms whose basis no longer equals the accepted values
+  (`arm_representation_problems`). Arms stored directly through the repository without items
+  have no basis and are not compared.
+* **H2 — Gate 3 approval is preserved.** From Stage 5 on, `Repository.require_gate3_open`
+  refuses, before anything is written, every change to Gate 3-approved data: screening
+  decisions (title/abstract and full text), the full-text manifest and linked PDFs, identity
+  confirmations, extraction items (proposal, acceptance, rejection, correction), arms and arm
+  invalidations, and risk-of-bias assessments. This deliberately reverses the PR #13 follow-up
+  rule that kept title/abstract decisions possible in Stage 5. Still supported in Stage 5
+  (each requires Stage 5 to be re-run): report-to-study links, double-counting decisions,
+  quantitative unavailability and analysis-plan revisions. Stage 5 → 6 now re-checks all Gate 3
+  conditions and, when the real Gate 3 transition recorded one, compares the `gate3_basis`
+  fingerprint (screening decisions, manifest, every extraction-item version, active arms,
+  invalidations, risk of bias) with the current data. Projects that reached Stage 5 without a
+  recorded basis get the re-checked conditions only.
+* **H3 — evidence is bound to the authoritative PDF.** Accepting an item requires the linked
+  PDF to be confirmed and the item's evidence (hash and stored filename) and machine check to
+  refer to it. A successful check of a replaced PDF never authorises acceptance. Replacing a
+  linked PDF must name the replaced hash (`X-Replaces-SHA256` / `replaces_sha256`), and identity
+  confirmations name the examined PDF (`expected_pdf_sha256`, required over HTTP). Both are
+  refused with nothing stored if the screen is stale. Up to Gate 3 a replacement invalidates
+  the report's arms (kind `source_replaced`, recorded as `source_replacement`). Values citing
+  the old PDF block Gate 3 until re-verified (a human correction against the new PDF), as do
+  approved risk-of-bias assessments citing it (a new assessment must be approved). After Gate 3
+  uploads, confirmations, "unobtainable" and XML-only acknowledgements are refused before any
+  file or row is stored. The manifest lists `pdf_sha256`.
+* **M1/M2 — KM/CIF boundaries and rounding** (see the method table in §9.5); the study data
+  record `rounding_half_unit_estimate/_ci_lower/_ci_upper`. A per-study transformation failure
+  excludes that study and never aborts the analysis.
+* **M3 — weights belong to the model shown.** `weight_common_pct` is the reported common-effect
+  model's weight: Mantel-Haenszel weights bᵢcᵢ/Nᵢ (OR) and cᵢn₁ᵢ/Nᵢ (RR), checked against
+  `metafor::weights.rma.mh`. It is `None` for the binomial ML common effect of proportions.
+  `weight_random_pct` is the reported random-effects model's weight and is `None` for the GLMM,
+  which has no study weights (metafor's `weights()` is not available for `rma.glmm`).
+  Sensitivity-model weights are in `weight_sensitivity_pct` under a label naming the model.
+  Tables and CSV name the model of each weight column. Forest plots size boxes by the primary
+  model's weights and say so, with equal boxes for the GLMM. Pooled estimates are unchanged.
+* **M4 — plots bound to the verified output.** `write_artifacts` deletes files of the previous
+  run that it no longer produces, but only if they still have the hash in the previous
+  manifest (edited or unrelated files are kept), and writes `manifest.json` last.
+  `verified_plots` returns only plots listed in a manifest that names the current output, whose
+  stored `stats_output.json` and plot files match their hashes. The UI shows nothing else and
+  no plots at all while the statistics are not valid.
+* **M5 — number formats.** `number_readings` lists every admissible reading of a printed
+  number. A leading `0,` or a group of other than three digits makes a comma a decimal comma
+  (`0,500` = 0.5). `1,234,567` and `1,234.5` are thousands. `1.234,5` is a thousands dot with a
+  decimal comma. `1,250` is ambiguous and needs a recorded `number_format` (proposal or
+  correction; the item is flagged and accepted only with a note citing the source context). The
+  reading is stored with the item and the arm value (new nullable column
+  `extracted_values.number_format`, added to existing databases by `init_db`). A single dot is
+  read as a decimal point by project convention; `thousands_point` can be recorded. Stored
+  values are never reinterpreted: rows stored with the pre-Session-9 reading load unchanged with
+  status `legacy_reading_differs` or `ambiguous_uninterpreted`, cannot be accepted or built,
+  and block Gate 3 and Stage 6 until corrected with an explicit reading. The review screens show
+  the verbatim text and the interpreted value together.
+
+**Review of PR #14 (commit `3a4f6ab`), five further findings, each reproduced first**
+(`tests/unit/test_session9_review_followup.py`, UI cases in `tests/unit/test_operations_ui.py`):
+
+* **P1a — upgrades keep valid projects valid.** The fields added in engine 1.1.0 are
+  serialised only when they carry information (`StudyResult.weight_sensitivity_pct` when
+  non-empty; `number_format` of values and items when a reading was recorded). An output,
+  statistics input or extraction item stored by the previous release therefore serialises and
+  hashes exactly as stored: no artifact or hash is rewritten and every integrity check stays
+  on. Validation is version-aware: an output declaring engine 1.0.0 may not carry
+  sensitivity weights, `ci_bound_not_transformable` or the `weight_convention` setting, and
+  its weight columns are labelled "inverse variance (engine 1.0.0)", which is what that
+  version stored. The cross-version test opens a database created by `df1a79a`
+  (`tests/fixtures/legacy/`, built by `make_legacy_db.py` with that commit's own code; a live
+  variant rebuilds it from a git worktree where the commit is available). In that database a
+  signed-off project and a Stage 6 project stay valid and completable after `init_db`, and a
+  raw edit of a legacy artifact is still rejected.
+* **P1b — transitions are atomic.** `Repository.apply_transition` takes the write lock, then
+  reads the phase, evaluates the guards, and records the gate decision, the transition and the
+  Gate 3 fingerprint in one transaction. `POST /gates/{gate}` and `POST /advance` use it, so a
+  competing write cannot fall between the check and the recording; it waits for the lock and is
+  then judged against the new phase. A refused request stores no approval or transition.
+* **P1c — the PDF screen is frozen.** The full-text manifest is a frozen screen
+  (`src/ui/frozen.py`, kind `fulltext_manifest`). The identity confirmation
+  (`expected_pdf_sha256`) and a replacement upload (`X-Replaces-SHA256`) send the hash the
+  reviewer saw, never one fetched during Streamlit's rerun. A conflict is refused ("has
+  changed") until an explicit reload and renewed review.
+* **P2a — scale-specific limit domains** (`effect_sizes.SCALE_DOMAINS`): identity [0, 1],
+  log (0, 1], logit and log(−log) (0, 1). An upper limit of 100 % is valid on the log scale.
+* **P2b — complete Mantel-Haenszel risk ratio.** Model-specific study selection
+  (`effect_sizes.enters_mantel_haenszel`): a double-all-event table enters the MH risk ratio
+  (with its MH weight cᵢn₁ᵢ/Nᵢ, its counts in the totals, its ledger entry and a forest-plot row
+  without a study-level estimate) but no inverse-variance model or heterogeneity statistic, and
+  no OR. Each pooled result reports its own k. With fewer than two studies that have a
+  study-level estimate the table is excluded with that reason. The synthetic cases
+  `mh_double_all_event` (complete-table MH RR 70/65) and `mh_boundaries` are part of the live
+  metafor validation, which compares the MH estimates and the MH weights of every table.
+
+**Review of `d364c0f`: model-specific populations reach every report.** Since P2b the
+models of one analysis can use different studies: the Mantel-Haenszel risk ratio includes a
+double-all-event table that no inverse-variance model uses. Each `PooledResult` therefore
+carries its own population: `study_ids`, `record_ids`, `total_events` and
+`total_participants`, consistent with its `k` and validated against the listed studies.
+`AnalysisResult.population(model)` returns it; for engine 1.0.0 outputs, which have none, it
+falls back to every listed study and the analysis totals, which is what that engine used. The
+ledger names the models each included report contributes to (`ReportAccount.models`). The new
+fields are serialised only when present, so legacy outputs keep their hashes, and a 1.0.0
+output may not carry them.
+
+Reporting uses the **primary** model's population wherever counts appear next to the primary
+estimate: GRADE decision support (k, participants, events, imprecision, publication-bias k),
+the reports whose risk of bias GRADE rates (`contributing_records`), the manuscript facts
+`stats.<a>.k/.participants/.events` and their record ids, and therefore the Summary of
+Findings row, the results table and the narrative. The status text and `status_reason` name
+the primary model and its k. Non-primary models with a different population stay visible and
+labelled as auxiliary: `auxiliary_models` in decision support,
+`stats.<a>.<model>.k/.participants/.events` facts, the status text, the figure legend, the
+statistics report ("Model population") and the forest-plot model rows (k per model). The
+analysis-level `k` and totals still count every listed study, as the complete ledger does.
+When every model uses every listed study, facts and texts are worded exactly as before.
+
+Remaining limitations: a historical value flagged under M5 in a project already past Gate 3
+blocks Stage 6 with no route back to correct it (the state machine has none); arm building is
+not bound to a displayed-state hash (triage L2); the atomicity guarantee relies on SQLite's
+single writer (other databases lock the project row, as for the reporting decisions).
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

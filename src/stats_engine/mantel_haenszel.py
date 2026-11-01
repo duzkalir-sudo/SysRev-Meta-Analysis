@@ -4,8 +4,16 @@
   from Robins, Breslow & Greenland, *Biometrics* 1986;42:311-323.
 * Risk ratio: variance of log RR from Greenland & Robins, *Biometrics* 1985;41:55-68.
 
-Raw counts are used (no continuity correction). Double-zero / double-all-event studies
-must be removed by the caller, as in ``metafor::rma.mh(drop00=TRUE)``.
+Raw counts are used (no continuity correction). The caller passes every table that enters the
+Mantel-Haenszel sums (``effect_sizes.enters_mantel_haenszel``; Session 9 review, P2): as in
+``metafor::rma.mh``, whose ``drop00`` affects only the study-level ``escalc`` outcomes, a
+double-all-event table enters the risk-ratio sums, while double-zero tables (and, for the OR,
+double-all-event tables) contribute nothing and are left out with identical results.
+
+Study weights (:func:`mantel_haenszel_weights`): wᵢ = bᵢcᵢ/Nᵢ for the odds ratio and
+wᵢ = cᵢn₁ᵢ/Nᵢ for the risk ratio — the weights of the Mantel-Haenszel estimators
+(OR_MH = Σaᵢdᵢ/Nᵢ ÷ Σbᵢcᵢ/Nᵢ; RR_MH = Σaᵢn₂ᵢ/Nᵢ ÷ Σcᵢn₁ᵢ/Nᵢ), exactly as returned by
+``metafor::weights.rma.mh`` (metafor 4.4-0; Mantel & Haenszel 1959; Greenland & Robins 1985).
 """
 
 from __future__ import annotations
@@ -67,3 +75,17 @@ def mantel_haenszel(
         "normal",
         None,
     )
+
+
+def mantel_haenszel_weights(
+    measure: Literal["RR", "OR"], tables: Sequence[tuple[int, int, int, int]]
+) -> list[float]:
+    """Mantel-Haenszel study weights in percent (raw counts; ``tables`` as above)."""
+    w: list[float] = []
+    for a, n1, c, n2 in tables:
+        n = n1 + n2
+        w.append((n1 - a) * c / n if measure == "OR" else c * n1 / n)
+    total = sum(w)
+    if total <= 0:
+        raise EstimationError("Mantel-Haenszel weights are undefined (all zero)")
+    return [100.0 * x / total for x in w]

@@ -78,6 +78,8 @@ READY = GuardContext(
     audit_passed=True,
     audit_problems=(),
     amendment_problems=(),
+    extraction_integrity_problems=(),
+    gate3_basis_problems=(),
 )
 
 # What the repository reports for a freshly created project: nothing recorded yet.
@@ -116,6 +118,8 @@ EMPTY = GuardContext(
     audit_passed=None,
     audit_problems=(),
     amendment_problems=(),
+    extraction_integrity_problems=(),
+    gate3_basis_problems=(),
 )
 
 
