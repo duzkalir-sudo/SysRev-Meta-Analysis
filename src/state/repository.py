@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from sqlalchemy import Select, func, select, text
 from sqlalchemy.orm import Session
@@ -162,8 +162,31 @@ class Repository:
             project_id, Phase(project.phase), history=self.list_transitions(project_id)
         )
 
+    def apply_transition(
+        self,
+        project_id: str,
+        make: Callable[[PipelineStateMachine, GuardContext], StateTransition],
+    ) -> StateTransition:
+        """Evaluate and persist a transition atomically (Session 9 review, P1).
+
+        The write lock is taken *before* the authoritative phase is read and the guards are
+        evaluated, so no other session can commit a change between the check and the
+        recording: the guard context, the gate decision, the phase change and the Gate 3
+        fingerprint describe the same state (SQLite allows one writer; elsewhere the project
+        row is locked). ``make`` builds the transition from the machine and the context and
+        raises (``GuardViolationError``/``StateTransitionError``) when it is not allowed - in
+        that case nothing is stored. Callers commit the session afterwards."""
+        self.lock_project(project_id)
+        machine = self.load_state_machine(project_id)
+        transition = make(machine, self.build_guard_context(project_id))
+        self.record_transition(transition)
+        return transition
+
     def record_transition(self, transition: StateTransition) -> None:
-        """Persist a transition produced by the state machine and update the project phase."""
+        """Persist a transition produced by the state machine and update the project phase.
+
+        Production code uses :meth:`apply_transition`, which holds the write lock from the
+        guard evaluation to this recording."""
         project = self.get_project(transition.project_id)
         if project.phase != transition.from_phase.value:
             raise SysRevError(

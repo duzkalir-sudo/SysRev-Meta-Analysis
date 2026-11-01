@@ -25,7 +25,7 @@ from src.core.exceptions import GuardViolationError, StateTransitionError
 from src.core.schemas.base import new_id
 from src.core.schemas.pipeline import GateDecision, StateTransition
 from src.state.db import ReviewerORM, init_db, make_engine, make_session_factory
-from src.state.machine import GATE_OF_PHASE
+from src.state.machine import GATE_OF_PHASE, GuardContext, PipelineStateMachine
 from src.state.repository import NotFoundError, Repository
 
 if TYPE_CHECKING:
@@ -197,25 +197,28 @@ def create_app(
         """
         repo = Repository(session)
         try:
-            machine = repo.load_state_machine(project_id)
+            repo.get_project(project_id)
         except NotFoundError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-        if machine.is_paused_at_gate:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, "the pipeline is at a gate: submit a gate decision"
-            )
-        try:
-            transition = machine.transition(
+
+        def make(machine: PipelineStateMachine, context: GuardContext) -> StateTransition:
+            if machine.is_paused_at_gate:
+                raise StateTransitionError("the pipeline is at a gate: submit a gate decision")
+            return machine.transition(
                 body.target, actor=reviewer.display_name, actor_type=ActorType.HUMAN,
-                context=repo.build_guard_context(project_id), reason=body.reason,
+                context=context, reason=body.reason,
             )  # fmt: skip
+
+        # Session 9 review (P1): lock, read the phase, check the guards and record the
+        # transition in one protected transaction (nothing is stored when refused).
+        try:
+            repo.apply_transition(project_id, make)
         except GuardViolationError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, {"message": str(exc), "violations": exc.violations}
             ) from exc
         except StateTransitionError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-        repo.record_transition(transition)
         return _view(repo, project_id)
 
     @app.post("/projects/{project_id}/gates/{gate}")
@@ -228,7 +231,7 @@ def create_app(
     ) -> ProjectView:
         repo = Repository(session)
         try:
-            machine = repo.load_state_machine(project_id)
+            repo.get_project(project_id)
         except NotFoundError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         try:
@@ -241,9 +244,12 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        # Session 9 review (P1): the guards are evaluated under the write lock and the
+        # approval, phase change and Gate 3 fingerprint are recorded in the same transaction;
+        # a refused decision stores no approval and no transition.
         try:
-            transition = machine.submit_gate_decision(
-                decision, repo.build_guard_context(project_id)
+            repo.apply_transition(
+                project_id, lambda machine, context: machine.submit_gate_decision(decision, context)
             )
         except GuardViolationError as exc:
             raise HTTPException(
@@ -252,7 +258,6 @@ def create_app(
             ) from exc
         except StateTransitionError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-        repo.record_transition(transition)
         return _view(repo, project_id)
 
     return app

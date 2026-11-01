@@ -32,6 +32,7 @@ from src.llm.credentials import BILLING_NOTE, ENV_VARS, CredentialResolver, inst
 from src.llm.tasks import TASK_LABELS, AITask, ProjectAISettings, TaskModelSettings
 from src.search.databases import DATABASES
 from src.stats_engine.stage5 import verified_plots
+from src.ui import frozen as fz
 from src.ui import operations_pages as op
 from src.ui import protocol_form as pf
 from src.ui import reporting_pages as rp
@@ -1012,36 +1013,47 @@ def page_screening(be: UIBackend) -> None:
 def page_extraction(be: UIBackend) -> None:
     pid = require_project()
     st.header("Full text and extraction")
-    manifest = be.api.get(f"/projects/{pid}/fulltext/manifest", params={"only_open": False})
+    fz.flash()
+    # Session 9 review (P1): the manifest is a frozen screen. Streamlit reruns the script
+    # before handling a submitted form; the hashes a decision is bound to come from the
+    # snapshot the reviewer saw, never from a fetch made during that rerun. Only an explicit
+    # reload (or the reviewer's own successful decision) replaces the snapshot.
+    mkey = fz.key(fz.MANIFEST, pid)
+    shown, error = fz.frozen(
+        mkey,
+        lambda: be.api.get(f"/projects/{pid}/fulltext/manifest", params={"only_open": False}),
+    )
     st.subheader("Full-text manifest")
-    st.dataframe(manifest.data if manifest.ok else [])
-    # Session 9 (H3): uploads that replace a linked PDF, and identity confirmations, are bound
-    # to the PDF hash shown in this manifest; a screen loaded before a change is refused.
-    shown_sha = {r["record_id"]: r.get("pdf_sha256") for r in (manifest.data or [])}
+    if error:
+        st.error(error)
+    st.dataframe(shown or [])
+    fz.reload_button(mkey)
+    shown_sha = {r["record_id"]: r.get("pdf_sha256") for r in (shown or [])}
     with st.form("upload"):
         record = st.text_input("Record ID for PDF upload")
         pdf = st.file_uploader("PDF", type=["pdf"])
-        replaces = shown_sha.get(record)
-        if replaces:
-            st.caption(f"Replaces the linked PDF {replaces[:12]}…; its arms will be invalidated.")
-        if st.form_submit_button("Upload (authenticated)") and record and pdf is not None:
-            headers = {"X-Filename": pdf.name} | (
-                {"X-Replaces-SHA256": replaces} if replaces else {}
-            )
-            show(be.api.request("PUT", f"/projects/{pid}/fulltext/{record}/pdf", token=token(),
-                                content=pdf.getvalue(), headers=headers),
-                 "PDF stored.")  # fmt: skip
+        submitted = st.form_submit_button("Upload (authenticated)")
+        if submitted and record and pdf is not None:
+            headers = fz.upload_headers(pdf.name, shown_sha.get(record))
+            fz.submit(
+                be.api.request("PUT", f"/projects/{pid}/fulltext/{record}/pdf", token=token(),
+                               content=pdf.getvalue(), headers=headers),
+                show, [mkey], "PDF stored.",
+            )  # fmt: skip
     with st.form("confirm"):
         record = st.text_input("Record ID whose PDF identity you confirm")
         note = st.text_input("Note")
-        examined = shown_sha.get(record)
         if st.form_submit_button("Confirm PDF identity (authenticated)") and record and note:
+            examined = shown_sha.get(record)
             if not examined:
                 st.error(f"{record} has no linked PDF in the manifest shown")
             else:
                 body = {"note": note, "expected_pdf_sha256": examined}
-                show(be.api.post(f"/projects/{pid}/fulltext/{record}/confirm-match",
-                                 token=token(), json=body))  # fmt: skip
+                fz.submit(
+                    be.api.post(f"/projects/{pid}/fulltext/{record}/confirm-match",
+                                token=token(), json=body),
+                    show, [mkey], "PDF identity confirmed.",
+                )  # fmt: skip
     st.subheader("Extraction items")
     items = be.api.get(f"/projects/{pid}/extraction/items").data or []
     advisories: dict[str, list[str]] = {}

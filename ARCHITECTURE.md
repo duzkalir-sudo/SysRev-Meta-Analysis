@@ -725,7 +725,7 @@ approving a new plan or changing approved data after the run all block Stage 6.
 | JATS XML parsing for evidence; OCR; supplementary-file retrieval | Not implemented (XML is stored with provenance only; image-only pages are flagged) |
 | PICO structuring agent | Not implemented |
 | Manuscript drafting (Session 6): evidence package, marker renderer, deterministic template draft, validated model drafting, Vancouver references, versioning, Markdown/DOCX export | Implemented and tested with synthetic projects and **mocked** model replies; **no live model call**; real-world prose quality unvalidated |
-| Statistics engine (`stats_engine`, Session 3) | Implemented for crude proportions (GLMM + logit IV), KM / cumulative incidence at time *t* (from reported CIs), RR, OR (IV, MH), MD, SMD; validated against metafor 4.4-0 / lme4 (1,523 comparisons incl. Mantel-Haenszel study weights; `validation/VALIDATION_REPORT.md`). HR, RD, IRR, rates, means, medians: reported as unsupported |
+| Statistics engine (`stats_engine`, Session 3) | Implemented for crude proportions (GLMM + logit IV), KM / cumulative incidence at time *t* (from reported CIs), RR, OR (IV, MH), MD, SMD; validated against metafor 4.4-0 / lme4 (1,879 comparisons incl. Mantel-Haenszel study weights; `validation/VALIDATION_REPORT.md`). HR, RD, IRR, rates, means, medians: reported as unsupported |
 | Forest plots, tables, Markdown report | Implemented (matplotlib SVG, deterministic) |
 | PRISMA 2020 flow diagram, PRISMA 2020 / abstract / SWiM checklists, GRADE and Summary of Findings, synthesis without meta-analysis (Session 7) | Implemented and tested with synthetic projects only (§9.9). Only the *new review, databases and registers* diagram variant is supported; other variants are refused with their unsupported fields |
 | Auditor (Session 6) | Implemented: deterministic, completeness-aware checks (§9.8), human acknowledgement and sign-off, advisory model claim review. Prose checks are rule-based and incomplete (limitations in §9.8 and in every report); reference verification tested with in-memory PubMed/Crossref fakes only — **no live lookup was made** |
@@ -1448,11 +1448,47 @@ the review required it).
   and block Gate 3 and Stage 6 until corrected with an explicit reading. The review screens show
   the verbatim text and the interpreted value together.
 
+**Review of PR #14 (commit `3a4f6ab`), five further findings, each reproduced first**
+(`tests/unit/test_session9_review_followup.py`, UI cases in `tests/unit/test_operations_ui.py`):
+
+* **P1a — upgrades keep valid projects valid.** The fields added in engine 1.1.0 are
+  serialised only when they carry information (`StudyResult.weight_sensitivity_pct` when
+  non-empty; `number_format` of values and items when a reading was recorded). An output,
+  statistics input or extraction item stored by the previous release therefore serialises and
+  hashes exactly as stored: no artifact or hash is rewritten and every integrity check stays
+  on. Validation is version-aware: an output declaring engine 1.0.0 may not carry
+  sensitivity weights, `ci_bound_not_transformable` or the `weight_convention` setting, and
+  its weight columns are labelled "inverse variance (engine 1.0.0)", which is what that
+  version stored. The cross-version test opens a database created by `df1a79a`
+  (`tests/fixtures/legacy/`, built by `make_legacy_db.py` with that commit's own code; a live
+  variant rebuilds it from a git worktree where the commit is available). In that database a
+  signed-off project and a Stage 6 project stay valid and completable after `init_db`, and a
+  raw edit of a legacy artifact is still rejected.
+* **P1b — transitions are atomic.** `Repository.apply_transition` takes the write lock, then
+  reads the phase, evaluates the guards, and records the gate decision, the transition and the
+  Gate 3 fingerprint in one transaction. `POST /gates/{gate}` and `POST /advance` use it, so a
+  competing write cannot fall between the check and the recording; it waits for the lock and is
+  then judged against the new phase. A refused request stores no approval or transition.
+* **P1c — the PDF screen is frozen.** The full-text manifest is a frozen screen
+  (`src/ui/frozen.py`, kind `fulltext_manifest`). The identity confirmation
+  (`expected_pdf_sha256`) and a replacement upload (`X-Replaces-SHA256`) send the hash the
+  reviewer saw, never one fetched during Streamlit's rerun. A conflict is refused ("has
+  changed") until an explicit reload and renewed review.
+* **P2a — scale-specific limit domains** (`effect_sizes.SCALE_DOMAINS`): identity [0, 1],
+  log (0, 1], logit and log(−log) (0, 1). An upper limit of 100 % is valid on the log scale.
+* **P2b — complete Mantel-Haenszel risk ratio.** Model-specific study selection
+  (`effect_sizes.enters_mantel_haenszel`): a double-all-event table enters the MH risk ratio
+  (with its MH weight cᵢn₁ᵢ/Nᵢ, its counts in the totals, its ledger entry and a forest-plot row
+  without a study-level estimate) but no inverse-variance model or heterogeneity statistic, and
+  no OR. Each pooled result reports its own k. With fewer than two studies that have a
+  study-level estimate the table is excluded with that reason. The synthetic cases
+  `mh_double_all_event` (complete-table MH RR 70/65) and `mh_boundaries` are part of the live
+  metafor validation, which compares the MH estimates and the MH weights of every table.
+
 Remaining limitations: a historical value flagged under M5 in a project already past Gate 3
 blocks Stage 6 with no route back to correct it (the state machine has none); arm building is
-not bound to a displayed-state hash (triage L2); the RR Mantel-Haenszel estimate differs from
-metafor's when a double-all-event study is present (see VALIDATION_REPORT.md; no estimate was
-changed).
+not bound to a displayed-state hash (triage L2); the atomicity guarantee relies on SQLite's
+single writer (other databases lock the project row, as for the reporting decisions).
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

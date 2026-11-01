@@ -550,7 +550,7 @@ def test_m1_transformed_scale_excludes_only_the_untransformable_study() -> None:
     assert res.status == "pooled" and res.k == 2
     (excluded,) = res.excluded
     assert excluded.study_id == "zero" and excluded.reason_code == "ci_bound_not_transformable"
-    assert "log_log transformation is undefined" in excluded.reason
+    assert "outside the domain (0, 1) of the declared log_log transformation" in excluded.reason
 
 
 def test_m2_each_printed_number_has_its_own_rounding_tolerance() -> None:

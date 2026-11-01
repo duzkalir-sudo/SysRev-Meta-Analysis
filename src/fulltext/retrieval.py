@@ -303,7 +303,8 @@ def register_upload(
             f"{record_id} already has a linked PDF ({old_sha[:12]}…); a replacement must name "
             "that PDF as the one it replaces (it was "
             + ("not named" if replaces_sha256 is None else f"{replaces_sha256[:12]}…")
-            + "): reload, then upload again; nothing was stored"
+            + "): the linked PDF has changed since it was displayed, or the replacement was not "
+            "bound to it - reload, then upload again; nothing was stored"
         )
     stored, problem = validate_pdf_bytes(data, store)
     if stored is None:
@@ -390,8 +391,8 @@ def confirm_pdf_match(
     if expected_pdf_sha256 is not None and expected_pdf_sha256 != item.pdf_sha256:
         raise StaleSourceError(
             f"the PDF linked to {record_id} is now {item.pdf_sha256[:12]}…, not the "
-            f"{expected_pdf_sha256[:12]}… that was examined; reload and check the current PDF "
-            "(nothing was saved)"
+            f"{expected_pdf_sha256[:12]}… that was examined: the linked PDF has changed since it "
+            "was displayed - reload and check the current PDF (nothing was saved)"
         )
     confirmed = FullTextItem.model_validate(
         item.model_dump()

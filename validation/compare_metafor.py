@@ -117,12 +117,21 @@ def comparisons(reference: dict[str, Any]) -> Iterator[Comparison]:
                 yield f"{cid}.{measure}", "kept", float(kept == kept_ref), 1.0, "closed"
                 ests = [es.log_ratio(measure, *tables[i]) for i in kept]
                 yield from _iv(f"{cid}.{measure}", [e.yi for e in ests], [e.vi for e in ests], ref)
-                mh = mantel_haenszel(measure, [tables[i] for i in kept])
+                # The engine's Mantel-Haenszel table selection (Session 9 review, P2): every
+                # table that enters the MH sums, incl. double-all-event tables for the RR.
+                mh_set = [i for i, t in enumerate(tables) if es.enters_mantel_haenszel(measure, *t)]
+                mh = mantel_haenszel(measure, [tables[i] for i in mh_set])
                 for f in ("estimate", "se", "ci_lower", "ci_upper", "statistic", "p_value"):
                     yield f"{cid}.{measure}", f"mh.{f}", getattr(mh, f), ref["mh"][f], "closed"
-                if "weights" in ref["mh"]:  # Session 9 (M3): weights.rma.mh
-                    mh_w = mantel_haenszel_weights(measure, [tables[i] for i in kept])
-                    for i, (got, want) in enumerate(zip(mh_w, ref["mh"]["weights"], strict=True)):
+                if "weights_all" in ref["mh"]:  # Session 9 (M3): weights.rma.mh, every table
+                    mh_w = dict(
+                        zip(mh_set, mantel_haenszel_weights(measure, [tables[i] for i in mh_set]),
+                            strict=True)
+                    )  # fmt: skip
+                    want_all = ref["mh"]["weights_all"]
+                    want_all = want_all if isinstance(want_all, list) else [want_all]
+                    for i, want in enumerate(want_all):
+                        got = mh_w.get(i, 0.0)  # a table outside the MH sums has weight 0
                         yield f"{cid}.{measure}", f"mh.weights[{i}]", got, want, "closed"
         elif kind == "continuous":
             rows = list(

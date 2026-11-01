@@ -39,6 +39,7 @@ PLANS = "analysis_plans"
 PLAN_WORK = "analysis_plan_work"
 AMENDMENT = "amendment"
 AMEND_WORK = "amendment_work"
+MANIFEST = "fulltext_manifest"  # Session 9 review (P1): PDF identity and replacement screen
 
 RELOAD = "Reload the current state (review it before deciding)"
 CHANGED = (
@@ -111,3 +112,13 @@ def submit(result: ApiResult, show: Show, keys: list[ScreenKey], message: str) -
         return False
     show(result)
     return False
+
+
+def upload_headers(filename: str, displayed_sha256: str | None) -> dict[str, str]:
+    """Headers of a PDF upload from the frozen manifest screen (Session 9 review, P1): a
+    replacement names the PDF the reviewer saw as linked, so it is refused if another PDF
+    has been linked since."""
+    headers = {"X-Filename": filename}
+    if displayed_sha256:
+        headers["X-Replaces-SHA256"] = displayed_sha256
+    return headers

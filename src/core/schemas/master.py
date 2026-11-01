@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
 
 from src.core.enums import (
     ActorType,
@@ -185,6 +185,15 @@ class ExtractionItem(StrictModel):
             value=self.value, reported_text=self.reported_text, unit=self.unit,
             evidence=self.evidence, number_format=self.number_format,
         )  # fmt: skip
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_format(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Session 9 review (P1): see ``ExtractedValue``; items stored before Session 9 keep
+        their serialised form and state hashes (arm bases, Gate 3 fingerprint)."""
+        data: dict[str, Any] = handler(self)
+        if self.number_format is None:
+            data.pop("number_format", None)
+        return data
 
     @property
     def format_status(self) -> NumberFormatStatus | None:

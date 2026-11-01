@@ -4,14 +4,11 @@
   from Robins, Breslow & Greenland, *Biometrics* 1986;42:311-323.
 * Risk ratio: variance of log RR from Greenland & Robins, *Biometrics* 1985;41:55-68.
 
-Raw counts are used (no continuity correction). Double-zero and double-all-event studies
-are removed by the caller (``inputs``/``engine``), following the convention that they carry
-no information on a relative effect. Note (Session 9 triage): ``metafor::rma.mh`` applies
-``drop00`` only to the study-level ``escalc`` outcomes, not to the Mantel-Haenszel sums. A
-double-zero study contributes nothing to those sums for either measure, and a double-all-event
-study contributes nothing to the OR, so the estimates agree. A double-all-event study does,
-however, enter metafor's MH *risk ratio*, which therefore differs from this engine's when
-such a study is present. No validation case contains one; see VALIDATION_REPORT.md.
+Raw counts are used (no continuity correction). The caller passes every table that enters the
+Mantel-Haenszel sums (``effect_sizes.enters_mantel_haenszel``; Session 9 review, P2): as in
+``metafor::rma.mh``, whose ``drop00`` affects only the study-level ``escalc`` outcomes, a
+double-all-event table enters the risk-ratio sums, while double-zero tables (and, for the OR,
+double-all-event tables) contribute nothing and are left out with identical results.
 
 Study weights (:func:`mantel_haenszel_weights`): wᵢ = bᵢcᵢ/Nᵢ for the odds ratio and
 wᵢ = cᵢn₁ᵢ/Nᵢ for the risk ratio — the weights of the Mantel-Haenszel estimators

@@ -17,7 +17,7 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
 
 from src.core.enums import ComparisonType, EffectMeasure
 from src.core.schemas.base import (
@@ -219,6 +219,17 @@ class StudyResult(FrozenModel):
     continuity_corrected: bool = False
     notes: list[str] = Field(default_factory=list)
 
+    @model_serializer(mode="wrap")
+    def _omit_absent_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Session 9 review (P1): a field added in engine 1.1.0 is serialised only when it
+        carries information. An output of engine 1.0.0 (which has no such field) therefore
+        serialises - and hashes - exactly as it was stored, so its integrity checks keep
+        working after an upgrade without rewriting the stored artifact or its hashes."""
+        data: dict[str, Any] = handler(self)
+        if not self.weight_sensitivity_pct:
+            data.pop("weight_sensitivity_pct", None)
+        return data
+
 
 ExclusionCode = Literal[
     "recorded_unavailable",  # a reviewer recorded the report as unusable for this outcome
@@ -386,6 +397,23 @@ class StatsOutput(FrozenModel):
     numeric_precision: NonEmptyStr
     analyses: list[AnalysisResult]
     limitations: list[str]
+
+    @model_validator(mode="after")
+    def _version_fields(self) -> StatsOutput:
+        """Version-aware validation (Session 9 review, P1): an output that declares engine
+        1.0.0 cannot carry content only engine 1.1.0 produces."""
+        if self.engine_version == "1.0.0":
+            for a in self.analyses:
+                if any(s.weight_sensitivity_pct for s in a.studies):
+                    raise ValueError("engine 1.0.0 outputs have no sensitivity-model weights")
+                codes = {e.reason_code for e in a.excluded} | {
+                    r.reason_code for r in a.reports if r.reason_code
+                }
+                if "ci_bound_not_transformable" in codes:
+                    raise ValueError("engine 1.0.0 outputs have no ci_bound_not_transformable")
+                if "weight_convention" in a.settings:
+                    raise ValueError("engine 1.0.0 outputs have no weight_convention setting")
+        return self
 
     @model_validator(mode="after")
     def _results_hash(self) -> StatsOutput:

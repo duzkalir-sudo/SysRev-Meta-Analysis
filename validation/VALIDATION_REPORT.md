@@ -49,7 +49,7 @@ interval; the common-effect binomial GLMM (`method = "EE"`); and Clopper-Pearson
 (`binom.test`). For 2×2 tables additionally Mantel-Haenszel RR/OR (`rma.mh`). For KM
 probabilities the SE derivation from the reported CI was re-implemented independently in R.
 
-## Results (1,523 comparisons, all within tolerance)
+## Results (1,879 comparisons, all within tolerance)
 
 | Class | Tolerance (abs / rel) | Largest absolute difference observed |
 |---|---|---|
@@ -81,19 +81,19 @@ steps until the (log-concave) integrand increases; a regression test checks unim
 
 ### Session 9 additions
 
-* **Mantel-Haenszel study weights** (`weights.rma.mh`) are now part of the reference
-  (`expected.<RR|OR>.mh.weights`, renormalised over the studies the engine keeps): 48
-  comparisons, all within the closed-form tolerance. Regenerating the reference with R 4.3.3 /
-  metafor 4.4-0 changed no other value.
-* **Observation (not changed):** `rma.mh(drop00 = TRUE)` applies `drop00` only to the
-  study-level `escalc` outcomes. A double-all-event study (all participants with the event in
-  both arms) therefore still enters metafor's Mantel-Haenszel *risk ratio* sums, while this
-  engine excludes such studies from every RR/OR analysis as uninformative. In a synthetic check
-  (10/10 vs 12/12, 3/30 vs 6/28, 5/25 vs 2/30) metafor gives MH RR 1.017 with and 1.041
-  without the double-all-event study. Double-zero studies contribute nothing to either sum,
-  and double-all-event studies nothing to the OR, so those estimates agree. No validation case
-  contains a double-all-event two-arm study; the engine's convention is documented in
-  `src/stats_engine/mantel_haenszel.py`.
+* **Mantel-Haenszel study weights** (`weights.rma.mh`) are part of the reference for every
+  table (`expected.<RR|OR>.mh.weights_all`, in percent; tables outside the MH sums have weight
+  0). Regenerating the reference with R 4.3.3 / metafor 4.4-0 changed no previous value.
+* **Complete-table Mantel-Haenszel risk ratio** (review of PR #14, P2): `rma.mh(drop00 = TRUE)`
+  applies `drop00` only to the study-level `escalc` outcomes, so a double-all-event table
+  enters its risk-ratio sums. The engine now does the same (it previously dropped such tables
+  from the MH RR as well). Two synthetic cases test this against metafor:
+  `mh_double_all_event` — (30/100 vs 20/100), (10/100 vs 10/100), (100/100 vs 100/100);
+  MH RR 70/65 = 1.0769 with the third table, 20/15 = 1.3333 without it; metafor and the engine
+  give 1.0769 — and `mh_boundaries` (a double-zero table, an all-event intervention arm, a
+  single-zero table, a double-all-event table and two ordinary tables). Inverse-variance models
+  keep the `escalc` convention and exclude double-zero and double-all-event tables.
+* 1,879 comparisons in total, all within tolerance.
 
 ## Reproducing
 

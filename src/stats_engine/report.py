@@ -59,8 +59,15 @@ def _pooled_rows(a: AnalysisResult) -> list[tuple[str, PooledResult]]:
     return rows
 
 
-def weight_model_label(r: PooledResult | None) -> str:
-    """Which model a weight column belongs to (Session 9, M3)."""
+LEGACY_WEIGHTS_LABEL = "inverse variance (engine 1.0.0)"
+
+
+def weight_model_label(r: PooledResult | None, a: AnalysisResult | None = None) -> str:
+    """Which model a weight column belongs to (Session 9, M3). Outputs of engine 1.0.0
+    (no ``weight_convention`` setting) always stored inverse-variance weights, whatever
+    the model; they are labelled as such (version-aware, Session 9 review P1)."""
+    if a is not None and "weight_convention" not in a.settings:
+        return LEGACY_WEIGHTS_LABEL
     if r is None:
         return "model not estimable"
     if r.method.startswith("Mantel-Haenszel"):
@@ -83,8 +90,8 @@ def primary_weights(a: AnalysisResult) -> tuple[list[float | None], str]:
     ``None`` where the primary model has none (e.g. the GLMM)."""
     primary = a.primary
     if primary is not None and primary.model == "random_effects":
-        return [s.weight_random_pct for s in a.studies], weight_model_label(primary)
-    return [s.weight_common_pct for s in a.studies], weight_model_label(primary)
+        return [s.weight_random_pct for s in a.studies], weight_model_label(primary, a)
+    return [s.weight_common_pct for s in a.studies], weight_model_label(primary, a)
 
 
 def analysis_markdown(a: AnalysisResult) -> str:
@@ -103,7 +110,7 @@ def analysis_markdown(a: AnalysisResult) -> str:
             f"{a.total_events} / {a.total_participants}"
         )
     sens = sensitivity_weight_labels(a)
-    ce, re_ = weight_model_label(a.common_effect), weight_model_label(a.random_effects)
+    ce, re_ = weight_model_label(a.common_effect, a), weight_model_label(a.random_effects, a)
     header = (
         f"| Study | Data | Estimate [{level:g}% CI] | Weight CE ({ce}) % | "
         f"Weight RE ({re_}) % | " + "".join(f"Weight {x} % | " for x in sens) + "Notes |"
@@ -220,9 +227,9 @@ def analysis_csv(a: AnalysisResult) -> str:
                 repr(s.ci_lower_natural),
                 repr(s.ci_upper_natural),
                 repr(s.weight_common_pct),
-                weight_model_label(a.common_effect),
+                weight_model_label(a.common_effect, a),
                 repr(s.weight_random_pct),
-                weight_model_label(a.random_effects),
+                weight_model_label(a.random_effects, a),
                 ";".join(f"{k}={v!r}" for k, v in sorted(s.weight_sensitivity_pct.items())),
                 s.ci_method,
                 "",
@@ -365,10 +372,16 @@ def forest_plot(a: AnalysisResult, path: Path) -> Path | None:
         y = n - i
         est, lo, hi = (None if v is None else v * m for v in (row["est"], row["lo"], row["hi"]))
         if est is None or lo is None or hi is None:
+            if row["kind"] == "study":  # e.g. a table entering only the MH risk ratio
+                text = "no study-level estimate"
+                if row["w"] is not None:
+                    text += f"  {row['w']:.1f}% (Mantel-Haenszel only)"
+                ax.annotate(text, xy=(1.01, y), xycoords=("axes fraction", "data"),
+                            va="center", fontsize=8)  # fmt: skip
             continue
         if row["kind"] == "study":
             ax.plot([lo, hi], [y, y], color="black", linewidth=1)
-            size = 4 + 10 * math.sqrt(max(row["w"], 0.0) / 100) if has_weights else 7.0
+            size = 4 + 10 * math.sqrt(max(row["w"] or 0.0, 0.0) / 100) if has_weights else 7.0
             ax.plot([est], [y], marker="s", color="black", markersize=size, linestyle="none")
         else:
             ax.fill([lo, est, hi, est], [y, y + 0.25, y, y - 0.25], color="black")

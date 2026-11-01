@@ -318,7 +318,9 @@ def build_review_router(store: DocumentStore) -> APIRouter:
         return [
             i.model_dump(mode="json")
             | {
-                # Session 9 (M5): how the stored value reads its printed text
+                # Session 9 (M5): the recorded reading (always listed, also when none was
+                # recorded and the serialised item omits it) and how the value reads its text
+                "number_format": i.number_format,
                 "format_status": i.format_status,
                 "item_state_sha256": item_state_sha256(i),
                 # one captured source per report: displayed *and* hashed (no second read)

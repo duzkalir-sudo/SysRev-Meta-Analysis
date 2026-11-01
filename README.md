@@ -512,4 +512,10 @@ What changes for a reviewer (details and remaining limitations: ARCHITECTURE.md 
   (`thousands_comma` or `decimal_comma`) and a note citing the source; `0,500` is read as 0.5.
 * Statistics engine 1.1.0: weight columns name their model (Mantel-Haenszel weights for the
   MH common effect; no study weights for the GLMM); forest plots are shown only when they
-  belong to the current, valid statistics output.
+  belong to the current, valid statistics output. The Mantel-Haenszel risk ratio uses every
+  table that enters its sums (including studies with the event in every participant of both
+  arms, as metafor does); an upper confidence limit of 100 % is valid on the log scale.
+* Upgrading keeps existing projects valid: artifacts, hashes, audits and sign-offs stored by
+  the previous release are not rewritten and still verify. Gate decisions and stage
+  transitions are checked and recorded under one database lock. The full-text page freezes
+  the manifest it shows; use "Reload" after another reviewer changed a PDF.

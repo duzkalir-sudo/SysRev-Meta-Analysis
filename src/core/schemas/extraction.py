@@ -5,9 +5,15 @@ from __future__ import annotations
 import math
 import re
 from itertools import pairwise
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from src.core.enums import (
     ActorType,
@@ -417,6 +423,16 @@ class ExtractedValue(FrozenModel):
     @property
     def format_status(self) -> NumberFormatStatus:
         return number_format_status(self.reported_text, self.value, self.number_format)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_format(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Session 9 review (P1): ``number_format`` is serialised only when a reading was
+        recorded, so values stored before Session 9 serialise - and hash (statistics input
+        fingerprints, evidence fingerprints) - exactly as before the upgrade."""
+        data: dict[str, Any] = handler(self)
+        if self.number_format is None:
+            data.pop("number_format", None)
+        return data
 
 
 _NUMERIC_FIELDS = (
