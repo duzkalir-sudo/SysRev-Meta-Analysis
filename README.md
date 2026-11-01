@@ -458,6 +458,11 @@ report excluded after an amendment can be withdrawn (tab *Withdraw arms*, Stage 
 from Stage 6 on, links, double-counting decisions and other statistics inputs can no longer be
 changed, because Stage 5 cannot be re-run then.
 
+**After the follow-up review:** each correction and analysis-plan screen is built from one
+captured state (the displayed PDF or outcome definitions and the hash sent back always describe
+the same thing), title/abstract decisions are also refused from Stage 6 on, and the phase is
+re-read from the database under the write lock before any late-stage mutation.
+
 ### What is and is not supported (Session 8)
 
 * **Provider facts were verified against the official documentation on 2026-10-31**

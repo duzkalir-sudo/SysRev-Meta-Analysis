@@ -93,16 +93,23 @@ def source_state(repo: Repository, project_id: str, record_id: str) -> dict[str,
     }
 
 
-def correction_state_sha256(repo: Repository, project_id: str, item: ExtractionItem) -> str:
+def correction_state_sha256(
+    repo: Repository,
+    project_id: str,
+    item: ExtractionItem,
+    source: dict[str, Any] | None = None,
+) -> str:
     """What a correction decision is bound to (review of PR #13, finding 1): the item *and*
     the linked PDF and identity confirmation displayed with it. A replaced PDF, a changed
-    identity check or a changed confirmation therefore makes an older screen stale."""
-    return state_sha256(
-        {
-            "item": item.model_dump(mode="json"),
-            "source": source_state(repo, project_id, item.record_id),
-        }
-    )
+    identity check or a changed confirmation therefore makes an older screen stale.
+
+    A screen must pass the ``source`` it displays (follow-up review, finding 1): the hash is
+    then computed from exactly that captured state, never from a second read that another
+    session could have changed in between. Without ``source`` the current state is read."""
+    shown = source if source is not None else source_state(repo, project_id, item.record_id)
+    if shown.get("record_id") != item.record_id:
+        raise ValueError("the source shown belongs to another report")
+    return state_sha256({"item": item.model_dump(mode="json"), "source": shown})
 
 
 def check_expected(actual: str, expected: str | None, what: str) -> None:
@@ -370,7 +377,7 @@ def revise_reviewed_item(
     if not note.strip():
         raise ReviewError("a correction needs a note")
     repo.lock_project(project_id)
-    phase = Phase(repo.get_project(project_id).phase)
+    phase = Phase(repo.current_phase(project_id))
     if phase not in REVISION_PHASES:
         raise ReviewError(
             f"reviewed values can be corrected in Stage 4 or at Gate 3 (project is in {phase}); "
@@ -584,7 +591,7 @@ def withdraw_arms(
     if not reason.strip():
         raise ReviewError("a withdrawal needs a reason")
     repo.lock_project(project_id)
-    phase = Phase(repo.get_project(project_id).phase)
+    phase = Phase(repo.current_phase(project_id))
     if phase not in REVISION_PHASES:
         raise ReviewError(
             f"arms are withdrawn in Stage 4 or at Gate 3 (project is in {phase}); later phases "

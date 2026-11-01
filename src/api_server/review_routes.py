@@ -307,7 +307,8 @@ def build_review_router(store: DocumentStore) -> APIRouter:
             i.model_dump(mode="json")
             | {
                 "item_state_sha256": item_state_sha256(i),
-                "state_sha256": correction_state_sha256(repo, project_id, i),
+                # one captured source per report: displayed *and* hashed (no second read)
+                "state_sha256": correction_state_sha256(repo, project_id, i, sources[i.record_id]),
                 "source": sources[i.record_id],
             }
             for i in rows

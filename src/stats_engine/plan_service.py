@@ -27,6 +27,7 @@ from typing import Any
 from sqlalchemy import select
 
 from src.core.schemas.base import utc_now
+from src.core.schemas.protocol import PICOProtocol
 from src.core.schemas.stats import AnalysisPlan, AnalysisSpec
 from src.extraction.master_table import StaleStateError, check_expected
 from src.state.db import AnalysisPlanORM, ReviewerORM
@@ -42,9 +43,16 @@ def list_plans(repo: Repository, project_id: str) -> list[AnalysisPlan]:
     return [AnalysisPlan.model_validate(r.payload) for r in rows]
 
 
-def plan_problems(repo: Repository, project_id: str, analyses: list[AnalysisSpec]) -> list[str]:
-    """What would refuse approval of these analyses against the current protocol."""
-    protocol = repo.latest_protocol(project_id)
+def plan_problems(
+    repo: Repository,
+    project_id: str,
+    analyses: list[AnalysisSpec],
+    protocol: PICOProtocol | None = None,
+) -> list[str]:
+    """What would refuse approval of these analyses against ``protocol`` (default: the
+    current protocol, read now)."""
+    if protocol is None:
+        protocol = repo.latest_protocol(project_id)
     if protocol is None:
         return ["no protocol: an analysis plan needs protocol outcomes"]
     outcomes = {o.outcome_id: o for o in protocol.outcomes}
@@ -58,14 +66,18 @@ def plan_problems(repo: Repository, project_id: str, analyses: list[AnalysisSpec
     return out
 
 
-def protocol_basis(repo: Repository, project_id: str) -> tuple[str | None, int | None]:
-    """(hash, version) of the current protocol; ``(None, None)`` before one exists."""
+def basis_of(protocol: PICOProtocol | None) -> tuple[str | None, int | None]:
+    """(hash, version) of one captured protocol; ``(None, None)`` if there is none."""
     from src.search.protocol_editor import protocol_sha256
 
-    protocol = repo.latest_protocol(project_id)
     if protocol is None:
         return None, None
     return protocol_sha256(protocol), protocol.version
+
+
+def protocol_basis(repo: Repository, project_id: str) -> tuple[str | None, int | None]:
+    """(hash, version) of the current protocol; ``(None, None)`` before one exists."""
+    return basis_of(repo.latest_protocol(project_id))
 
 
 def _check_protocol(repo: Repository, project_id: str, expected: str | None) -> tuple[str, int]:
@@ -80,8 +92,11 @@ def plan_state(repo: Repository, project_id: str) -> dict[str, Any]:
     plans = list_plans(repo, project_id)
     latest = plans[-1] if plans else None
     approved = next((p for p in reversed(plans) if p.status == "approved"), None)
+    # Follow-up review, finding 2: the outcome definitions displayed, the protocol hash and
+    # version sent back with a decision, and the compatibility check all come from ONE
+    # captured protocol, so a screen can never pair old definitions with a newer hash.
     protocol = repo.latest_protocol(project_id)
-    sha, version = protocol_basis(repo, project_id)
+    sha, version = basis_of(protocol)
     return {
         "protocol_sha256": sha,
         "protocol_version": version,
@@ -90,7 +105,7 @@ def plan_state(repo: Repository, project_id: str) -> dict[str, Any]:
         "latest_sha256": latest.sha256() if latest else None,
         "latest_approved_sha256": approved.sha256() if approved else None,
         "draft_problems": (
-            plan_problems(repo, project_id, latest.analyses)
+            plan_problems(repo, project_id, latest.analyses, protocol)
             if latest is not None and latest.status == "draft"
             else []
         ),

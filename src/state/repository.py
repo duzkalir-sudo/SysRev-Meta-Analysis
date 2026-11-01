@@ -508,8 +508,9 @@ class Repository:
 
     # ------------------------------------------------------------------ screening
     def save_screening_decision(self, project_id: str, decision: ScreeningDecision) -> None:
-        if decision.stage == ScreeningStage.FULL_TEXT:
-            self.require_stats_inputs_open(project_id, "a full-text eligibility decision")
+        # Follow-up review, finding 3: full-text eligibility depends on title/abstract
+        # inclusion, so every screening decision is a Stage 5 input.
+        self.require_stats_inputs_open(project_id, f"a {decision.stage.value} screening decision")
         if decision.is_human:
             reviewer = self.require_active_reviewer(decision.reviewer_id)
             if decision.reviewer_identity != reviewer.display_name:
@@ -572,10 +573,12 @@ class Repository:
     def save_conflict(self, project_id: str, conflict: ScreeningConflict) -> None:
         """Persist a conflict that matches the stored reviewer decisions.
 
+        Refused from Stage 6 on, like every screening mutation (follow-up review, finding 3).
         A *resolved* conflict is accepted only as a mirror of an existing human
         ADJUDICATOR decision by an active, enrolled reviewer with the same verdict; a
         stored resolution can never be changed or withdrawn.
         """
+        self.require_stats_inputs_open(project_id, "a screening conflict record")
         self._validate_conflict(project_id, conflict)
         self.session.merge(
             ScreeningConflictORM(
@@ -948,7 +951,7 @@ class Repository:
         """Review of PR #13, finding 5: from Stage 6 on, the verified statistics cannot be
         recomputed (the state machine has no route back to Stage 5 and ``run_stage5`` refuses),
         so a change to any Stage 5 input is refused *before anything is written*."""
-        phase = self.get_project(project_id).phase
+        phase = self.locked_phase(project_id)
         if phase in self.STATS_INPUTS_FROZEN:
             raise SysRevError(
                 f"{what} would change the inputs of the verified statistics, which cannot be "
@@ -1561,15 +1564,16 @@ class Repository:
     def save_analysis_plan(self, project_id: str, plan: AnalysisPlan) -> None:
         """Append a plan version. Approval must come from an active enrolled reviewer, and an
         approved plan must be consistent with the protocol's outcomes."""
-        project = self.get_project(project_id)
+        self.get_project(project_id)
         if plan.status == "approved":
-            if project.phase in (
+            phase = self.locked_phase(project_id)
+            if phase in (
                 Phase.STAGE6_MANUSCRIPT.value,
                 Phase.STAGE6_AUDIT.value,
                 Phase.COMPLETED.value,
             ):
                 raise SysRevError(
-                    f"a new analysis plan cannot be approved in {project.phase}: it would "
+                    f"a new analysis plan cannot be approved in {phase}: it would "
                     "invalidate the statistics output, and the pipeline has no route back to "
                     "Stage 5 to re-run them (Session 8 safeguard)"
                 )
@@ -2057,9 +2061,16 @@ class Repository:
         stored against: no other writer can change records, decisions or evidence between
         the check and the commit (SQLite allows one writer; on other databases this locks the
         project row, which serialises reporting decisions)."""
+        self.session.flush()  # pending changes are written (and kept) before the lock
         self.session.execute(
             text("UPDATE projects SET title = title WHERE id = :pid"), {"pid": project_id}
         )
+        # The cached project (kept across commits: expire_on_commit=False) may describe a
+        # state another session has since changed; reload it from inside the locked
+        # transaction on next access (follow-up review, finding 4).
+        cached = self.session.get(ProjectORM, project_id)
+        if cached is not None:
+            self.session.expire(cached)
 
     def _require_reporting_phase(self, project_id: str) -> None:
         phase = self.get_project(project_id).phase
@@ -2311,6 +2322,23 @@ class Repository:
         rows = self.session.scalars(stmt.order_by(GovernanceRecordORM.seq)).all()
         return [r.payload | {"_record_id": r.id, "_recorded_at": r.created_at.isoformat()}
                 for r in rows]  # fmt: skip
+
+    def current_phase(self, project_id: str) -> str:
+        """The phase as persisted *now* (a column read from the database, never the cached
+        ``ProjectORM``, which survives commits because sessions use expire_on_commit=False)."""
+        phase = self.session.execute(
+            select(ProjectORM.phase).where(ProjectORM.id == project_id)
+        ).scalar_one_or_none()
+        if phase is None:
+            raise NotFoundError(f"project {project_id} not found")
+        return str(phase)
+
+    def locked_phase(self, project_id: str) -> str:
+        """Take the write lock, then read the persisted phase within the same transaction
+        (follow-up review, finding 4): a transition committed by another session before the
+        lock is seen, and none can commit until this transaction ends (SQLite: one writer)."""
+        self._lock_for_reporting(project_id)
+        return self.current_phase(project_id)
 
     def lock_project(self, project_id: str) -> None:
         """Take the database write lock for this transaction before checking that the state a

@@ -1352,6 +1352,26 @@ re-executing an identical strategy (amend its dates, which creates a new strateg
    approval and invalidation, cohort-overlap resolutions and full-text eligibility decisions.
    In Stage 5 such changes remain allowed and the supported route is to re-run Stage 5 (tested).
 
+**Follow-up review of PR #13 (commit e7dd405): four fixes.**
+
+1. *One captured source per correction screen.* `GET /extraction/items` reads each report's
+   source once and computes `state_sha256` from that same captured source
+   (`correction_state_sha256(…, source=…)`); a screen can no longer display PDF A with a hash
+   of PDF B. If B becomes current afterwards, the correction is refused (409, nothing saved).
+2. *One captured protocol per plan screen.* `plan_state` derives the displayed outcome
+   definitions, the protocol hash and version, and the draft's compatibility check from one
+   `latest_protocol` read (`basis_of`). An approval based on old definitions is refused after
+   an amendment and neither records a basis nor closes the plan re-review.
+3. *Every screening mutation is a Stage 5 input.* `save_screening_decision` (title/abstract and
+   full text) and `save_conflict` are refused from Stage 6 on, before writing; full-text
+   eligibility depends on title/abstract inclusion.
+4. *Phase read fresh under the lock.* `require_stats_inputs_open`, plan approval and the
+   Stage 4 / Gate 3 and amendment phase checks use `Repository.locked_phase` /
+   `current_phase`: the write lock is taken first, then the persisted phase is read as a column
+   in the same transaction. `_lock_for_reporting` also flushes pending changes and expires the
+   cached `ProjectORM` (sessions keep objects across commits: `expire_on_commit=False`), so a
+   transition committed by another session is never hidden by a stale object.
+
 **Limitations.** All provider traffic is mocked; no live listing, inference or cost measurement
 was made. The stale-state checks are guaranteed on SQLite only (one writer); on PostgreSQL the
 lock statement locks a row and does not serialise other writers (§9.9). The same enrolled

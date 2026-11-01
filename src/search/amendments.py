@@ -464,7 +464,7 @@ def propose(
     """Store a proposal (not active). Bound to the approved protocol the reviewer saw."""
     active = repo.require_active_reviewer(reviewer.id)
     repo.lock_project(project_id)
-    phase = Phase(repo.get_project(project_id).phase)
+    phase = Phase(repo.current_phase(project_id))
     if phase in (Phase.STAGE1_PROTOCOL, Phase.GATE1_SEARCH_STRATEGY):
         raise AmendmentError("before Gate 1 the protocol is edited as a draft, not amended")
     if phase == Phase.COMPLETED:
@@ -593,7 +593,7 @@ def decide(
         decided_by=active.display_name, reviewer_id=active.id, comments=comments,
     )  # fmt: skip
     if decision == "approved":
-        phase = Phase(repo.get_project(project_id).phase)
+        phase = Phase(repo.current_phase(project_id))
         proposed = current.protocol
         changes = material_changes(base, proposed)
         _check_phase(phase, changes)
