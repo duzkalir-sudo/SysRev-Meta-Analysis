@@ -571,3 +571,108 @@ def test_heterogeneity_names_its_population_when_it_differs(
         )
     else:
         assert population == "the studies of the rated (primary) estimate"
+
+
+# =============================================================== preflight request URLs
+# Review of cc0c0ca: ``httpx.get(url, params={})`` replaced the configured query with an
+# empty one, so Europe PMC received ``/search`` without ``query`` (HTTP 400) and PubMed,
+# OpenAlex and Crossref were checked without their parameters. These tests use the real
+# HTTPX request construction with a MockTransport and inspect the URL actually sent.
+def _sent(monkeypatch: pytest.MonkeyPatch, statuses: list[int]) -> list[object]:
+    import httpx
+
+    seen: list[object] = []
+    answers = iter(statuses)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(next(answers), json={})
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(httpx, "get", client.get)
+    monkeypatch.setattr("validation.session10.preflight.time.sleep", lambda s: None)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("name", "required"),
+    [  # reviewer's oracle (test_pr15_preflight_query.py)
+        (
+            "europe_pmc",
+            {
+                "query": "EXT_ID:1 AND SRC:MED",
+                "format": "json",
+                "resultType": "lite",
+                "pageSize": "1",
+            },
+        ),
+        ("pubmed_eutils", {"db": "pubmed", "retmode": "json"}),
+        ("openalex", {"per_page": "1"}),
+        ("crossref", {"rows": "1"}),
+    ],
+)
+def test_preflight_preserves_the_configured_query(
+    monkeypatch: pytest.MonkeyPatch, name: str, required: dict[str, str]
+) -> None:
+    from validation.session10 import preflight
+
+    seen = _sent(monkeypatch, [200])
+    result = preflight.network_check(name, preflight.NETWORK[name], {})
+    assert result["_status"] == "pass" and len(seen) == 1
+    assert {k: seen[0].params.get(k) for k in required} == required, str(seen[0])  # type: ignore[attr-defined]
+    assert result["query_parameters"] == sorted(required)
+
+
+@pytest.mark.parametrize(
+    "name", sorted(__import__("validation.session10.preflight", fromlist=["NETWORK"]).NETWORK)
+)
+def test_without_additions_the_configured_url_is_sent_unchanged(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    from validation.session10 import preflight
+
+    seen = _sent(monkeypatch, [401 if name.endswith("no_key") else 200])
+    preflight.network_check(name, preflight.NETWORK[name], {})
+    assert str(seen[0]) == preflight.NETWORK[name]
+
+
+def test_additional_parameters_are_merged_with_the_configured_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    from validation.session10 import preflight
+
+    email = "reviewer@example.org"  # synthetic
+    seen = _sent(monkeypatch, [200, 200])
+    result = preflight.network_check(
+        "svc", "https://api.example.org/v1/x?rows=1&q=a%20b", {"email": email}
+    )
+    sent = seen[0].params  # type: ignore[attr-defined]
+    assert (sent.get("rows"), sent.get("q"), sent.get("email")) == ("1", "a b", email)
+    assert result["query_parameters"] == ["email", "q", "rows"]
+    # Unpaywall's configured URL has no query: the e-mail is added, nothing removed
+    result = preflight.network_check("unpaywall", preflight.NETWORK["unpaywall"], {"email": email})
+    assert seen[1].params.get("email") == email  # type: ignore[attr-defined]
+    assert seen[1].path == "/v2/10.1038/nature12373"  # type: ignore[attr-defined]
+    assert email not in json.dumps(result)  # parameter values are never reported
+
+
+def test_an_addition_never_silently_overrides_a_configured_parameter() -> None:
+    from validation.session10 import preflight
+
+    with pytest.raises(ValueError, match="already set"):
+        preflight.request_url(preflight.NETWORK["crossref"], {"rows": "1000"})
+
+
+def test_retries_resend_the_same_complete_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    from validation.session10 import preflight
+
+    seen = _sent(monkeypatch, [400, 200])
+    result = preflight.network_check("europe_pmc", preflight.NETWORK["europe_pmc"], {})
+    assert result["_status"] == "warn" and [a["http_status"] for a in result["attempts"]] == [
+        400,
+        200,
+    ]
+    assert "body_start" in result["attempts"][0]
+    assert all(u.params.get("query") == "EXT_ID:1 AND SRC:MED" for u in seen)  # type: ignore[attr-defined]

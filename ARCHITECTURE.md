@@ -1581,7 +1581,15 @@ Each finding was reproduced on Linux before the fix; regressions in
   run, JUnit report, installation step or the preflight failed. The preflight stops the whole
   process tree it started (the Streamlit child outlived the launcher on Windows) and checks
   that the ports are released; network checks record every attempt and the start of an
-  unexpected response (Europe PMC answered 400 once and 200 later; the cause is not known).
+  unexpected response.
+* **Preflight request URLs (review of `cc0c0ca`).** `httpx.get(url, params={})` replaces a URL's
+  query, so every configured check was sent without its parameters: Europe PMC received
+  `/search` without `query` and answered 400 (the reviewer's live diagnostic: the same URL with
+  its query preserved returned 200, and the application's `EuropePMCClient.count` returned 1 —
+  the application client was not at fault), and PubMed, OpenAlex and Crossref were checked
+  without their parameters. `request_url` sends the configured URL unchanged, merges additional
+  parameters explicitly and refuses ones that would override a configured parameter;
+  transport-level tests inspect the URL actually sent.
 * **Heterogeneity population.** When the Mantel-Haenszel primary model includes tables
   without a study-level estimate, the results paragraph and GRADE decision support say that
   Q/I²/τ² come from the inverse-variance studies (with their k). Facts, templates, statistics

@@ -2,9 +2,10 @@
 
 **Durum: TAMAMLANMADI.** Gerçek bir derlemenin uçtan uca pilotu (gerçek arama, PDF'ler,
 canlı model çağrıları, insan kararları ve makale) **yürütülmedi**. Bu oturumun bulut
-ortamının Windows'a erişimi hâlâ **yoktur**. `f2de5e6` commit'i, sizin bağımsız incelemenizde
-gerçek bir Windows bilgisayarında çalıştırıldı. O çalıştırmanın sonuçları ve bulguları §0'da
-özetlenmiştir; düzeltilmiş commit'in Windows'ta yeniden çalıştırılması sizdedir. Bu belge
+ortamının Windows'a erişimi hâlâ **yoktur**. `f2de5e6` ve `cc0c0ca` commit'leri, sizin bağımsız
+incelemelerinizde gerçek bir Windows bilgisayarında çalıştırıldı (§0.1, §0.4). `cc0c0ca`'dan sonra
+yalnızca ön kontroldeki URL sorgusu kusuru düzeltildi (§0.4). Bu düzeltmenin Windows'ta hedefli
+olarak yeniden doğrulanması sizdedir. Bu belge
 hazırlanan, yürütülen ve engellenen işleri ayrı ayrı kaydeder.
 
 | Sembol | Anlamı |
@@ -30,8 +31,9 @@ karakter bulunan yeni bir sanal ortam kullanıldı; `Run-Session10.ps1` değişt
 * Ön kontrol: API `POST /projects` için 201 döndü, ancak hemen yeniden başlatmadan sonra proje
   **yoktu** (aşağıda P1-a). ACL değerlendirmesi başarısız sayıldı (P2-a).
 * Ağ: PubMed, OpenAlex ve Crossref 200; iki sağlayıcının anahtarsız model listesi uçları 401.
-  Europe PMC ilk denemede **400**, sonraki bir istekte 200 döndü. Nedeni belirlenmedi; bu,
-  doğrulanmış kalıcı bir bağlantı hatası değildir.
+  Europe PMC ilk denemede **400**, sonraki bir istekte 200 döndü. *(Düzeltme, §0.4: ön kontrol
+  bu sürümde de isteği sorgusuz gönderiyordu; bu, 400 ile tutarlıdır. O günkü yanıt ayrıca
+  teşhis edilmedi. Diğer üç servisin 200'ü de yapılandırılmış sorguyu sınamıyordu.)*
 * Dış `powershell.exe -File` süreci, başarısız test ve ön kontrole rağmen **0** ile çıktı (P2-c).
 * Çıkarım (inference), ücretli çağrı, gerçek derleme ya da bilimsel karar **yapılmadı**.
 
@@ -63,8 +65,9 @@ yeniden üretimi Windows'taki gerçek çalıştırmaya dayanır.
   davranışta (yalnızca başlatıcıyı durdurmak) çocuk HTTP sunucusu dinlemeye devam etti.
 * **Europe PMC:** Sorgu, uygulamanın kendi istemcisinin parametreleriyle (`resultType=lite`)
   belgelenmiş `EXT_ID:1 AND SRC:MED` aramasına çevrildi. Her deneme kaydedilir, beklenmeyen
-  yanıtın başı saklanır. Önce hata sonra başarı `warn` (geçici) olarak raporlanır. 400'ün
-  nedeni bilinmiyor; kalıcı bağlantı hatası olarak sunulmuyor.
+  yanıtın başı saklanır. Önce hata sonra başarı `warn` (geçici) olarak raporlanır. *(Bu
+  maddedeki "400'ün nedeni bilinmiyor" yorumu yanlıştı: neden §0.4'teki istek oluşturma
+  kusuruydu. `cc0c0ca`'da da sürüyordu ve bu turda düzeltildi.)*
 * **Heterojenlik popülasyonu (§7.4'teki gözlem):** MH birincil modeli kendi kestirimi olmayan
   tabloları da içerdiğinde sonuç paragrafı şunu yazar: "Heterogeneity (computed with
   inverse-variance weights from the 2 studies with a study-level estimate, not from the
@@ -99,6 +102,75 @@ alternatif soru önerisi geçersizdir. Protokolün içeriği (PICO, sonuçlar, u
 veritabanları ve arama dizeleri) ve gereken insan kararları, gerçek pilot başlamadan önce
 belirlenmelidir. Bu oturumda belgenin içeriği okunmadı ve depoya hiçbir bölümü eklenmedi.
 
+### 0.4 `cc0c0ca` bağımsız Windows doğrulaması ve kalan P2 (2026-11-02)
+
+**YÜRÜTÜLDÜ (Windows, bağımsız inceleme):** Windows 11 Home build 26300, Python 3.12.10, cp1252,
+UTF-8 modu kapalı; yollarda boşluk ve Türkçe karakter vardı. `Run-Session10.ps1 -SkipInstall
+-Network`, önceki turda temiz kurulmuş ayrı bir sanal ortamla çalıştırıldı.
+
+* Tam paket: **1.061 geçti, 6 atlandı** (R olmadığı için 5 test; POSIX'e özgü 1 test), 6 canlı
+  test seçim dışı.
+* Hedefli kontroller (önceki bağımsız testler ve düzeltme testleri): **78 geçti, 1 POSIX testi
+  atlandı**. Ek bir gerçek Windows ACL testi geçti: sentetik bir klasöre eklenen gerçek
+  `Everyone` ACE'si reddedildi; dolu klasörde veritabanı oluşturulmadı.
+* 14 PowerShell süreç kontrolü Windows'ta geçti. Gerçek çalıştırmada pytest 0, ön kontrol 1 ve
+  dış PowerShell **1** ile çıktı (`verdict=failed`). Bu doğru davranıştır ve korunuyor.
+* Önceki beş düzeltme Windows'ta doğrulandı: commit zamanlaması ve yeniden başlatma, ACL'nin
+  yeniden denemede atlanamaması, SID tabanlı doğrulama, manifest bağlama ve çıkış kodu.
+* CI (`41391148760`, `cc0c0ca`): dört iş de başarılı.
+
+**Kalan P2 — ön kontrol yapılandırılmış URL sorgusunu siliyordu.** `network_check`,
+`httpx.get(url, params=params)` çağırıyordu. HTTPX bu durumda URL'deki sorguyu `params` ile
+**değiştirir**; `params={}` sorguyu tamamen kaldırır (burada HTTPX 0.28.1 ile doğrulandı). Boş
+olmayan bir ekleme de mevcut sorgunun yerine geçerdi.
+
+* Europe PMC sorgusuz `/search` isteği aldı: 400/400 (ön kontrol çıktısındaki
+  `"path":"/europepmc/webservices/rest/search"`).
+* PubMed, OpenAlex ve Crossref de kendi parametreleri olmadan sınandı. Bu yüzden onların 200'ü
+  tanımlı kontrol isteğini kanıtlamıyordu.
+* İncelemenin canlı teşhisi (Windows, ücretsiz, salt okunur): `params={}` ile sorgusuz URL **400**;
+  aynı URL sorgusu korunarak **200**; uygulamanın kendi
+  `EuropePMCClient.count("EXT_ID:1 AND SRC:MED")` çağrısı **1** döndürdü.
+* Uygulamanın Europe PMC istemcisinde arıza yoktu; kusur yalnızca ön kontrol aracındaydı.
+  `f2de5e6`'daki ilk 400 de aynı biçimde gönderilmiş bir isteğe aitti. Bu, onunla tutarlıdır
+  ama o yanıt ayrıca teşhis edilmedi.
+
+**Yeniden üretim (YÜRÜTÜLDÜ, Linux):** İncelemenin `test_pr15_preflight_query.py` dosyasındaki
+dört durumun dördü de `cc0c0ca` üzerinde başarısız oldu.
+
+**Düzeltme:** `request_url` gönderilecek URL'yi açıkça kurar. Ek parametre yoksa yapılandırılmış
+URL değiştirilmeden gönderilir. Ek parametreler `httpx.URL.copy_merge_params` ile birleştirilir;
+yapılandırılmış bir parametreyle çakışan ek reddedilir (sessizce üzerine yazılmaz).
+`httpx.get` artık `params=` almaz. Raporda istenen host/yol ve parametre **adları** yer alır,
+değerleri yer almaz (örneğin Unpaywall e-postası). Yeniden deneme, deneme kaydı ve `warn`
+davranışı aynıdır.
+
+**Regresyonlar** (`tests/unit/test_session10_review.py`, gerçek HTTPX istek oluşturma ve
+`MockTransport`, gönderilen URL incelenir):
+
+* İncelemenin dört durumu, aynı beklentiyle.
+* Her `NETWORK` girdisi eklemesiz olarak birebir aynı URL ile gönderilir.
+* Boş olmayan ek, mevcut sorguyla birleşir. Unpaywall'a e-posta eklenir ama rapora yazılmaz.
+* Çakışan ek reddedilir.
+* Yeniden deneme, tam sorguyla tekrar gönderilir.
+
+Bu testlerin 11'i `cc0c0ca`'nın `preflight.py` dosyasıyla başarısız oluyor; düzeltilmiş dosyayla
+hepsi geçiyor. Bunlar **taklit edilmiş taşıma** (mock) testleridir; canlı servis kontrolü değildir.
+
+**Windows'ta hedefli yeniden doğrulama** (bu ortamda hâlâ Windows yok; ağ politikası da bu
+servisleri engelliyor):
+
+```powershell
+python -m pytest -p no:cacheprovider tests/unit/test_session10_review.py -k "query or unchanged or merged or overrides or resend or network"
+python -m validation.session10.preflight --out session10_results\network_recheck --network
+```
+
+Beklenen: `europe_pmc` için `pass` ve `query_parameters` = `format, pageSize, query, resultType`.
+PubMed `db, retmode`, OpenAlex `per_page`, Crossref `rows` parametreleriyle `pass` olmalı;
+anahtarsız sağlayıcı uçları 401 vermeli. Tam `Run-Session10.ps1` çalıştırmasında başarısız bir ağ
+kontrolü yine çıkış kodu 1 vermelidir.
+
+
 ## 1. Ortam
 
 | Öğe | Değer |
@@ -126,7 +198,7 @@ belirlenmelidir. Bu oturumda belgenin içeriği okunmadı ve depoya hiçbir böl
 
 | Kapsam | Durum | Ayrıntı |
 |---|---|---|
-| 1. Windows kurulum ve başlatma | `f2de5e6`: **YÜRÜTÜLDÜ (Windows, bağımsız inceleme)**; bulgular düzeltildi, düzeltilmiş commit Windows'ta **henüz çalıştırılmadı** | §0, §3, §4 |
+| 1. Windows kurulum ve başlatma | `f2de5e6` ve `cc0c0ca`: **YÜRÜTÜLDÜ (Windows, bağımsız inceleme)**; `cc0c0ca`'da 1.061 geçti, 6 atlandı. Kalan ön kontrol sorgu kusuru düzeltildi; hedefli Windows doğrulaması bekleniyor | §0, §3, §4 |
 | `0700` izin varsayımı | Düzeltildi (`f2de5e6`); Windows'ta kalan ACL sorunları §0 P1-b/P2-a ile düzeltildi; Windows'ta yeniden çalıştırılmalı | §0, §3.1 |
 | İki metin okuma hatası (`PYTHONUTF8=1` ile geçen) | Düzeltildi; gerçek Windows'ta (cp1252) **tekrarlanmadı** | §0.1, §3.2 |
 | API commit zamanlaması | **Düzeltildi** (P1-a); Linux'ta gerçek HTTP ile test edildi | §0.2 |
@@ -345,7 +417,8 @@ başlatma/sürdürme).
 | Anthropic `/v1/models` | Anahtarsız GET | 401 (erişilebilir; çağrı faturalanmadı) | Uygulamanın adaptörü değil |
 | OpenAI `/v1/models` | Anahtarsız GET | Vekil sunucu 403 | Denenemedi |
 | Model çıkarımı (inference) | — | **Yapılmadı** | — |
-| Windows ön kontrolü (bağımsız inceleme, `f2de5e6`) | Uygulama dışı `httpx` GET'leri | PubMed, OpenAlex, Crossref 200; Europe PMC önce 400, sonra 200; Anthropic/OpenAI anahtarsız 401 | Erişilebilirlik; uygulamanın istemcisi değil |
+| Windows ön kontrolü (bağımsız inceleme, `f2de5e6` ve `cc0c0ca`) | Uygulama dışı `httpx` GET'leri — **sorguları silinmiş olarak** (§0.4) | PubMed, OpenAlex, Crossref 200 (parametresiz); Europe PMC 400 (sorgusuz). Anahtarsız Anthropic/OpenAI 401 | Erişilebilirlik; uygulamanın istemcisi değil. Düzeltilmiş isteklerle yeniden kontrol gerekli |
+| Europe PMC teşhisi (bağımsız inceleme, Windows) | Aynı URL, sorgu korunarak; uygulamanın `EuropePMCClient.count` çağrısı | 200; `hit_count=1` | Evet (`count`) |
 
 Mock'lu testler canlı uyumluluğu kanıtlamaz. Sağlayıcı uyumluluğu, kullanım kaydı ve hata
 davranışı **doğrulanmamıştır**.
@@ -434,6 +507,7 @@ Düzeltilip düzeltilmeyeceği sizin kararınızdır.
 
 **Session 10'u tamamlamak için hâlâ gerekenler (hepsi sizin Windows bilgisayarınızda):**
 
+0. §0.4'teki hedefli ağ kontrolünün düzeltilmiş commit ile Windows'ta yeniden çalıştırılması.
 1. Düzeltilmiş commit'in `Run-Session10.ps1` ile Windows'ta yeniden çalıştırılması:
    ACL testi, PowerShell süreç kontrolleri, API yeniden başlatma, UI süreç ağacı ve Europe PMC.
    Bu düzeltmelerin Windows kolları bu ortamda çalıştırılamadı. Bu, ctypes ile SDDL okumayı

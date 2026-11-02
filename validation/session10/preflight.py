@@ -144,19 +144,40 @@ def environment() -> dict[str, Any]:
     }
 
 
-def network_check(name: str, url: str, params: dict[str, str], attempts: int = 2) -> dict[str, Any]:
-    """Reachability of one service. Each attempt is recorded (status, and for an unexpected
-    answer the start of the body), so a refusal can be diagnosed instead of being summarised
-    as "no connectivity". Europe PMC answered 400 once and 200 on a later request during the
-    Windows review; a failure followed by a success is reported as ``warn`` (transient), not
-    as a pass and not as a confirmed connectivity failure."""
+def request_url(url: str, extra: dict[str, str]) -> Any:
+    """The URL actually requested: ``url`` with its own query preserved and ``extra`` merged.
+
+    ``httpx.get(url, params=...)`` *replaces* the URL's query with ``params``; with
+    ``params={}`` the configured query was removed, so Europe PMC received ``/search`` without
+    ``query`` and answered 400, and PubMed, OpenAlex and Crossref were checked without their
+    parameters (review of PR #15 at ``cc0c0ca``). Without additions the configured URL is
+    sent unchanged; an addition that names a configured parameter is refused rather than
+    silently overriding it."""
     import httpx
 
+    if not extra:
+        return httpx.URL(url)
+    base = httpx.URL(url)
+    clash = sorted(set(extra) & set(base.params.keys()))
+    if clash:
+        raise ValueError(f"additional parameters {clash} are already set in the configured URL")
+    return base.copy_merge_params(extra)
+
+
+def network_check(name: str, url: str, params: dict[str, str], attempts: int = 2) -> dict[str, Any]:
+    """Reachability of one service with the configured request (``request_url``). Each
+    attempt is recorded (status, and for an unexpected answer the start of the body); the
+    report names the requested host/path and query parameters but never their values (an
+    e-mail address may be one). A failure followed by a success is reported as ``warn``
+    (transient), not as a pass and not as a confirmed connectivity failure."""
+    import httpx
+
+    target = request_url(url, params)
     expected = (401, 403) if name.endswith("no_key") else (200,)
     tries: list[dict[str, Any]] = []
     for i in range(attempts):
         try:
-            r = httpx.get(url, params=params, timeout=20)  # honours the system proxy
+            r = httpx.get(target, timeout=20)  # no params=: the query is part of target
         except httpx.HTTPError as exc:
             tries.append({"error": f"{type(exc).__name__}: {exc}"[:300]})
         else:
@@ -170,7 +191,13 @@ def network_check(name: str, url: str, params: dict[str, str], attempts: int = 2
             time.sleep(2)
     ok = [t for t in tries if t.get("http_status") in expected]
     status = "pass" if ok and len(tries) == 1 else ("warn" if ok else "FAIL")
-    return {"_status": status, "http_status": tries[-1].get("http_status"), "attempts": tries}
+    return {
+        "_status": status,
+        "http_status": tries[-1].get("http_status"),
+        "request": f"{target.scheme}://{target.host}{target.path}",
+        "query_parameters": sorted(target.params.keys()),
+        "attempts": tries,
+    }
 
 
 def directory_protection(path: Path) -> dict[str, Any]:

@@ -26,7 +26,10 @@ powershell -ExecutionPolicy Bypass -File validation\session10\Run-Session10.ps1 
 
 * `-Network` checks reachability of PubMed, Europe PMC, OpenAlex, Crossref, Unpaywall (needs
   `SYSREV_UNPAYWALL_EMAIL` in the environment) and the Anthropic/OpenAI model-list endpoints
-  **without keys** (HTTP 401 means reachable; nothing is billed).
+  **without keys** (HTTP 401 means reachable; nothing is billed). Each check sends its
+  configured URL with the query intact (`request_url`; before the fix of the `cc0c0ca` review
+  the query was dropped and Europe PMC answered 400). The report lists the requested host/path
+  and parameter names, never parameter values.
 * `-CompareUtf8` adds a second test run with `PYTHONUTF8=1`. Only the default run counts as
   Windows validation; the second one shows whether a failure is an encoding issue.
 * Use `-PythonVersion 3.11` or `3.13` to test another interpreter (`py -0` lists them).
