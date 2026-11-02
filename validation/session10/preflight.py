@@ -36,7 +36,6 @@ import locale
 import os
 import platform
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -67,7 +66,9 @@ PACKAGES = (
 )
 NETWORK = {
     "pubmed_eutils": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/einfo.fcgi?db=pubmed&retmode=json",
-    "europe_pmc": "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=PMID:1&format=json&pageSize=1",
+    # the parameters the application's own client sends (src/apis/europepmc.py), with a
+    # documented search: EXT_ID/SRC (https://europepmc.org/RestfulWebService)
+    "europe_pmc": "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A1%20AND%20SRC%3AMED&format=json&resultType=lite&pageSize=1",
     "openalex": "https://api.openalex.org/works?per_page=1",
     "crossref": "https://api.crossref.org/works?rows=1",
     "unpaywall": "https://api.unpaywall.org/v2/10.1038/nature12373",
@@ -143,35 +144,43 @@ def environment() -> dict[str, Any]:
     }
 
 
-def directory_protection(path: Path) -> dict[str, Any]:
-    """Who can access ``path``: POSIX mode bits, or the Windows ACL entries (read-only)."""
-    if os.name != "nt":
-        mode = stat.S_IMODE(path.stat().st_mode)
-        return {"mode": oct(mode), "owner_only": mode & 0o077 == 0}
-    from src.state.db import _windows_tool
+def network_check(name: str, url: str, params: dict[str, str], attempts: int = 2) -> dict[str, Any]:
+    """Reachability of one service. Each attempt is recorded (status, and for an unexpected
+    answer the start of the body), so a refusal can be diagnosed instead of being summarised
+    as "no connectivity". Europe PMC answered 400 once and 200 on a later request during the
+    Windows review; a failure followed by a success is reported as ``warn`` (transient), not
+    as a pass and not as a confirmed connectivity failure."""
+    import httpx
 
-    out = subprocess.run(
-        [_windows_tool("icacls.exe"), path.name],
-        cwd=path.parent,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=True,
-    ).stdout
-    lines = [x.strip() for x in out.splitlines()]
-    entries = [lines[0][len(path.name) :].strip()]
-    for x in lines[1:]:
-        if not x:
-            break
-        entries.append(x)
-    entries = [e for e in entries if e]
-    return {
-        "acl_entries": len(entries),
-        "inherited_entries": sum("(I)" in e for e in entries),
-        # principal names are not reported (they may contain the user's name)
-        "owner_only": len(entries) == 1 and "(I)" not in entries[0],
-    }
+    expected = (401, 403) if name.endswith("no_key") else (200,)
+    tries: list[dict[str, Any]] = []
+    for i in range(attempts):
+        try:
+            r = httpx.get(url, params=params, timeout=20)  # honours the system proxy
+        except httpx.HTTPError as exc:
+            tries.append({"error": f"{type(exc).__name__}: {exc}"[:300]})
+        else:
+            entry: dict[str, Any] = {"http_status": r.status_code}
+            if r.status_code not in expected:
+                entry["body_start"] = r.text[:300]
+            tries.append(entry)
+            if r.status_code in expected:
+                break
+        if i + 1 < attempts:
+            time.sleep(2)
+    ok = [t for t in tries if t.get("http_status") in expected]
+    status = "pass" if ok and len(tries) == 1 else ("warn" if ok else "FAIL")
+    return {"_status": status, "http_status": tries[-1].get("http_status"), "attempts": tries}
+
+
+def directory_protection(path: Path) -> dict[str, Any]:
+    """Whether ``path`` is owner-only, decided by the application's own structured check
+    (POSIX mode bits; on Windows the owner and DACL in SDDL, by SID: ``src.state.acl``).
+    Read-only. Account names and SIDs are not reported."""
+    from src.state.db import directory_protection_problems
+
+    problems = directory_protection_problems(path)
+    return {"owner_only": not problems, "problems": problems}
 
 
 def free_port() -> int:
@@ -196,19 +205,83 @@ def wait_http(url: str, timeout: float = 60.0) -> Any:
     raise TimeoutError(f"{url} did not answer within {timeout:.0f} s ({last})")
 
 
+def port_open(port: int) -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def stop_tree(proc: subprocess.Popen[bytes], *, hard: bool) -> None:
+    """Stop ``proc`` and every process it started, and nothing else.
+
+    ``python -m src.ui`` starts Streamlit as a child process: stopping only the launcher left
+    the UI running on Windows (review of PR #15). The process is started as its own process
+    group/session (``popen_tree``); on Windows ``taskkill /T /F`` ends exactly the tree of its
+    PID, on POSIX the process group is signalled. ``hard`` stops without a graceful shutdown
+    (a crash, as the API restart check needs); otherwise SIGTERM is tried first on POSIX."""
+    if os.name == "nt":
+        from src.state.db import _windows_tool
+
+        if proc.poll() is None:
+            subprocess.run(
+                [_windows_tool("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+            )
+    else:
+        import signal
+
+        try:
+            os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
+            if not hard:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    proc.poll()  # reap the leader: a zombie would keep the group "alive"
+                    os.killpg(proc.pid, 0)  # raises once the whole group has exited
+                    time.sleep(0.2)
+                os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def popen_tree(cmd: list[str], env: dict[str, str], cwd: Path, fh: Any) -> subprocess.Popen[bytes]:
+    kw: dict[str, Any] = {}
+    if os.name == "nt":
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    else:
+        kw["start_new_session"] = True  # its own process group, led by proc.pid
+    return subprocess.Popen(cmd, env=env, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT, **kw)
+
+
 @contextlib.contextmanager
-def server(cmd: list[str], env: dict[str, str], cwd: Path, log: Path) -> Iterator[None]:
+def server(
+    cmd: list[str],
+    env: dict[str, str],
+    cwd: Path,
+    log: Path,
+    *,
+    port: int,
+    hard_stop: bool = False,
+    record: dict[str, Any] | None = None,
+) -> Iterator[None]:
+    """Run ``cmd`` for the duration of the block; afterwards its whole process tree is
+    stopped and ``port`` must be free again (recorded in ``record``)."""
     with log.open("ab") as fh:
-        proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=fh, stderr=subprocess.STDOUT)
+        proc = popen_tree(cmd, env, cwd, fh)
         try:
             yield
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+            stop_tree(proc, hard=hard_stop)
+            deadline = time.monotonic() + 15
+            while port_open(port) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if record is not None:
+                record["port_released"] = not port_open(port)
 
 
 def scratch_env(scratch: Path) -> dict[str, str]:
@@ -308,7 +381,12 @@ def run(args: argparse.Namespace) -> int:
             str(port),
         ]
         base_url = f"http://127.0.0.1:{port}"
-        with server(cmd, env, scratch, out / "preflight_api.log"):
+        # the server is killed without a graceful shutdown right after the acknowledgement:
+        # only data committed before the 201 may survive (review of PR #15, P1)
+        stops: dict[str, Any] = {}
+        with server(
+            cmd, env, scratch, out / "preflight_api.log", port=port, hard_stop=True, record=stops
+        ):
             info["health"] = wait_http(f"{base_url}/health").json()
             r = httpx.post(
                 f"{base_url}/projects",
@@ -318,14 +396,20 @@ def run(args: argparse.Namespace) -> int:
             )
             r.raise_for_status()
             pid = r.json()["project_id"]
-        with server(cmd, env, scratch, out / "preflight_api.log"):
+        info["port_released_after_first_stop"] = stops.get("port_released")
+        with server(
+            cmd, env, scratch, out / "preflight_api.log", port=port, hard_stop=True, record=stops
+        ):
             wait_http(f"{base_url}/health")
             titles = {
                 p["project_id"]: p["title"]
                 for p in httpx.get(f"{base_url}/projects", timeout=10, trust_env=False).json()
             }
         info["project_after_restart"] = titles.get(pid)
-        if titles.get(pid) != "Ön kontrol projesi ğüşİ":
+        info["port_released_after_second_stop"] = stops.get("port_released")
+        if titles.get(pid) != "Ön kontrol projesi ğüşİ" or not all(
+            info[k] for k in ("port_released_after_first_stop", "port_released_after_second_stop")
+        ):
             info["_status"] = "FAIL"
 
     with rep.step("UI: streamlit startup and health") as info:
@@ -339,9 +423,14 @@ def run(args: argparse.Namespace) -> int:
             "--server.headless",
             "true",
         ]
-        with server(cmd, env, scratch, out / "preflight_ui.log"):
+        stops = {}
+        with server(cmd, env, scratch, out / "preflight_ui.log", port=port, record=stops):
             r = wait_http(f"http://127.0.0.1:{port}/_stcore/health", timeout=90)
             info["health"] = r.text.strip()
+        # the launcher's Streamlit child must not outlive the check
+        info["port_released"] = stops.get("port_released")
+        if not stops.get("port_released"):
+            info["_status"] = "FAIL"
         info["note"] = "browser use (pages, uploads, downloads) is checked manually"
 
     with rep.step("UTF-8 export to a non-ASCII path") as info:
@@ -365,10 +454,7 @@ def run(args: argparse.Namespace) -> int:
                         info.update(_status="skip", reason="SYSREV_UNPAYWALL_EMAIL not set")
                         continue
                     params["email"] = email
-                r = httpx.get(u, params=params, timeout=20)  # honours the system proxy
-                info["http_status"] = r.status_code
-                ok = r.status_code in ((401, 403) if name.endswith("no_key") else (200,))
-                info["_status"] = "pass" if ok else "FAIL"
+                info.update(network_check(name, u, params))
     else:
         rep.add("network", "skip", "run with --network to check the live services")
 

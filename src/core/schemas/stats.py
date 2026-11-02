@@ -478,6 +478,17 @@ class AnalysisResult(FrozenModel):
             total_participants=r.total_participants,
         )
 
+    def heterogeneity_population(self) -> tuple[str, ...] | None:
+        """Studies behind ``heterogeneity`` when they differ from the primary model's
+        population, else ``None``. Q, I² and τ² are always computed from the studies with a
+        study-level estimate (inverse-variance weights); the Mantel-Haenszel risk ratio also
+        uses tables without one (Session 9, P2b), so its k can be larger (Session 10 review:
+        the heterogeneity statement must name its own population)."""
+        if self.heterogeneity is None:
+            return None
+        ids = tuple(s.study_id for s in self.studies if s.yi is not None)
+        return None if ids == self.population().study_ids else ids
+
     def auxiliary_populations(self) -> list[tuple[PooledResult, ModelPopulation]]:
         """Reported non-primary models whose population differs from the primary's."""
         primary = self.population()

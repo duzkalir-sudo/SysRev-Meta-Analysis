@@ -48,7 +48,8 @@ def _write(tmp: Path, analyses: list[Any]) -> Path:
         a.model_dump(mode="json") for a in analyses]})  # fmt: skip
     (d / "stats_output.json").write_text(body, encoding="utf-8")
     sha = hashlib.sha256(body.encode()).hexdigest()
-    (d / "manifest.json").write_text(json.dumps({"stats_output_sha256": sha}), encoding="utf-8")
+    manifest = {"stats_output_sha256": sha, "files": {"stats_output.json": sha}}  # as Stage 5
+    (d / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return d
 
 

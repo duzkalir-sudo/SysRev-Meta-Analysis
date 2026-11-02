@@ -529,7 +529,10 @@ Status, findings and what remains to be executed on Windows: `SESSION10_VALIDATI
   population states its counts with units ("population of this model: 2 studies, 400
   participants, 70 events").
 * On Windows a newly created database directory gets an owner-only ACL (POSIX: `0700`, as
-  before); if it cannot be applied, startup is refused.
+  before), verified from its security descriptor by SID before the database is created; if it
+  cannot be applied or verified, startup is refused, also on every later start.
+* The API sends a success response only after the request's changes are committed (a failed
+  commit is answered with HTTP 500 and stores nothing). Requires FastAPI ≥ 0.121.
 * Tests and validation scripts read and write text as UTF-8 explicitly, so the suite no longer
-  depends on `PYTHONUTF8=1` on Windows code pages (checked on Linux with a cp1254 locale; not
-  yet run on Windows).
+  depends on `PYTHONUTF8=1` on Windows code pages (the independent Windows run of `f2de5e6`,
+  cp1252, passed both former failures).

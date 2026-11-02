@@ -367,7 +367,9 @@ agent) could impersonate the reviewer.
    the enrolled reviewer; `gate_decisions.reviewer_id` is a `NOT NULL` foreign key.
 5. **Hygiene.** The server is meant to bind to loopback (uvicorn's default
    `127.0.0.1`); file-based SQLite directories are created with mode `0700` (on Windows,
-   where POSIX modes do not apply, with an explicit owner-only ACL — Session 10). Tokens
+   where POSIX modes do not apply, with an explicit owner-only ACL that is verified by SID
+   before a database is created — Session 10, §9.12). API responses are sent only after the
+   request's transaction has committed. Tokens
    must not be placed in `.env`, the repository, or anywhere an agent process can read.
 
 **Remaining limitations (threat model).** These measures stop an agent that can only
@@ -1540,6 +1542,51 @@ The status of each validation step (prepared, executed, blocked) is recorded in
   and validation reads/writes relied on the locale encoding; two tests failed on a Windows
   code page (reproduced on Linux with a cp1254 locale). Every text I/O call now names its
   encoding, and a test enforces that for `src`, `tests` and `validation`.
+
+**Review of PR #15 (commit `f2de5e6`), including the first real Windows execution**
+(Windows 11, Python 3.12.10, cp1252, UTF-8 mode off: 990 passed, 1 failed, 5 R tests skipped).
+Each finding was reproduced on Linux before the fix; regressions in
+`tests/unit/test_session10_commit.py`, `tests/unit/test_session10_review.py` and (Windows only)
+`tests/unit/test_session10_powershell.py`:
+
+* **P1 — success before commit.** `get_session` committed after `yield`; FastAPI's default
+  request-scoped dependency exit runs after the response is sent (FastAPI ≥ 0.118), so
+  `POST /projects` answered 201 and a server stopped at once lost the project. The session
+  dependency is now function-scoped (`Depends(get_session, scope="function")`, FastAPI ≥ 0.121,
+  the new lower bound, tested): the commit happens before the response; a failed commit is
+  rolled back and answered with HTTP 500 ("nothing … was stored"). Authentication, the write
+  lock and atomic transitions are unchanged; no endpoint streams from the session. Tested over
+  real HTTP (uvicorn) with a delayed commit, a failed commit, an authenticated write and three
+  hard kills right after acknowledged writes.
+* **P1 — ACL failure bypassed on restart.** The directory stayed after a failed ACL step and the
+  next start skipped protection. On Windows `prepare_sqlite_path` now creates the directories
+  itself, restricts and **verifies** them before any database file exists, and on failure
+  removes only the empty directories it created. An existing empty directory without the
+  database is restricted and verified; a non-empty one is never changed (startup is refused if
+  it is not owner-only); an existing database file is opened as before.
+* **P2 — owner-only decided by entry count.** Verification now reads the owner and DACL as SDDL
+  (`GetNamedSecurityInfoW`) and decides by SID (`src/state/acl.py`): protected DACL, no
+  inherited entries, allowed trustees only the current user, SYSTEM, Administrators and OWNER
+  RIGHTS (only while the owner is one of these), and full control for the current user. SYSTEM
+  and Administrators are accepted because they can override any DACL (take ownership,
+  backup/restore privileges), as root can on POSIX. Everyone, Users, Authenticated Users, Guests,
+  other accounts, unknown aliases, object ACEs and null DACLs are rejected. The four entries
+  observed on Windows (user, SYSTEM, Administrators, OWNER RIGHTS — the protected ACL that
+  CPython ≥ 3.12.4 applies for `mkdir(0o700)` since the fix of CVE-2024-4030, plus the
+  user's grant) are owner-only.
+* **P2 — validation tooling.** `check_pilot_stats` requires both manifest bindings
+  (`stats_output_sha256` and `files["stats_output.json"]`) to equal the file's hash and reports a
+  verdict: `validated` (exit 0), `failed` (1), `error` (2), `inconclusive` (3: something was not
+  compared, e.g. an unsupported HR outcome). `Run-Session10.ps1` exits non-zero when any test
+  run, JUnit report, installation step or the preflight failed. The preflight stops the whole
+  process tree it started (the Streamlit child outlived the launcher on Windows) and checks
+  that the ports are released; network checks record every attempt and the start of an
+  unexpected response (Europe PMC answered 400 once and 200 later; the cause is not known).
+* **Heterogeneity population.** When the Mantel-Haenszel primary model includes tables
+  without a study-level estimate, the results paragraph and GRADE decision support say that
+  Q/I²/τ² come from the inverse-variance studies (with their k). Facts, templates, statistics
+  and the evidence fingerprint are unchanged (only the drafting template and decision-support
+  text changed).
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

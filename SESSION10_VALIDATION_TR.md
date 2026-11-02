@@ -1,16 +1,103 @@
 # Oturum 10 — Gerçek dünya Windows doğrulaması: durum raporu
 
-**Durum: TAMAMLANMADI.** Bu oturumda Windows bilgisayarınızda hiçbir komut çalıştırılamadı.
-Gerçek bir derlemenin uçtan uca pilotu (gerçek arama, PDF'ler, canlı model çağrıları, insan
-kararları ve makale) **yürütülmedi**. Bu belge hazırlanan, yürütülen ve engellenen işleri ayrı
-ayrı kaydeder. Aşağıdaki hiçbir sonuç bir Windows doğrulaması, gerçek bir derleme ya da sizin
-bilimsel kararınız olarak okunmamalıdır.
+**Durum: TAMAMLANMADI.** Gerçek bir derlemenin uçtan uca pilotu (gerçek arama, PDF'ler,
+canlı model çağrıları, insan kararları ve makale) **yürütülmedi**. Bu oturumun bulut
+ortamının Windows'a erişimi hâlâ **yoktur**. `f2de5e6` commit'i, sizin bağımsız incelemenizde
+gerçek bir Windows bilgisayarında çalıştırıldı. O çalıştırmanın sonuçları ve bulguları §0'da
+özetlenmiştir; düzeltilmiş commit'in Windows'ta yeniden çalıştırılması sizdedir. Bu belge
+hazırlanan, yürütülen ve engellenen işleri ayrı ayrı kaydeder.
 
 | Sembol | Anlamı |
 |---|---|
 | **YÜRÜTÜLDÜ (Linux)** | Bu bulut kapsayıcısında (Ubuntu 24.04, Linux) gerçekten çalıştırıldı; Windows değildir |
-| **HAZIRLANDI** | Betik/talimat yazıldı ve mümkün olduğu kadar Linux'ta denendi; Windows'ta çalıştırılmadı |
+| **YÜRÜTÜLDÜ (Windows, bağımsız inceleme)** | Sizin incelemenizde gerçek Windows 11'de, `f2de5e6` ile çalıştırıldı (ham raporlar depoya eklenmedi) |
+| **HAZIRLANDI** | Betik/talimat yazıldı ve mümkün olduğu kadar Linux'ta denendi; düzeltilmiş hâli Windows'ta henüz çalıştırılmadı |
 | **ENGELLENDİ** | Bu oturumdan yapılamaz; sizin bilgisayarınızda ya da sizin kararınızla yapılmalı |
+
+## 0. PR #15 bağımsız incelemesi (`f2de5e6`) ve düzeltmeler (2026-11-02)
+
+### 0.1 Gerçek Windows çalıştırması — YÜRÜTÜLDÜ (Windows, bağımsız inceleme)
+
+Ortam: Windows 11 Home build 26300, Python 3.12.10, ANSI kod sayfası cp1252, UTF-8 modu
+kapalı. `PYTHONUTF8` ve `PYTHONIOENCODING` testlerde kaldırıldı. Yolunda boşluk ve Türkçe
+karakter bulunan yeni bir sanal ortam kullanıldı; `Run-Session10.ps1` değiştirilmeden
+çalıştırıldı (PowerShell ayrıştırıcısında 0 sözdizimi hatası).
+
+* Testler: **990 geçti, 1 başarısız, 5 atlandı** (R kurulu değil), **6 canlı test seçim dışı**.
+  Tek başarısız test `test_sqlite_directory_created_owner_only` idi: dört açık ACL girdisi
+  (geçerli kullanıcı, SYSTEM, Administrators, OWNER RIGHTS) vardı, test ise tek girdi bekliyordu.
+* Daha önceki iki kodlama hatası **tekrarlanmadı**; UI başlatma ve UTF-8 dosya gidiş-dönüşü geçti.
+* Ön kontrol: API `POST /projects` için 201 döndü, ancak hemen yeniden başlatmadan sonra proje
+  **yoktu** (aşağıda P1-a). ACL değerlendirmesi başarısız sayıldı (P2-a).
+* Ağ: PubMed, OpenAlex ve Crossref 200; iki sağlayıcının anahtarsız model listesi uçları 401.
+  Europe PMC ilk denemede **400**, sonraki bir istekte 200 döndü. Nedeni belirlenmedi; bu,
+  doğrulanmış kalıcı bir bağlantı hatası değildir.
+* Dış `powershell.exe -File` süreci, başarısız test ve ön kontrole rağmen **0** ile çıktı (P2-c).
+* Çıkarım (inference), ücretli çağrı, gerçek derleme ya da bilimsel karar **yapılmadı**.
+
+### 0.2 Bulgular, yeniden üretim ve düzeltmeler
+
+Her bulgu düzeltmeden önce bu Linux ortamında yeniden üretildi. İncelemenin yeniden üretim
+testleri `f2de5e6` üzerinde Linux'ta çalıştırıldı: 7 testin 7'si başarısız oldu.
+`Everyone:(F)` testi Linux'ta POSIX koluna düştüğü için başka bir nedenle başarısız oldu; Windows
+kolu Linux'ta zorlanarak ayrıca üretildi (`owner_only: True`). PowerShell çıkış kodu kusuru
+kaynakta görülüyor (betik hiç `exit` çağırmıyordu); burada PowerShell çalıştırılamadığı için
+yeniden üretimi Windows'taki gerçek çalıştırmaya dayanır.
+
+| # | Bulgu | Düzeltme | Regresyon testleri |
+|---|---|---|---|
+| P1-a | API, commit tamamlanmadan başarılı yanıt veriyordu (`get_session`'ın `yield` sonrası commit'i, FastAPI'nin varsayılan *request* kapsamında yanıttan sonra çalışıyor) | Oturum bağımlılığı `Depends(get_session, scope="function")`: commit yanıttan **önce**. Commit hatası geri alınır ve HTTP 500 ile bildirilir ("hiçbir şey kaydedilmedi"). FastAPI alt sınırı 0.121 (`scope` ilk kez 0.121.0'da; 0.117.1, 0.118.0 ve 0.120.0'da yok). FastAPI 0.121.0 ile 75 API testi geçti | `test_session10_commit.py`: gerçek HTTP (uvicorn), geciken commit, başarısız commit, kimliği doğrulanmış yazma (`PUT /protocol`), onaylanmış yazmadan hemen sonra 3 kez zorla sonlandırma + yeniden başlatma. 4'ü eski kodda başarısız, yeni kodda geçiyor |
+| P1-b | Başarısız ACL kurulumu, yeniden açılışta atlanıyordu | Windows'ta dizinler kodun kendisi tarafından oluşturulur; veritabanı dosyası yaratılmadan önce ACL uygulanır ve **SID ile doğrulanır**. Başarısızlıkta yalnızca bu çağrının oluşturduğu boş dizinler kaldırılır. Var olan boş dizin yeniden korunup doğrulanır; dolu ve ilgisiz bir dizin hiç değiştirilmez (sahip-yalnız değilse başlatma reddedilir); var olan veritabanı dosyası eskisi gibi açılır | `test_session10_review.py`: incelemenin iki testi (Windows kolu zorlanarak), doğrulanamayan ACL, kalan boş dizin, ilgisiz klasörün korunması, var olan veritabanı, POSIX davranışının değişmemesi |
+| P2-a | Sahip-yalnız kararı girdi sayısına dayanıyordu (`Everyone:(F)` kabul ediliyordu) | `src/state/acl.py`: sahip ve DACL SDDL olarak okunur (`GetNamedSecurityInfoW`) ve SID ile değerlendirilir; yerelleştirilmiş adlar ve `icacls` metni kullanılmaz. Ön kontrol ve Windows testi aynı denetimi kullanır | Everyone, Users, Authenticated Users, Guests, başka hesap, bilinmeyen takma ad, nesne ACE'si, devralınmış girdiler, null DACL ve başka sahip+OWNER RIGHTS reddedilir. Windows'ta gözlenen dört girdili ACL kabul edilir |
+| P2-b | İstatistik denetleyicisi yanlış manifesti kabul ediyordu (`digest in json.dumps(manifest)`) | `stats_output_sha256` ve `files["stats_output.json"]` alanlarının **ikisi de** bulunmalı, biçimce doğru olmalı ve dosyanın özetiyle aynı olmalı | Yanlış, çelişkili, eksik ya da bozuk bağlamalar reddedilir. Olumlu kontrol olarak gerçek bir Aşama 5 manifesti kullanılır (R yalnızca bu mantığı ayırmak için taklit edildi; sayısal iddia yok) |
+| P2-c | PowerShell betiği başarısız doğrulamaya rağmen 0 ile çıkıyordu | Genel karar: test çalıştırması, JUnit raporu, kurulum ve ön kontrolün hepsi başarılıysa 0; doğrulama başarısızsa 1; betik tamamlanamadıysa 2. Eksik ya da bozuk JUnit raporu ve sıfır test başarısızlık sayılır | `test_session10_powershell.py`: gerçek `powershell.exe` ile 14 süreç düzeyi kontrolü. **Yalnızca Windows'ta çalışır**; burada atlandı |
+
+**Ek araç düzeltmeleri:**
+
+* **Karşılaştırılmayan çıktı:** `check_pilot_stats` bir karar verir: `validated` (0),
+  `failed` (1), `error` (2) ya da `inconclusive` (3). Örneğin desteklenmeyen bir HR çıktısı
+  `inconclusive` olur. Yalnızca 0, istatistiklerin yeniden üretildiği anlamına gelir.
+* **Süreç ağacı:** Ön kontrol, başlattığı sürecin bütün ağacını durdurur (Windows'ta
+  `taskkill /T /F` yalnızca kendi PID'sine; POSIX'te süreç grubu) ve portların boşaldığını
+  denetler. İlgisiz bir Python süreci durdurulmaz (testle doğrulandı). Linux kontrolü: eski
+  davranışta (yalnızca başlatıcıyı durdurmak) çocuk HTTP sunucusu dinlemeye devam etti.
+* **Europe PMC:** Sorgu, uygulamanın kendi istemcisinin parametreleriyle (`resultType=lite`)
+  belgelenmiş `EXT_ID:1 AND SRC:MED` aramasına çevrildi. Her deneme kaydedilir, beklenmeyen
+  yanıtın başı saklanır. Önce hata sonra başarı `warn` (geçici) olarak raporlanır. 400'ün
+  nedeni bilinmiyor; kalıcı bağlantı hatası olarak sunulmuyor.
+* **Heterojenlik popülasyonu (§7.4'teki gözlem):** MH birincil modeli kendi kestirimi olmayan
+  tabloları da içerdiğinde sonuç paragrafı şunu yazar: "Heterogeneity (computed with
+  inverse-variance weights from the 2 studies with a study-level estimate, not from the
+  population of the primary model): …". GRADE karar desteği de aynı bilgiyi verir. Olgular,
+  şablonlar, istatistikler ve kanıt parmak izi değişmedi: `evidence.py`, `stats_engine` ve
+  `reporting/state.py` `f2de5e6` ile aynı; şemaya yalnızca bir yöntem eklendi.
+
+**Düzeltmelerden sonraki Linux sonuçları (YÜRÜTÜLDÜ, Linux; Windows sonucu değildir):**
+
+* Tam paket, UTF-8, R kurulu: **1053 geçti, 0 başarısız, 14 atlandı** (yalnızca Windows'a özgü
+  PowerShell kontrolleri), 6 canlı test seçim dışı. `ruff`, `ruff format` ve `mypy` (strict,
+  130 dosya) temiz.
+* Tam paket, cp1254 öykünmesi, boşluk ve Türkçe karakter içeren `TMPDIR`: **1048 geçti,
+  0 başarısız, 19 atlandı** (14 PowerShell kontrolü; R boşluklu geçici dizini reddettiği için
+  5 R testi).
+* metafor referansı yeniden üretildi: **1.879 karşılaştırmanın tümü tolerans içinde**. Pilot
+  denetleyicisinin canlı R testleri (sentetik çıktılar) geçti.
+* İncelemenin özgün testleri bu ağaçta, Linux'ta: commit zamanlaması ve üç denetleyici testi
+  **geçti**. İki ACL testi ve `Everyone` testi Linux'ta POSIX koluna düştüğü için hâlâ
+  başarısız; bunların Windows'ta geçmesi beklenir, ancak doğrulanmadı. Aynı oracle'larla
+  uyarlanmış kopyaları Windows kolunu zorlayarak geçiyor.
+* En düşük FastAPI sürümü (0.121.0, Starlette 0.49.3) ile API, commit, kimlik doğrulama,
+  amendment ve işlem testleri: **75 geçti, 1 atlandı** (o ortamda Streamlit yok).
+* Python 3.11 ile Windows'ta, pytest'in `tmp_path` dizinleri korumalı ACL almayabilir
+  (CPython bunu 3.12.4'ten beri uygular). Var olan dolu bir dizinde yeni veritabanı reddedildiği
+  için bazı testler orada farklı davranabilir. Windows'ta yalnızca 3.12.10 çalıştırıldı.
+
+### 0.3 Pilot protokolü — sizin seçiminiz
+
+Pilot için **sizin mevcut Gamma Knife vestibüler schwannom protokolünüz** kullanılacak; §5.1'deki
+alternatif soru önerisi geçersizdir. Protokolün içeriği (PICO, sonuçlar, uygunluk ölçütleri,
+veritabanları ve arama dizeleri) ve gereken insan kararları, gerçek pilot başlamadan önce
+belirlenmelidir. Bu oturumda belgenin içeriği okunmadı ve depoya hiçbir bölümü eklenmedi.
 
 ## 1. Ortam
 
@@ -39,17 +126,20 @@ bilimsel kararınız olarak okunmamalıdır.
 
 | Kapsam | Durum | Ayrıntı |
 |---|---|---|
-| 1. Windows kurulum ve başlatma | **HAZIRLANDI**; Linux eşdeğeri **YÜRÜTÜLDÜ (Linux)** | §3, §4 |
-| `0700` izin varsayımı | **Kusur doğrulandı ve düzeltildi**; Windows'ta çalıştırılmadı | §3.1 |
-| İki metin okuma hatası (`PYTHONUTF8=1` ile geçen) | **cp1254 öykünmesiyle yeniden üretildi ve düzeltildi**; Windows'ta çalıştırılmadı | §3.2 |
-| 2. Gerçek PubMed araması ve içe aktarma | **ENGELLENDİ** (ağ politikası; ayrıca onaylı protokol yok) | §5 |
+| 1. Windows kurulum ve başlatma | `f2de5e6`: **YÜRÜTÜLDÜ (Windows, bağımsız inceleme)**; bulgular düzeltildi, düzeltilmiş commit Windows'ta **henüz çalıştırılmadı** | §0, §3, §4 |
+| `0700` izin varsayımı | Düzeltildi (`f2de5e6`); Windows'ta kalan ACL sorunları §0 P1-b/P2-a ile düzeltildi; Windows'ta yeniden çalıştırılmalı | §0, §3.1 |
+| İki metin okuma hatası (`PYTHONUTF8=1` ile geçen) | Düzeltildi; gerçek Windows'ta (cp1252) **tekrarlanmadı** | §0.1, §3.2 |
+| API commit zamanlaması | **Düzeltildi** (P1-a); Linux'ta gerçek HTTP ile test edildi | §0.2 |
+| 2. Gerçek PubMed araması ve içe aktarma | **ENGELLENDİ**: bulut ağ politikası; Windows'ta PubMed erişilebilir (200). Protokol seçildi, içeriği henüz belirlenmedi | §0.3, §5 |
 | 3. Gerçek PDF'ler ve veri çıkarma | **ENGELLENDİ** (PDF yok, Windows yok) | §5 |
 | 4. Canlı model/API davranışı | **ENGELLENDİ** (anahtar yok; OpenAI ağ dışı). Yalnızca anahtarsız erişilebilirlik ölçüldü | §6 |
 | 5. İstatistik ve raporlama | Bağımsız denetleyici **HAZIRLANDI**, sentetik veride **YÜRÜTÜLDÜ (Linux)**; pilot verisi yok | §7 |
-| 6. Makale, denetim, dışa aktarma | **ENGELLENDİ** (pilot yok); duyarlılık cümlesi kusuru **düzeltildi** | §8 |
+| 6. Makale, denetim, dışa aktarma | **ENGELLENDİ** (pilot yok); duyarlılık cümlesi ve heterojenlik etiketi **düzeltildi** | §0.2, §8 |
 | İnsan kararları | **Hiçbiri verilmedi ya da taklit edilmedi** | §5.3 |
 
 ## 3. Windows bulguları (kaynakta kanıtlanan, Linux'ta yeniden üretilen)
+
+*(Bu bölüm `f2de5e6` öncesi durumu anlatır; Windows sonuçları için bkz. §0.1.)*
 
 Daha önceki bağımsız Windows çalıştırmanızın sonucu (980 geçti, 1 R testi atlandı, 7 test
 seçim dışı) bu oturumda yeniden üretilemez, çünkü Windows'a erişim yok. Aşağıdaki iki
@@ -147,10 +237,14 @@ Reviewer kaydı yapmaz, anahtar ve token okumaz, `data\` klasörünüze dokunmaz
 `session10_results\windows_<UTC>\` klasörünü bana gönderin; paylaşmadan önce içeriğini kontrol edin.
 
 **Bu betiğin durumu:** Yalnızca ASCII karakterlerle yazıldı; Windows PowerShell 5.1 BOM'suz
-dosyayı ANSI olarak okuduğu için Türkçe adlar karakter kodlarından oluşturulur. **Hiç
-çalıştırılmadı ve sözdizimi denetlenmedi:** bu kapsayıcıda PowerShell yok, indirilen bir
-PowerShell ikili dosyasını çalıştırma izni de reddedildi. Çağırdığı Python ön kontrolü Linux'ta
-çalıştırıldı (§4.1).
+dosyayı ANSI olarak okuduğu için Türkçe adlar karakter kodlarından oluşturulur. `f2de5e6`
+sürümü bağımsız incelemede Windows'ta değiştirilmeden çalıştırıldı (§0.1). Çıkış kodu kusuru
+(P2-c) düzeltildi: betik artık `summary.json` içine genel bir karar (`verdict`) ve nedenlerini
+yazar ve buna göre çıkar (0 başarılı, 1 doğrulama başarısız, 2 betik tamamlanamadı).
+`-VerdictOnly <summary.json>` yalnızca kararı hesaplar. **Düzeltilmiş betik bu ortamda
+çalıştırılamadı:** PowerShell yok, indirilen bir PowerShell ikili dosyasını çalıştırma izni de
+reddedildi. Süreç düzeyi kontrolleri (`tests/unit/test_session10_powershell.py`) Windows'ta
+tam test paketinin içinde çalışır.
 
 ### 4.1 Ön kontrolün Linux sonucu (YÜRÜTÜLDÜ, Linux — Windows sonucu değildir)
 
@@ -164,9 +258,18 @@ Karalama klasörü `/tmp/SysRev Doğrulama ş10 İ/run 20261101T175416Z`:
 | UTF-8 dışa aktarma (`dışa aktarım/özet ğüşİ.md`) | geçti |
 | Ağ | PubMed, Europe PMC, OpenAlex, Crossref ve OpenAI: vekil sunucu 403. Anthropic: 401 (erişilebilir). Unpaywall: e-posta tanımlı değil, atlandı |
 
+Düzeltmelerden sonra yeniden çalıştırma (YÜRÜTÜLDÜ, Linux, ağ denetimleri olmadan): veritabanı
+`{"owner_only": true, "problems": []}`; API iki kez **zorla** sonlandırıldı ve onaylanan Türkçe
+başlıklı proje yeniden başlatmadan sonra mevcuttu; her iki durdurmadan sonra port boşaldı. UI
+sağlık uç noktası `ok` döndü, durdurmadan sonra port boşaldı ve Streamlit süreci kalmadı.
+Sonuç: 0 başarısız denetim.
+
 ## 5. Pilot: girdiler, plan ve insan kapıları
 
 ### 5.1 Girdiler — sizden gerekenler
+
+*(Güncel: pilot için sizin Gamma Knife vestibüler schwannom protokolünüz seçildi, bkz. §0.3.
+Aşağıdaki alternatif soru önerisi geçersizdir ve yalnızca kayıt olarak bırakıldı.)*
 
 Depoda klinik soru, onaylı protokol ya da seçilmiş literatür dosyası yok. Google Drive'ınızda
 yalnızca **dosya adları** arandı; içerik açılmadı. Bir protokol belgesine benzeyen bir dosya
@@ -242,6 +345,7 @@ başlatma/sürdürme).
 | Anthropic `/v1/models` | Anahtarsız GET | 401 (erişilebilir; çağrı faturalanmadı) | Uygulamanın adaptörü değil |
 | OpenAI `/v1/models` | Anahtarsız GET | Vekil sunucu 403 | Denenemedi |
 | Model çıkarımı (inference) | — | **Yapılmadı** | — |
+| Windows ön kontrolü (bağımsız inceleme, `f2de5e6`) | Uygulama dışı `httpx` GET'leri | PubMed, OpenAlex, Crossref 200; Europe PMC önce 400, sonra 200; Anthropic/OpenAI anahtarsız 401 | Erişilebilirlik; uygulamanın istemcisi değil |
 
 Mock'lu testler canlı uyumluluğu kanıtlamaz. Sağlayıcı uyumluluğu, kullanım kaydı ve hata
 davranışı **doğrulanmamıştır**.
@@ -272,6 +376,9 @@ Son ağaçla tam test paketi (YÜRÜTÜLDÜ, Linux, UTF-8 yerel ayarı, R kurulu
 * Modele özgü ağırlıkları, Q, p ve I²'yi karşılaştırır.
 
 Tanınmayan bir model "karşılaştırılmadı" olarak listelenir, asla "geçti" sayılmaz.
+İnceleme üzerine (§0.2) dosyanın özeti iki manifest alanının ikisiyle de birebir eşleşmelidir.
+Sonuç bir karar olarak verilir: `validated`, `failed`, `error` ya da `inconclusive`. Yalnızca
+`validated` (çıkış 0), istatistiklerin yeniden üretildiği anlamına gelir.
 
 Sentetik sınama (`tests/unit/test_session10_tooling.py`): RR ve OR (birincil model ortak ve
 rastgele; çift tam olaylı tablo dahil, MH k = 3) ile oranlar (GLMM ve logit-IV):
@@ -288,7 +395,11 @@ R, oturum geçici dizininin yolunda boşluk varsa başlamıyor:
 `Fatal error: 'R_TempDir' contains space` (Linux'ta gözlendi). Denetleyici POSIX'te bu
 durumda R'a `/tmp` verir. Windows'taki davranış denetlenmedi; talimat README'de.
 
-### 7.4 Açık gözlem — incelemeniz için (düzeltilmedi)
+### 7.4 Heterojenlik popülasyonu (inceleme üzerine düzeltildi, §0.2)
+
+*Aşağıdaki gözlem PR #15 incelemesinde düzeltilmesi istenen bir etiketleme sorunu olarak
+kabul edildi ve düzeltildi; sayılar değişmedi.*
+
 
 Üç denemeli sentetik örnekte birincil model Mantel-Haenszel olduğunda sonuç paragrafı
 "3 studies … including 600 participants … Heterogeneity: Q = 0.68 (df = 1 …); I² = 0%"
@@ -323,11 +434,14 @@ Düzeltilip düzeltilmeyeceği sizin kararınızdır.
 
 **Session 10'u tamamlamak için hâlâ gerekenler (hepsi sizin Windows bilgisayarınızda):**
 
-1. `Run-Session10.ps1`'in varsayılan Windows çalıştırması, sonuçları ve gerekirse betik
-   hatalarının düzeltilmesi.
-2. Tarayıcıda normal kullanım: yükleme, indirme ve dışa aktarma.
-3. §5'teki pilotun tamamı: gerçek arama, PDF'ler, canlı çağrılar, insan kararları ve makale.
-4. `collect_pilot_evidence` ve `check_pilot_stats` çıktıları; PRISMA, GRADE/SoF,
+1. Düzeltilmiş commit'in `Run-Session10.ps1` ile Windows'ta yeniden çalıştırılması:
+   ACL testi, PowerShell süreç kontrolleri, API yeniden başlatma, UI süreç ağacı ve Europe PMC.
+   Bu düzeltmelerin Windows kolları bu ortamda çalıştırılamadı. Bu, ctypes ile SDDL okumayı
+   (`GetNamedSecurityInfoW`) da kapsar.
+2. Pilot protokolünüzün içeriğinin ve gereken insan kararlarının belirlenmesi (§0.3).
+3. Tarayıcıda normal kullanım: yükleme, indirme ve dışa aktarma.
+4. Pilotun tamamı: gerçek arama, PDF'ler, canlı çağrılar, insan kararları ve makale.
+5. `collect_pilot_evidence` ve `check_pilot_stats` çıktıları; PRISMA, GRADE/SoF,
    kontrol listeleri ve makalenin pilot kanıtına göre denetlenmesi.
 
 **Önceden belgelenmiş ve değişmeyen sınırlamalar:**
@@ -338,6 +452,11 @@ Düzeltilip düzeltilmeyeceği sizin kararınızdır.
 * Gerçek dışa aktarma dosyalarıyla ayrıştırıcı denemesi yapılmadı.
 * SQLite dışında kilitleme garantisi yok.
 * `SYSREV_DATA_DIR` sahip-yalnız değil.
+* Windows'ta önceden var olan bir veritabanı dosyası, dizini doğrulanmadan eskisi gibi açılır
+  (yükseltme uyumluluğu); ön kontrol bu dizinin durumunu raporlar.
+* `src.ui` başlatıcısı Streamlit'i bir çocuk süreç olarak başlatır. Başlatıcı zorla
+  sonlandırılırsa çocuk süreç kalabilir. Ön kontrol kendi ağacını temizler; uygulamanın
+  başlatıcısı değiştirilmedi.
 * Çok reviewer'lı imza yok.
 
 **Hariç tutmalar ve geçici çözümler:** Bu dalda hiçbir test hariç tutulmadı ya da atlanmadı;

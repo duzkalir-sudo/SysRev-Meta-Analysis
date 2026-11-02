@@ -768,18 +768,118 @@ def prepare_sqlite_path(url: str) -> None:
     """Create the parent directory of a file-based SQLite URL with owner-only permissions.
 
     The database holds reviewer credential hashes and the audit trail; other OS users
-    should not be able to read or write it.
+    should not be able to read or write it. On POSIX ``mkdir(mode=0o700)`` creates the
+    directory protected in one step; an existing directory is used as it is (unchanged).
+
+    On Windows the mode has no reliable effect, so protection is a separate step that can
+    fail (Session 10). It must fail closed across restarts (review of PR #15, P1): a new
+    database is created only in a directory **verified** owner-only from its security
+    descriptor (``src.state.acl``):
+
+    * directories this call creates are restricted to the current user and verified; if
+      that fails, the (empty) directories it created are removed again and the error is
+      raised, so a retry starts from the beginning instead of finding a directory;
+    * an existing directory without the database file is verified; an empty one is
+      restricted first (an interrupted initialisation, or a folder made for the database);
+      a non-empty one is never changed: if it is not owner-only, startup is refused;
+    * an existing database file is opened as before; the preflight reports its directory.
     """
     if not url.startswith("sqlite:///") or ":memory:" in url:
         return
     path = Path(url.removeprefix("sqlite:///"))
-    created = not path.parent.exists()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if created and os.name == "nt":
-        # Windows ignores the POSIX mode: a new directory inherits its parent's ACL (under
-        # C:\ that usually lets every authenticated user modify it). Apply the equivalent of
-        # 0700 explicitly (Session 10). Like the POSIX mode, only new directories are changed.
-        restrict_directory_to_current_user(path.parent)
+    directory = path.parent
+    if not _is_windows():
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return
+    created = _create_directories(directory)
+    try:
+        if not created:
+            if path.exists():
+                return
+            if any(directory.iterdir()):
+                _require_owner_only(directory, existing=True)
+                return
+        restrict_directory_to_current_user(directory)
+        _require_owner_only(directory, existing=False)
+    except BaseException:
+        _remove_created(created)
+        raise
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _create_directories(directory: Path) -> list[Path]:
+    """``mkdir -p`` that returns the directories it created, outermost first."""
+    missing = []
+    d = directory
+    while not d.exists():
+        missing.append(d)
+        if d.parent == d:
+            break
+        d = d.parent
+    created = []
+    try:
+        for d in reversed(missing):
+            try:
+                d.mkdir(mode=0o700)
+            except FileExistsError:
+                if not d.is_dir():
+                    raise
+                continue  # created concurrently by someone else: not ours to remove
+            created.append(d)
+    except BaseException:
+        _remove_created(created)
+        raise
+    return created
+
+
+def _remove_created(created: list[Path]) -> None:
+    """Remove the directories a failed initialisation created, innermost first, only while
+    they are empty (``rmdir`` never deletes content)."""
+    for d in reversed(created):
+        try:
+            d.rmdir()
+        except OSError:
+            return
+
+
+def _require_owner_only(directory: Path, *, existing: bool) -> None:
+    problems = windows_directory_problems(directory)
+    if problems:
+        how = (
+            "It already exists and contains files, so it is not changed automatically. "
+            "Choose a database location in a new folder (it is then created and restricted "
+            "automatically) or restrict this folder to your account."
+            if existing
+            else "Its owner-only protection could not be applied or verified."
+        )
+        raise SysRevError(
+            f"refusing to create the database in {directory}: it is not restricted to the "
+            f"current user ({'; '.join(problems)}). {how}"
+        )
+
+
+def windows_directory_problems(directory: Path) -> list[str]:
+    """Why ``directory`` is not owner-only on Windows (empty: verified owner-only)."""
+    from src.state.acl import owner_only_problems, windows_sddl
+
+    try:
+        return owner_only_problems(windows_sddl(directory), current_user_sid())
+    except (OSError, SysRevError, subprocess.SubprocessError) as exc:
+        return [f"the security descriptor could not be read ({type(exc).__name__}: {exc})"]
+
+
+def directory_protection_problems(directory: Path) -> list[str]:
+    """Why ``directory`` is accessible to other accounts (empty: owner-only). POSIX: no
+    group/other mode bits; Windows: ``windows_directory_problems``."""
+    if _is_windows():
+        return windows_directory_problems(directory)
+    import stat
+
+    mode = stat.S_IMODE(directory.stat().st_mode)
+    return [] if mode & 0o077 == 0 else [f"mode {oct(mode)} gives access to group/other"]
 
 
 def _windows_tool(name: str) -> str:

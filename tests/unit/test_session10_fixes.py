@@ -195,36 +195,6 @@ def test_encoding_scan_detects_the_defect(tmp_path: Path) -> None:
 # did not exist. Session 10 applies an explicit owner-only ACL on Windows.
 
 
-def windows_acl_entries(directory: Path) -> list[str]:
-    """Access-control entries of ``directory`` as printed by ``icacls`` (Windows only)."""
-    import subprocess
-
-    from src.state.db import _windows_tool
-
-    # run from the parent with the bare name, so that the echoed path is ASCII whatever the
-    # console code page (only the SID-independent flags are inspected)
-    name = directory.name
-    assert name.isascii()
-    out = subprocess.run(
-        [_windows_tool("icacls.exe"), name],
-        cwd=directory.parent,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=True,
-    ).stdout
-    lines = [x.strip() for x in out.splitlines()]
-    first = lines[0]
-    assert first.lower().startswith(name.lower()), out
-    entries = [first[len(name) :].strip()]
-    for x in lines[1:]:
-        if not x or x.lower().startswith("successfully"):
-            break
-        entries.append(x)
-    return [e for e in entries if e]
-
-
 class _Runner:
     def __init__(self, icacls_returncode: int = 0) -> None:
         self.calls: list[list[str]] = []
@@ -265,25 +235,6 @@ def test_windows_acl_failure_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(SysRevError, match="could not restrict"):
         restrict_directory_to_current_user(tmp_path, run=_Runner(icacls_returncode=5))
-
-
-def test_prepare_sqlite_path_applies_the_acl_only_to_new_directories_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import os
-    import types
-
-    import src.state.db as db
-
-    calls: list[Path] = []
-    monkeypatch.setattr(db, "os", types.SimpleNamespace(name="nt", environ=os.environ))
-    monkeypatch.setattr(db, "restrict_directory_to_current_user", calls.append)
-    new = tmp_path / "yeni dizin ğ" / "db"
-    db.prepare_sqlite_path(f"sqlite:///{new}/sysrev.db")
-    assert calls == [new] and new.is_dir()
-    db.prepare_sqlite_path(f"sqlite:///{new}/sysrev.db")  # existing: left unchanged
-    db.prepare_sqlite_path("sqlite:///:memory:")
-    assert calls == [new]
 
 
 def test_a_stored_draft_with_the_old_sentence_is_routed_to_human_review(

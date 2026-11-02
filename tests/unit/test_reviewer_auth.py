@@ -186,12 +186,11 @@ def test_sqlite_directory_created_owner_only(tmp_path: object) -> None:
 
     target = Path(str(tmp_path)) / "nested" / "db"
     prepare_sqlite_path(f"sqlite:///{target}/sysrev.db")
-    if os.name == "nt":  # Session 10: POSIX modes do not exist on Windows; the ACL does
-        from tests.unit.test_session10_fixes import windows_acl_entries
+    if os.name == "nt":  # Session 10: POSIX modes do not exist on Windows; the DACL does
+        from src.state.db import directory_protection_problems
 
-        entries = windows_acl_entries(target)
-        assert len(entries) == 1, entries
-        assert "(I)" not in entries[0] and "(F)" in entries[0], entries
+        # structured: owner and DACL by SID (src.state.acl), not icacls text or entry count
+        assert directory_protection_problems(target) == []
     else:
         assert stat.S_IMODE(target.stat().st_mode) == 0o700
     prepare_sqlite_path("sqlite:///:memory:")  # no-op

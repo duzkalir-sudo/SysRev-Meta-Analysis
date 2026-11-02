@@ -31,8 +31,16 @@ powershell -ExecutionPolicy Bypass -File validation\session10\Run-Session10.ps1 
   Windows validation; the second one shows whether a failure is an encoding issue.
 * Use `-PythonVersion 3.11` or `3.13` to test another interpreter (`py -0` lists them).
 
-Expected on this branch: no failures in the default run, one skipped test if R is not
-installed, six deselected `live` tests. Send back the results folder.
+The script exits **0 only if** every test run has a readable JUnit report with at least one
+test and no failure or error, and the preflight passed; **1** if validation failed; **2** if the
+script could not complete (e.g. installation). The verdict and its reasons are printed and
+written to `summary.json` (`verdict`, `verdict_problems`). `-VerdictOnly <summary.json>`
+re-evaluates an existing summary. The run includes the Windows-only process-level controls in
+`tests/unit/test_session10_powershell.py`.
+
+Expected on this branch: no failures in the default run, the R tests skipped if R is not
+installed, six deselected `live` tests. A preflight network check that fails once and succeeds
+on retry is reported as `warn` (it does not fail the run). Send back the results folder.
 
 ## 2. The pilot through the normal interface
 
@@ -46,7 +54,9 @@ python -m uvicorn src.api_server.main:app       # window 1 (API, 127.0.0.1:8000)
 python -m src.ui                                # window 2 (browser UI, 127.0.0.1:8501)
 ```
 
-Then follow the pilot plan in `SESSION10_VALIDATION_TR.md` §5: protocol → Gate 1 → PubMed
+The pilot uses the user's own Gamma Knife vestibular schwannoma protocol (its contents and the
+required human decisions are established before the pilot starts). Then follow the plan in
+`SESSION10_VALIDATION_TR.md` §5: protocol → Gate 1 → PubMed
 search → deduplication → AI screening (small batch) → your adjudication → full texts (open
 access + your PDFs, identity confirmation) → AI extraction proposals → your acceptance and
 corrections (including one awkward page) → arms → risk of bias → Gate 3 → analysis plan →
@@ -60,7 +70,11 @@ python -m validation.session10.collect_pilot_evidence <project_id>
 python -m validation.session10.check_pilot_stats "data\output\<project_id>\stats"
 ```
 
-The statistics folder is the one the UI writes (`<SYSREV_DATA_DIR>\output\<project_id>\stats`,
+The checker's exit status is its verdict: **0 `validated`** (bound to the manifest, every
+reported model reproduced), 1 `failed` (a mismatch, or `stats_output_sha256` /
+`files["stats_output.json"]` missing or not equal to the file's hash), 2 `error` (R could not
+compute a reference), 3 `inconclusive` (something was not compared, e.g. an unsupported HR
+outcome). The statistics folder is the one the UI writes (`<SYSREV_DATA_DIR>\output\<project_id>\stats`,
 by default `data\output\...`). The second command needs R with `metafor`, `lme4` and `jsonlite` (`Rscript` on `PATH`, or
 `--rscript "C:\Program Files\R\R-4.x.x\bin\Rscript.exe"`). Usage and costs: page
 **Usage & costs** (estimates from list prices) and the provider consoles (measured).

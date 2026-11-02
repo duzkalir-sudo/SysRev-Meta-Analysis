@@ -20,7 +20,10 @@ What is checked, per analysis with a pooled result (PROPORTION, RR, OR):
 
 Tolerances are those of validation/VALIDATION_REPORT.md (closed form 1e-10, REML 1e-8,
 GLMM 2e-4). A model whose method is not recognised is listed as *not compared*, never as
-passed. Writes ``pilot_stats_check.json`` and ``pilot_stats_check.md`` to ``--out``.
+passed; any uncompared value makes the run *inconclusive* (exit 3), a failed comparison or a
+missing/incorrect manifest binding *failed* (exit 1). Only exit 0 (*validated*) means the
+reported statistics were reproduced. Writes ``pilot_stats_check.json`` and
+``pilot_stats_check.md`` to ``--out``.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -263,7 +267,51 @@ def compare(stats: dict[str, Any], ref: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+HEX64 = re.compile(r"[0-9a-f]{64}")
+EXIT = {"validated": 0, "failed": 1, "error": 2, "inconclusive": 3}
+
+
+def manifest_problems(manifest: Any, digest: str) -> list[str]:
+    """Is ``stats_output.json`` (SHA-256 ``digest``) the output this Stage 5 manifest names?
+
+    Stage 5 (``src.stats_engine.stage5.write_artifacts``) records the output's hash twice:
+    ``stats_output_sha256`` and ``files["stats_output.json"]``. Both must be present, well
+    formed and equal to the file's hash. The digest appearing anywhere else (a note, another
+    file's entry) does not bind the file (review of PR #15, P2)."""
+    if not isinstance(manifest, dict):
+        return ["manifest.json is not a JSON object"]
+    problems = []
+    named = manifest.get("stats_output_sha256")
+    files = manifest.get("files")
+    listed = files.get("stats_output.json") if isinstance(files, dict) else None
+    for field, value in (("stats_output_sha256", named), ('files["stats_output.json"]', listed)):
+        if value is None:
+            problems.append(f"manifest field {field} is missing")
+        elif not isinstance(value, str) or not HEX64.fullmatch(value):
+            problems.append(f"manifest field {field} is not a SHA-256 hex digest")
+        elif value != digest:
+            problems.append(f"manifest field {field} = {value} does not match the file ({digest})")
+    if not isinstance(files, dict):
+        problems.append("manifest field files is missing or not an object")
+    return problems
+
+
+def verdict(rows: list[dict[str, Any]], binding: list[str]) -> str:
+    """``validated`` only if the output is bound to its manifest, at least one value was
+    compared, nothing failed and nothing was left uncompared. Uncompared analyses or models
+    (e.g. an unsupported HR outcome) make the run ``inconclusive``: it completed, but did
+    not validate everything the output reports."""
+    if binding or any(x["status"] == "FAIL" for x in rows):
+        return "failed"
+    compared = [x for x in rows if x["status"] == "pass"]
+    if not compared or any(x["status"] == "not compared" for x in rows):
+        return "inconclusive"
+    return "validated"
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Exit status: 0 validated, 1 failed, 2 error (no reference could be computed),
+    3 inconclusive. Only 0 means that the statistics were validated."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("stats_dir", type=Path)
     ap.add_argument("--out", type=Path, default=Path("session10_results"))
@@ -271,12 +319,17 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):  # never fail on a narrow console code page
         sys.stdout.reconfigure(errors="backslashreplace")
-    out_path = args.stats_dir / "stats_output.json"
-    manifest = json.loads((args.stats_dir / "manifest.json").read_text(encoding="utf-8"))
-    digest = sha256_file(out_path)
-    named = json.dumps(manifest)
-    stats = json.loads(out_path.read_text(encoding="utf-8"))
     args.out.mkdir(parents=True, exist_ok=True)
+    out_path = args.stats_dir / "stats_output.json"
+    digest = sha256_file(out_path)
+    try:
+        manifest: Any = json.loads((args.stats_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        manifest = None
+        binding = [f"manifest.json could not be read ({type(exc).__name__})"]
+    else:
+        binding = manifest_problems(manifest, digest)
+    stats = json.loads(out_path.read_text(encoding="utf-8"))
     rin = args.out / "pilot_r_input.json"
     rout = args.out / "pilot_r_reference.json"
     rin.write_text(json.dumps(r_input(stats), indent=2), encoding="utf-8")
@@ -290,6 +343,13 @@ def main(argv: list[str] | None = None) -> int:
         check=False,
         env=env,
     )
+    result: dict[str, Any] = {
+        "stats_output_sha256": digest,
+        "listed_in_manifest": not binding,
+        "manifest_problems": binding,
+        "engine_version": stats.get("engine_version"),
+        "r_temp_dir": r_tmp,
+    }
     if proc.returncode != 0:
         print(proc.stdout + proc.stderr, file=sys.stderr)
         if "R_TempDir" in proc.stdout + proc.stderr:
@@ -298,31 +358,48 @@ def main(argv: list[str] | None = None) -> int:
                 "(Windows: TMP and TEMP) to a folder without spaces and run again.",
                 file=sys.stderr,
             )
-        return 2
+        result.update(
+            verdict="error",
+            r_exit_code=proc.returncode,
+            r_output=(proc.stdout + proc.stderr)[-2000:],
+        )
+        (args.out / "pilot_stats_check.json").write_text(
+            json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print("verdict: error (no reference values were computed)")
+        return EXIT["error"]
     ref = json.loads(rout.read_text(encoding="utf-8"))
     rows = compare(stats, ref)
-    failed = [x for x in rows if x["status"] == "FAIL"]
-    result = {
-        "stats_output_sha256": digest,
-        "listed_in_manifest": digest in named,
-        "engine_version": stats.get("engine_version"),
-        "reference_software": ref["software"],
-        "r_temp_dir": r_tmp,
-        "comparisons": len([x for x in rows if x["status"] != "not compared"]),
-        "failures": len(failed),
-        "not_compared": len([x for x in rows if x["status"] == "not compared"]),
-        "rows": rows,
-    }
+    outcome = verdict(rows, binding)
+    validated = sorted(
+        {x["analysis_id"] for x in rows if x["status"] == "pass"}
+        - {x["analysis_id"] for x in rows if x["status"] != "pass"}
+    )
+    result.update(
+        verdict=outcome,
+        reference_software=ref["software"],
+        comparisons=len([x for x in rows if x["status"] != "not compared"]),
+        failures=len([x for x in rows if x["status"] == "FAIL"]),
+        not_compared=len([x for x in rows if x["status"] == "not compared"]),
+        validated_analyses=validated,
+        not_validated_analyses=sorted({x["analysis_id"] for x in rows} - set(validated)),
+        rows=rows,
+    )
     (args.out / "pilot_stats_check.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     md = [
         "# Pilot statistics vs R metafor (Session 10)",
         "",
-        f"* stats_output.json SHA-256: `{digest}` (listed in manifest: {digest in named})",
+        f"* **verdict: {outcome}** (exit status {EXIT[outcome]}; only `validated` means the "
+        "reported statistics were reproduced)",
+        f"* stats_output.json SHA-256: `{digest}`; bound to its manifest: {not binding}"
+        + (f" ({'; '.join(binding)})" if binding else ""),
         f"* engine: {stats.get('engine_version')}; reference: {ref['software']}",
         f"* comparisons: {result['comparisons']}, failures: {result['failures']}, "
         f"not compared: {result['not_compared']}",
+        f"* validated analyses: {', '.join(validated) or 'none'}; not validated: "
+        f"{', '.join(result['not_validated_analyses']) or 'none'}",
         "",
         "| Analysis | Quantity | Engine | metafor | Tolerance | Status |",
         "|---|---|---|---|---|---|",
@@ -333,8 +410,8 @@ def main(argv: list[str] | None = None) -> int:
         for x in rows
     ]
     (args.out / "pilot_stats_check.md").write_text("\n".join(md) + "\n", encoding="utf-8")
-    print("\n".join(md[:6]))
-    return 1 if failed or not result["listed_in_manifest"] else 0
+    print("\n".join(md[:8]))
+    return EXIT[outcome]
 
 
 if __name__ == "__main__":
