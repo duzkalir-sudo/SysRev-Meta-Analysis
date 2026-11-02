@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -184,5 +186,11 @@ def test_sqlite_directory_created_owner_only(tmp_path: object) -> None:
 
     target = Path(str(tmp_path)) / "nested" / "db"
     prepare_sqlite_path(f"sqlite:///{target}/sysrev.db")
-    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    if os.name == "nt":  # Session 10: POSIX modes do not exist on Windows; the DACL does
+        from src.state.db import directory_protection_problems
+
+        # structured: owner and DACL by SID (src.state.acl), not icacls text or entry count
+        assert directory_protection_problems(target) == []
+    else:
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
     prepare_sqlite_path("sqlite:///:memory:")  # no-op

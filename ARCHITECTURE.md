@@ -366,7 +366,10 @@ agent) could impersonate the reviewer.
    decision whose `reviewer_id` is missing, unknown, revoked, or whose name does not match
    the enrolled reviewer; `gate_decisions.reviewer_id` is a `NOT NULL` foreign key.
 5. **Hygiene.** The server is meant to bind to loopback (uvicorn's default
-   `127.0.0.1`); file-based SQLite directories are created with mode `0700`. Tokens
+   `127.0.0.1`); file-based SQLite directories are created with mode `0700` (on Windows,
+   where POSIX modes do not apply, with an explicit owner-only ACL that is verified by SID
+   before a database is created — Session 10, §9.12). API responses are sent only after the
+   request's transaction has committed. Tokens
    must not be placed in `.env`, the repository, or anywhere an agent process can read.
 
 **Remaining limitations (threat model).** These measures stop an agent that can only
@@ -1512,6 +1515,86 @@ Remaining limitations: a historical value flagged under M5 in a project already 
 blocks Stage 6 with no route back to correct it (the state machine has none); arm building is
 not bound to a displayed-state hash (triage L2); the atomicity guarantee relies on SQLite's
 single writer (other databases lock the project row, as for the reporting decisions).
+
+### 9.12 Session 10 — preparation of the real-world Windows pilot
+
+Session 10 validates the existing product on Windows with a real review. The defects
+confirmed while preparing it are fixed with regressions in `tests/unit/test_session10_fixes.py`;
+the pilot tooling is in `validation/session10/` (tested in `tests/unit/test_session10_tooling.py`).
+The status of each validation step (prepared, executed, blocked) is recorded in
+`SESSION10_VALIDATION_TR.md`.
+
+* **Sensitivity-analysis sentence.** The results paragraph selected every fact whose key began
+  with `stats.<analysis>.sensitivity.`, which since the Session 9 review includes the
+  sensitivity model's own population counts; the draft could read "Sensitivity analysis: 2;
+  400; 70; 1.35 (…)". Estimates are now selected by their role (`sensitivity_estimate`); when
+  the sensitivity model has its own population, its counts follow the estimate with their units
+  ("(population of this model: 2 studies, 400 participants, 70 events)"). Calculations, facts
+  and their hashes are unchanged; stored manuscript versions are never rewritten. A stored
+  version that still contains the old sentence is no longer recognised as template text when it
+  is audited again, so the Auditor routes it to human review (not blocking).
+* **Owner-only database directory on Windows.** `mkdir(mode=0o700)` has no effect on Windows;
+  the directory inherited its parent's ACL. A newly created SQLite directory now gets an
+  explicit ACL (`icacls /inheritance:r /grant:r *<current user SID>:(OI)(CI)F`, system tools
+  called by absolute path). If it cannot be applied, startup fails closed. As on POSIX, an
+  existing directory is not changed; the preflight reports whether it is owner-only.
+* **Text encoding.** The application already wrote and read its files as UTF-8. Seventeen test
+  and validation reads/writes relied on the locale encoding; two tests failed on a Windows
+  code page (reproduced on Linux with a cp1254 locale). Every text I/O call now names its
+  encoding, and a test enforces that for `src`, `tests` and `validation`.
+
+**Review of PR #15 (commit `f2de5e6`), including the first real Windows execution**
+(Windows 11, Python 3.12.10, cp1252, UTF-8 mode off: 990 passed, 1 failed, 5 R tests skipped).
+Each finding was reproduced on Linux before the fix; regressions in
+`tests/unit/test_session10_commit.py`, `tests/unit/test_session10_review.py` and (Windows only)
+`tests/unit/test_session10_powershell.py`:
+
+* **P1 — success before commit.** `get_session` committed after `yield`; FastAPI's default
+  request-scoped dependency exit runs after the response is sent (FastAPI ≥ 0.118), so
+  `POST /projects` answered 201 and a server stopped at once lost the project. The session
+  dependency is now function-scoped (`Depends(get_session, scope="function")`, FastAPI ≥ 0.121,
+  the new lower bound, tested): the commit happens before the response; a failed commit is
+  rolled back and answered with HTTP 500 ("nothing … was stored"). Authentication, the write
+  lock and atomic transitions are unchanged; no endpoint streams from the session. Tested over
+  real HTTP (uvicorn) with a delayed commit, a failed commit, an authenticated write and three
+  hard kills right after acknowledged writes.
+* **P1 — ACL failure bypassed on restart.** The directory stayed after a failed ACL step and the
+  next start skipped protection. On Windows `prepare_sqlite_path` now creates the directories
+  itself, restricts and **verifies** them before any database file exists, and on failure
+  removes only the empty directories it created. An existing empty directory without the
+  database is restricted and verified; a non-empty one is never changed (startup is refused if
+  it is not owner-only); an existing database file is opened as before.
+* **P2 — owner-only decided by entry count.** Verification now reads the owner and DACL as SDDL
+  (`GetNamedSecurityInfoW`) and decides by SID (`src/state/acl.py`): protected DACL, no
+  inherited entries, allowed trustees only the current user, SYSTEM, Administrators and OWNER
+  RIGHTS (only while the owner is one of these), and full control for the current user. SYSTEM
+  and Administrators are accepted because they can override any DACL (take ownership,
+  backup/restore privileges), as root can on POSIX. Everyone, Users, Authenticated Users, Guests,
+  other accounts, unknown aliases, object ACEs and null DACLs are rejected. The four entries
+  observed on Windows (user, SYSTEM, Administrators, OWNER RIGHTS — the protected ACL that
+  CPython ≥ 3.12.4 applies for `mkdir(0o700)` since the fix of CVE-2024-4030, plus the
+  user's grant) are owner-only.
+* **P2 — validation tooling.** `check_pilot_stats` requires both manifest bindings
+  (`stats_output_sha256` and `files["stats_output.json"]`) to equal the file's hash and reports a
+  verdict: `validated` (exit 0), `failed` (1), `error` (2), `inconclusive` (3: something was not
+  compared, e.g. an unsupported HR outcome). `Run-Session10.ps1` exits non-zero when any test
+  run, JUnit report, installation step or the preflight failed. The preflight stops the whole
+  process tree it started (the Streamlit child outlived the launcher on Windows) and checks
+  that the ports are released; network checks record every attempt and the start of an
+  unexpected response.
+* **Preflight request URLs (review of `cc0c0ca`).** `httpx.get(url, params={})` replaces a URL's
+  query, so every configured check was sent without its parameters: Europe PMC received
+  `/search` without `query` and answered 400 (the reviewer's live diagnostic: the same URL with
+  its query preserved returned 200, and the application's `EuropePMCClient.count` returned 1 —
+  the application client was not at fault), and PubMed, OpenAlex and Crossref were checked
+  without their parameters. `request_url` sends the configured URL unchanged, merges additional
+  parameters explicitly and refuses ones that would override a configured parameter;
+  transport-level tests inspect the URL actually sent.
+* **Heterogeneity population.** When the Mantel-Haenszel primary model includes tables
+  without a study-level estimate, the results paragraph and GRADE decision support say that
+  Q/I²/τ² come from the inverse-variance studies (with their k). Facts, templates, statistics
+  and the evidence fingerprint are unchanged (only the drafting template and decision-support
+  text changed).
 
 ### Statistical methods not yet implemented
 Meta-regression; subgroup interaction tests; Egger's / Begg's tests and trim-and-fill;

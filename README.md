@@ -519,3 +519,20 @@ What changes for a reviewer (details and remaining limitations: ARCHITECTURE.md 
   the previous release are not rewritten and still verify. Gate decisions and stage
   transitions are checked and recorded under one database lock. The full-text page freezes
   the manifest it shows; use "Reload" after another reviewer changed a PDF.
+
+## Session 10: preparation of the real-world Windows pilot
+
+Status, findings and what remains to be executed on Windows: `SESSION10_VALIDATION_TR.md`
+(Turkish). Tools and instructions: [`validation/session10/README.md`](validation/session10/README.md).
+
+* A sensitivity-analysis sentence lists only estimates; a sensitivity model with its own
+  population states its counts with units ("population of this model: 2 studies, 400
+  participants, 70 events").
+* On Windows a newly created database directory gets an owner-only ACL (POSIX: `0700`, as
+  before), verified from its security descriptor by SID before the database is created; if it
+  cannot be applied or verified, startup is refused, also on every later start.
+* The API sends a success response only after the request's changes are committed (a failed
+  commit is answered with HTTP 500 and stores nothing). Requires FastAPI ≥ 0.121.
+* Tests and validation scripts read and write text as UTF-8 explicitly, so the suite no longer
+  depends on `PYTHONUTF8=1` on Windows code pages (the independent Windows run of `f2de5e6`,
+  cp1252, passed both former failures).

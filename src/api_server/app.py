@@ -10,6 +10,7 @@ and the reviewer's identity is taken from it — a request body cannot name a re
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,6 +31,8 @@ from src.state.repository import NotFoundError, Repository
 
 if TYPE_CHECKING:
     from src.search.service import SearchClients
+
+logger = logging.getLogger(__name__)
 
 
 class CreateProjectRequest(BaseModel):
@@ -68,17 +71,35 @@ class ProjectView(BaseModel):
 
 
 def get_session(request: Request) -> Iterator[Session]:
+    """One transaction per request, committed **before** the response is sent.
+
+    The dependency is function-scoped (``SessionDep``): FastAPI runs the code after ``yield``
+    when the path operation returns, before the response goes out. With the default
+    request scope it runs after the response has been sent (FastAPI >= 0.118), so a client
+    could receive ``201`` for data that a failed commit or a crash then lost (Session 10
+    review, P1). A failed commit is rolled back and answered with HTTP 500; nothing of the
+    request is stored."""
     factory: sessionmaker[Session] = request.app.state.session_factory
     with factory() as session:
         try:
             yield session
-            session.commit()
         except Exception:
             session.rollback()
             raise
+        try:
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            logger.exception("commit failed; the request's changes were rolled back")
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "the change could not be saved: the database transaction failed and was "
+                "rolled back, so nothing from this request was stored. Try again.",
+            ) from exc
 
 
-SessionDep = Annotated[Session, Depends(get_session)]
+# scope="function" (FastAPI >= 0.121): commit before the response, see get_session.
+SessionDep = Annotated[Session, Depends(get_session, scope="function")]
 
 
 def require_reviewer(request: Request, session: SessionDep) -> ReviewerORM:

@@ -22,7 +22,7 @@ from src.stats_engine.numerics import heterogeneity, random_effects
 from validation.compare_metafor import DEFAULT_REFERENCE, comparisons, main, within
 
 ROOT = Path(__file__).resolve().parents[2]
-REFERENCE = json.loads(DEFAULT_REFERENCE.read_text())
+REFERENCE = json.loads(DEFAULT_REFERENCE.read_text(encoding="utf-8"))
 
 
 def test_reference_metadata_records_software_versions() -> None:
@@ -91,7 +91,7 @@ def test_live_r_matches(tmp_path: Path) -> None:
         capture_output=True,
     )
     assert main(out) == 0
-    fresh = json.loads(out.read_text())
+    fresh = json.loads(out.read_text(encoding="utf-8"))
     # the committed reference is reproducible from the script (up to build-level noise)
     committed = {c["id"]: c for c in REFERENCE["cases"]}
     assert set(committed) == {c["id"] for c in fresh["cases"]}

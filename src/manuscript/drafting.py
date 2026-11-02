@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from src.core.schemas.manuscript import ManuscriptSection, StyleSettings
+from src.core.schemas.stats import AnalysisResult
 from src.llm.provider import (
     LLMConfig,
     LLMProvider,
@@ -30,7 +31,7 @@ from src.llm.provider import (
     parse_json_object,
 )
 from src.manuscript.document import AUTHOR_INPUT_RE, CITE_RE, FACT_RE, vancouver
-from src.manuscript.evidence import EvidencePackage
+from src.manuscript.evidence import EvidencePackage, _model_key
 
 PROMPT_VERSION = "manuscript-draft-v1"
 HEADINGS = {
@@ -171,6 +172,60 @@ TABLE_CAPTIONS = {
 }
 
 
+COUNT_UNITS = (("k", "studies"), ("participants", "participants"), ("events", "events"))
+
+
+def _sensitivity_clauses(p: EvidencePackage, k: str) -> list[str]:
+    """One clause per sensitivity estimate of analysis ``k`` (``stats.<analysis>``).
+
+    Facts are selected by their role, never by key prefix: ``<k>.sensitivity.<i>`` is the
+    estimate (its text names the model), while ``<k>.sensitivity.<i>.k/.participants/.events``
+    are that model's own population counts (Session 9 review), which are added with their
+    units next to the estimate they describe (Session 10)."""
+    estimates = sorted(
+        (
+            f
+            for f in p.facts.values()
+            if f.role == "sensitivity_estimate"
+            and re.fullmatch(rf"{re.escape(k)}\.sensitivity\.\d+", f.key)
+        ),
+        key=lambda f: int(f.key.rsplit(".", 1)[1]),
+    )
+    clauses = []
+    for f in estimates:
+        counts = [
+            f"{{{{{f.key}.{part}}}}} {unit}"
+            for part, unit in COUNT_UNITS
+            if f"{f.key}.{part}" in p.facts and p.facts[f"{f.key}.{part}"].role == "count"
+        ]
+        clause = f"{{{{{f.key}}}}}"
+        if counts:
+            clause += " (population of this model: " + ", ".join(counts) + ")"
+        clauses.append(clause)
+    return clauses
+
+
+def _heterogeneity_label(a: AnalysisResult, k: str, p: EvidencePackage) -> str:
+    """Names the population of Q/I²/τ² when it is not the primary model's (Session 10
+    review of PR #15). Uses the existing count fact of the model with that population, so
+    no evidence fact, template or fingerprint changes; otherwise the text is unchanged."""
+    ids = a.heterogeneity_population()
+    if ids is None:
+        return ""
+    count = next(
+        (
+            f"{{{{{k}.{_model_key(a, r)}.k}}}} "
+            for r, pop in a.auxiliary_populations()
+            if pop.study_ids == ids and f"{k}.{_model_key(a, r)}.k" in p.facts
+        ),
+        "",
+    )
+    return (
+        f" (computed with inverse-variance weights from the {count}studies with a "
+        "study-level estimate, not from the population of the primary model)"
+    )
+
+
 def _results(p: EvidencePackage) -> str:
     included = "; ".join(f"@{k}" for k in sorted(p.included_ref_keys.values()))
     paras = [
@@ -204,14 +259,14 @@ def _results(p: EvidencePackage) -> str:
                 + f") (Figure {fig})."
             )
             if f"{k}.heterogeneity" in p.facts:
-                s += f" Heterogeneity: {{{{{k}.heterogeneity}}}}" + (
+                s += f" Heterogeneity{_heterogeneity_label(a, k, p)}: {{{{{k}.heterogeneity}}}}" + (
                     f"; {{{{{k}.tau2}}}}." if f"{k}.tau2" in p.facts else "."
                 )
             if f"{k}.prediction_interval" in p.facts:
                 s += f" The {{{{{k}.prediction_interval}}}}."
-            sens = [x for x in p.facts if x.startswith(f"{k}.sensitivity.")]
+            sens = _sensitivity_clauses(p, k)
             if sens:
-                s += " Sensitivity analysis: " + "; ".join(f"{{{{{x}}}}}" for x in sens) + "."
+                s += " Sensitivity analysis: " + "; ".join(sens) + "."
         elif f"{k}.single_study_estimate" in p.facts:
             fig += 1
             rids = p.facts[f"{k}.single_study_estimate"].record_ids

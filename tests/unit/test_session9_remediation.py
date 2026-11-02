@@ -627,14 +627,18 @@ def test_m3_glmm_primary_shows_no_study_weights_and_labels_iv_logit_ones(tmp_pat
     md = analysis_markdown(a)
     assert "Weight RE (GLMM: no study weights) %" in md and IV_LOGIT_RE_LABEL in md
     svg = forest_plot(a, tmp_path / "n.svg")
-    assert svg is not None and "equal box sizes (GLMM: no study weights)" in svg.read_text()
+    assert svg is not None and "equal box sizes (GLMM: no study weights)" in svg.read_text(
+        encoding="utf-8"
+    )
     # logit-IV primary: the reported random-effects model has (inverse-variance) weights
     spec_iv = spec.model_copy(update={"proportion_method": "logit_inverse_variance"})
     b = run_analysis(spec_iv, OUTCOMES["necrosis"], inputs(necrosis_arms()))
     assert [s.weight_random_pct for s in b.studies] == pytest.approx(iv)
     assert all(not s.weight_sensitivity_pct for s in b.studies)
     svg_b = forest_plot(b, tmp_path / "b.svg")
-    assert svg_b is not None and "weight % (inverse-variance logit)" in svg_b.read_text()
+    assert svg_b is not None and "weight % (inverse-variance logit)" in svg_b.read_text(
+        encoding="utf-8"
+    )
 
 
 # =========================================================================== M4
@@ -655,7 +659,8 @@ def test_m4_real_rerun_retires_the_plot_of_an_analysis_without_data(
     first = run_stage5(repo, "mc1", output_dir=out, generated_at=NOW)
     assert first.output.analyses[0].status == "pooled"
     assert [n for n, _ in verified_plots(out, first.sha256)[0]] == ["comp"]
-    (out / "notes.txt").write_text("a reviewer's own file")  # unrelated: never removed
+    # unrelated: never removed
+    (out / "notes.txt").write_text("a reviewer's own file", encoding="utf-8")
     reviewer = repo.require_active_reviewer(rid)
     for t in ("t1", "t2", "t3"):  # a supported Stage 5 operation that removes all data
         record_unavailability(repo, "mc1", t, reviewer=reviewer, reason_code="other",
@@ -665,7 +670,7 @@ def test_m4_real_rerun_retires_the_plot_of_an_analysis_without_data(
     assert second.output.analyses[0].status == "no_data"
     assert not (out / "plots" / "comp.svg").exists()
     assert verified_plots(out, second.sha256) == ([], [])
-    assert (out / "notes.txt").read_text() == "a reviewer's own file"
+    assert (out / "notes.txt").read_text(encoding="utf-8") == "a reviewer's own file"
     # the previous output's plots are never shown for the current output
     plots, withheld = verified_plots(out, first.sha256)
     assert plots == [] and withheld and "another statistics output" in withheld[0]
@@ -677,8 +682,8 @@ def test_m4_edited_or_unlisted_plots_are_never_shown(session: Session, tmp_path:
     repo, rid = _stage5_project(session)
     out = tmp_path / "stats"
     art = run_stage5(repo, "mc1", output_dir=out, generated_at=NOW)
-    (out / "plots" / "stray.svg").write_text("<svg/>")  # not in the manifest
-    (out / "plots" / "comp.svg").write_text("<svg>edited</svg>")
+    (out / "plots" / "stray.svg").write_text("<svg/>", encoding="utf-8")  # not in the manifest
+    (out / "plots" / "comp.svg").write_text("<svg>edited</svg>", encoding="utf-8")
     plots, withheld = verified_plots(out, art.sha256)
     assert plots == [] and any("modified after it was generated" in w for w in withheld)
     # a rerun keeps the edited file (hash differs from the manifest) only if it is not
@@ -688,7 +693,8 @@ def test_m4_edited_or_unlisted_plots_are_never_shown(session: Session, tmp_path:
         record_unavailability(repo, "mc1", t, reviewer=reviewer, reason_code="other",
                               reason="synthetic", outcome_id="complication")  # fmt: skip
     again = run_stage5(repo, "mc1", output_dir=out, generated_at=NOW)
-    assert (out / "plots" / "comp.svg").read_text() == "<svg>edited</svg>"  # kept: edited
+    # kept: edited
+    assert (out / "plots" / "comp.svg").read_text(encoding="utf-8") == "<svg>edited</svg>"
     assert (out / "plots" / "stray.svg").exists()
     assert verified_plots(out, again.sha256) == ([], [])
 
@@ -717,7 +723,7 @@ def test_m4_ui_shows_only_plots_of_the_current_valid_output(
         repo, _ = _stage5_project(s)
         run_stage5(repo, "mc1", output_dir=stats_dir, generated_at=NOW)
         s.commit()
-    (stats_dir / "plots" / "stray.svg").write_text("<svg/>")
+    (stats_dir / "plots" / "stray.svg").write_text("<svg/>", encoding="utf-8")
     app = str(Path(__file__).resolve().parents[2] / "src" / "ui" / "app.py")
 
     def page() -> AppTest:

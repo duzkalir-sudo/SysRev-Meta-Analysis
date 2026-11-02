@@ -431,7 +431,7 @@ async def test_full_pipeline(
     follow = ledger[follow_id]
     assert (follow.status, follow.reason_code) == ("excluded", "recorded_unavailable")
     assert follow.reason is not None and "not counted as a separate study" in follow.reason
-    assert (tmp_path / "stats" / "stats_output.json").read_text() == (
+    assert (tmp_path / "stats" / "stats_output.json").read_text(encoding="utf-8") == (
         stage5.output.to_canonical_json()
     )
     advance(repo, Phase.STAGE6_MANUSCRIPT)

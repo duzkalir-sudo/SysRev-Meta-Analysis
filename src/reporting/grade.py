@@ -147,6 +147,18 @@ def applicability_problems(
     return problems
 
 
+def _heterogeneity_population_text(a: AnalysisResult) -> str:
+    ids = a.heterogeneity_population()
+    if ids is None:
+        return "the studies of the rated (primary) estimate"
+    primary = a.population()
+    return (
+        f"the {len(ids)} studies with a study-level estimate (inverse-variance weights), not "
+        f"the {primary.k} studies of the rated "
+        f"{a.primary.label if a.primary else 'primary'} estimate"
+    )
+
+
 def decision_support(a: AnalysisResult, rob: dict[str, RiskOfBiasAssessment]) -> dict[str, Any]:
     """Information shown next to each domain. It never pre-fills a judgement."""
     rids = contributing_records(a)
@@ -223,6 +235,9 @@ def decision_support(a: AnalysisResult, rob: dict[str, RiskOfBiasAssessment]) ->
                     "p_value": h.p_value,
                     "tau2": a.random_effects.tau2 if a.random_effects else None,
                     "prediction_interval": list(pi) if pi else None,
+                    # Session 10 review: the studies behind Q/I²/τ² when they are not the
+                    # rated (primary) estimate's population
+                    "population": _heterogeneity_population_text(a),
                 }
                 if h is not None
                 else {
